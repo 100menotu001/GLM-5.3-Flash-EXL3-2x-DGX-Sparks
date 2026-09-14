@@ -155,15 +155,19 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 # E2 one-shot 2026-09-01: 7168 keep (100k ~1148 / 300k ~1107); 2048/3548 similar or slower.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-7168}"
-# Decode hygiene (issue #43): the OpenAI layer backs an omitted max_tokens with
-# max_model_len - prompt (~1M here), so a single unbounded request may decode
-# for effectively forever, growing KV until it preempts everything else.
-# A bounded server-side default (HF generation_config semantics:
-# max_new_tokens == vLLM max_tokens) caps that worst case. Admission in this
-# vLLM is chunk-based (allocate_slots per chunk), so this does NOT gate
-# admission; long-context concurrency is governed by the effective KV pool
-# (see issue #43 measurements). Empty = old unbounded fallback.
-DEFAULT_MAX_NEW_TOKENS="${DEFAULT_MAX_NEW_TOKENS:-65536}"
+# Decode hygiene (issue #43): without a server default, omitted chat limits
+# may consume the entire remaining context budget and grow KV enough to
+# preempt other sessions. A bounded omitted-request default limits that risk.
+# This is not a cap: overlay/patch_default_max_new_tokens.py changes only the serving
+# layer's omitted-request fallback. Explicit client limits override this
+# default; independently configured server/platform and context caps remain.
+# Admission in this vLLM is chunk-based (allocate_slots per
+# chunk), so this does NOT gate admission; long-context concurrency is
+# governed by the effective KV pool (see issue #43 measurements).
+# Unset-only expansion: explicit empty preserves stock model/server limits,
+# and a caller export — including empty — beats .env.
+# Two-node start.sh only; start-tp4.sh is unchanged.
+DEFAULT_MAX_NEW_TOKENS="${DEFAULT_MAX_NEW_TOKENS-65536}"
 # Empty preserves the stock scheduler; opt in after measuring contention.
 LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}"
 CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
@@ -179,6 +183,7 @@ KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
+DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
@@ -427,6 +432,12 @@ validate_numeric_config() {
         _glm53_canonical_positive_int LONG_PREFILL_TOKEN_THRESHOLD \
             "$LONG_PREFILL_TOKEN_THRESHOLD" "$MAX_NUM_BATCHED_TOKENS" || return
     fi
+    # Empty preserves stock limits; a set value must canonicalize
+    # before restart stops the healthy pair.
+    if [ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ]; then
+        _glm53_canonical_positive_int DEFAULT_MAX_NEW_TOKENS \
+            "$DEFAULT_MAX_NEW_TOKENS" 1000000 || return
+    fi
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
@@ -496,6 +507,7 @@ validate_overlay_artifacts() {
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
+        "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
@@ -721,6 +733,7 @@ preflight() {
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
+    [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "$DEFAULT_TOKENS_PATCH_HOST missing"
     [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
@@ -1178,6 +1191,7 @@ GLM53_OVERLAY_ORDER=(
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    patch_default_max_new_tokens.py
     patch_indexer_workspace.py
     patch_ablit.py
 )
@@ -1219,7 +1233,6 @@ ARGS=(
 [ -n "${GPU_MEM_UTIL:-}" ]  && ARGS+=(--gpu-memory-utilization "${GPU_MEM_UTIL}")
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
-[ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ] && ARGS+=(--override-generation-config "{\"max_new_tokens\": ${DEFAULT_MAX_NEW_TOKENS}}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
@@ -1295,7 +1308,6 @@ ARGS=(
 [ -n "${GPU_MEM_UTIL:-}" ]  && ARGS+=(--gpu-memory-utilization "${GPU_MEM_UTIL}")
 [ -n "${MAX_NUM_SEQS:-}" ] && ARGS+=(--max-num-seqs "${MAX_NUM_SEQS}")
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
-[ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ] && ARGS+=(--override-generation-config "{\"max_new_tokens\": ${DEFAULT_MAX_NEW_TOKENS}}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
@@ -1375,6 +1387,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
 
     worker_ssh "rm -rf /tmp/glm53-ablit"
@@ -1495,6 +1509,7 @@ launch_cluster() {
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
@@ -1531,6 +1546,7 @@ launch_cluster() {
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
@@ -1678,7 +1694,7 @@ on_ready() {
     local spec="MTP k=${MTP_TOKENS}"
     [ "$SPEC_METHOD" = "dflash" ] && spec="DFlash2 k=${DFLASH_TOKENS} (${DFLASH_MODEL})"
     [ "$SPEC_METHOD" = "none" ] && spec=off
-    local mt_line="mt_default=off (omitted max_tokens unbounded, up to ~max_model_len)"
+    local mt_line="mt_default=off (stock model/server limits)"
     [ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ] && mt_line="mt_default=${DEFAULT_MAX_NEW_TOKENS}"
     local ablit="off (stock weights)"
     [ "$ABLIT" = "1" ] && ablit="ON method=${ABLIT_METHOD} direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA}"
