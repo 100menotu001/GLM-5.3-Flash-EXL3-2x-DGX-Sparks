@@ -650,7 +650,7 @@ This kit's `.env.tp3` also pins:
 | `NFS_SHARE` | inherited `1` | one 164 GiB copy on the head; neither worker has room for another |
 | `MAX_MODEL_LEN` | `1000000` | three nodes hold ~55.75 GiB of weights each |
 | `GPU_MEM_UTIL` | `0.80` | UMA headroom; raise only with `MemAvailable` in front of you |
-| `--kv-cache-memory-bytes` | 40 GiB (`42949672960`) | `.env`'s 14 GiB cap is a TP=2 number; this flag ignores `GPU_MEM_UTIL` |
+| `--kv-cache-memory-bytes` | 35 GiB (`37580963840`) | `.env`'s 14 GiB cap is a TP=2 number; this flag ignores `GPU_MEM_UTIL`. Dropped from 40 GiB after a head OOM mid-chat. |
 | `EXL3_FAT_GROUPED` | `1` (from `.env`) | E3 grouped fat-expert prefill |
 | `SOCKET_IFNAME` | management LAN (`enP7s7`) | gloo/NCCL bootstrap; the ring has no single CX7 IF that reaches both peers |
 | `NCCL_CROSS_NIC` / `NCCL_IB_SUBNET_AWARE_ROUTING` | `1` | directed dual-port ring |
@@ -658,7 +658,9 @@ This kit's `.env.tp3` also pins:
 Live KV on this kit (`/metrics` `vllm:cache_config_info`, 2026-09-15, 40 GiB
 cap, `MAX_MODEL_LEN=1000000`): **3,230,656 tokens**, **3.23×** concurrency at
 1M (`num_gpu_blocks=2213`, `block_size=64`, `cache_dtype=fp8`). Occupancy
-moves with load; the pool size does not.
+moves with load; the pool size does not. The cap is now **35 GiB**
+(`37580963840`), so those token/concurrency numbers shrink by 12.5% on the
+next boot.
 
 Wire the three boxes as a **directed ring** — each node's Port0 (cage next to
 the RJ45) to the *next* node's Port1. NCCL pairs NIC index to NIC index per
