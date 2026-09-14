@@ -12,7 +12,7 @@ sha256:2c55b4653d4b2c7d4497169b14edc16f44b3fc3058a9ab9cd302e365783e7cbb,
 file vllm/entrypoints/serve/utils/api_utils.py) after applying
 overlay/patch_default_max_new_tokens.py — the same source the container
 patches at boot. The platform cap is stubbed; the completion-call harness
-supplies request metadata and prompt length without importing GPU modules.
+uses real Pydantic v2 normalization and field tracking, without GPU imports.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,8 +29,8 @@ START = ROOT / "start.sh"
 
 sys.path.insert(0, str(ROOT / "overlay"))
 from patch_default_max_new_tokens import (
-    OLD, LIMITS_PATH, COMPLETION_PATH,
-    apply_text, apply_completion_text, main as patch_main,
+    OLD, LIMITS_PATH, COMPLETION_PATH, PROTOCOL_PATH,
+    apply_text, apply_completion_text, apply_protocol_text, main as patch_main,
 )
 
 # The pinned vLLM fixture is licensed under Apache-2.0.
@@ -153,9 +152,8 @@ def test_env_unset_keeps_stock_hard_cap() -> None:
         assert get_max_tokens(1_000_000, None, 1000, {"max_tokens": 32}) == 32
 
 
-# The pinned completion call, wrapped without importing GPU-serving modules.
-# CompletionRequest's pinned default is 16; model_fields_set distinguishes
-# that default from an explicitly supplied 16.
+# Pinned completion call and before-validator, without GPU-serving imports.
+# Pydantic must observe omitted input before the validator normalizes null.
 COMPLETION_FIXTURE = '''import io
 class Serving:
     def limit(self, request, max_model_len, engine_inputs):
@@ -171,30 +169,45 @@ class Serving:
         return max_tokens
 '''
 
+PROTOCOL_FIXTURE = '''from pydantic import BaseModel, model_validator
+class CompletionRequest(BaseModel):
+    max_tokens: int | None = 16
+    truncate_prompt_tokens: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_null_max_tokens(cls, data):
+        if isinstance(data, dict) and data.get("max_tokens") is None:
+            data = data.copy()
+            data["max_tokens"] = cls.model_fields["max_tokens"].default
+        return data
+'''
+
 
 def test_completion_distinguishes_omission_from_explicit_sixteen() -> None:
     source, status = apply_completion_text(COMPLETION_FIXTURE)
     assert status == "applied"
+    protocol, status = apply_protocol_text(PROTOCOL_FIXTURE)
+    assert status == "applied"
     namespace = {"get_max_tokens": _load_patched_get_max_tokens()}
+    exec(protocol, namespace)
     exec(source, namespace)
+    request_type = namespace["CompletionRequest"]
     serving = namespace["Serving"]()
     serving.default_sampling_params = {}
     serving.override_max_tokens = None
     serving._extract_prompt_len = lambda length: length
     with patch.dict(os.environ, {"DEFAULT_MAX_NEW_TOKENS": "65536"}):
-        for value, fields, expected in (
-            (16, set(), 65536),
-            (16, {"max_tokens"}, 16),
-            (200000, {"max_tokens"}, 200000),
-            (None, {"max_tokens"}, 65536),
+        for data, expected in (
+            ({}, 65536),
+            ({"max_tokens": 16}, 16),
+            ({"max_tokens": 200000}, 200000),
+            ({"max_tokens": None}, 16),
         ):
-            request = SimpleNamespace(
-                max_tokens=value, model_fields_set=fields, truncate_prompt_tokens=None,
-            )
+            request = request_type.model_validate(data)
             assert serving.limit(request, 1000000, [1000]) == expected
         os.environ["DEFAULT_MAX_NEW_TOKENS"] = ""
-        request = SimpleNamespace(max_tokens=16, model_fields_set=set(), truncate_prompt_tokens=None)
-        assert serving.limit(request, 1000000, [1000]) == 16
+        assert serving.limit(request_type.model_validate({}), 1000000, [1000]) == 16
 
 
 def test_patch_apply_skip_drift() -> None:
@@ -209,23 +222,26 @@ def test_patch_apply_skip_drift() -> None:
     assert rejected.startswith("drifted:") and unchanged == drifted
 
 
-def test_both_targets_are_checked_before_writing() -> None:
+def test_all_targets_are_checked_before_writing() -> None:
     with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"DEFAULT_MAX_NEW_TOKENS": "65536"}):
         root = Path(td)
-        limits, completion = root / LIMITS_PATH, root / COMPLETION_PATH
+        limits, completion, protocol = (
+            root / LIMITS_PATH, root / COMPLETION_PATH, root / PROTOCOL_PATH,
+        )
         limits.parent.mkdir(parents=True)
         completion.parent.mkdir(parents=True)
         limits.write_text("import os\n" + PINNED_GET_MAX_TOKENS)
-        broken = COMPLETION_FIXTURE.replace("request.max_tokens,", "request.max_tokens + 0,")
-        completion.write_text(broken)
-        original = limits.read_bytes()
-        assert patch_main(["patch", td]) == 1
-        assert limits.read_bytes() == original and completion.read_text() == broken
         completion.write_text(COMPLETION_FIXTURE)
+        protocol.write_text(PROTOCOL_FIXTURE.replace('data.get("max_tokens")', 'data.get("max_tokens", 16)'))
+        targets = (limits, completion, protocol)
+        original = tuple(target.read_bytes() for target in targets)
+        assert patch_main(["patch", td]) == 1
+        assert tuple(target.read_bytes() for target in targets) == original
+        protocol.write_text(PROTOCOL_FIXTURE)
         assert patch_main(["patch", td]) == 0
-        first = (limits.read_bytes(), completion.read_bytes())
+        first = tuple(target.read_bytes() for target in targets)
         assert patch_main(["patch", td]) == 0
-        assert first == (limits.read_bytes(), completion.read_bytes())
+        assert tuple(target.read_bytes() for target in targets) == first
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +388,7 @@ if __name__ == "__main__":
     test_caller_value_beats_dotenv()
     test_independent_server_caps_are_preserved()
     test_completion_distinguishes_omission_from_explicit_sixteen()
-    test_both_targets_are_checked_before_writing()
+    test_all_targets_are_checked_before_writing()
     test_rank_arguments_do_not_create_a_hard_cap()
     test_validation_accepts_unset_empty_and_positive()
     test_validation_rejects_malformed()
