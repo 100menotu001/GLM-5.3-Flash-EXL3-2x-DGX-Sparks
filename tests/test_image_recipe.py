@@ -18,8 +18,10 @@ def test_documented_defaults() -> None:
     start = START.read_text()
     example = ENV_EXAMPLE.read_text()
     assert 'MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-7168}"' in start
+    assert 'LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD-3584}"' in start
     assert 'EXL3_FAT_KERNEL="${EXL3_FAT_KERNEL:-1}"' in start
     assert "MAX_NUM_BATCHED_TOKENS=7168" in example
+    assert re.search(r"^LONG_PREFILL_TOKEN_THRESHOLD=3584$", example, re.M)
     assert re.search(r"^EXL3_FAT_KERNEL=1$", example, re.M)
 
 
