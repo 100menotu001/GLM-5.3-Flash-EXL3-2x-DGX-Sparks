@@ -10,10 +10,14 @@ Both launchers preserve caller override precedence, and TP=4 now forwards the
 threshold on both ranks.
 
 Scheduler and projection defaults are **unchanged**: mixed-prefill stays `fair`
-on TP=2 / `0` on TP=3 / `skip` on TP=4, and `GLM53_DENSE_FP8` stays `off`. The
-proposed `CHUNK=0` TP=2 default and the FP8 default-on are held: the first needs
-#180's contention qualification to land, and the second needs the maintainer's
-exact-head server-side prefill-cost admission. Historical projection
+on TP=2 / `0` on TP=3 / `skip` on TP=4, and the three FP8 sites this change
+scopes — `start.sh`, `overlay/exl3.py` and `overlay/patch_dense_fp8.py` — keep
+`GLM53_DENSE_FP8` at `off`. `start-tp3.sh` is the exception and stays as main
+has it: TP=3 still defaults `GLM53_DENSE_FP8=dense,kda` alongside its `CHUNK=0`,
+so FP8 projections remain exercised on that path. The proposed `CHUNK=0` TP=2
+default and the FP8 default-on are held: the first needs #180's contention
+qualification to land, and the second needs the maintainer's exact-head
+server-side prefill-cost admission. Historical projection
 measurements (0.005-0.017 nats shared-top-K conditional KL on 57k code/prose
 tokens) are screening results, not full-distribution numerical qualification.
 

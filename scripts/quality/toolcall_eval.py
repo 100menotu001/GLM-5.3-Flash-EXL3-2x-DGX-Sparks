@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Tool-calling and verbatim-recall probe through the served chat endpoint at the served
 sampling defaults (thinking on, temperature 1.0 / top_p 0.95). Every case has a checker:
-right tool, well-formed arguments, no leaked <tool_call>/<arg_key> text, and — for the
-long-context cases — old_string copied EXACTLY from a 20k-token file (what an Edit tool
-needs) and verbatim recall of a numbered line at 2k / 9k / 18k tokens depth.
+right tool, object-shaped arguments (a null/array/number payload is recorded as a failed
+sample, see decode_args), no leaked <tool_call>/<arg_key> text, and — for the long-context
+cases — the requested file_path, old_string copied EXACTLY from a 20k-token file and the
+required new_string (what an Edit tool needs), plus verbatim recall of a numbered line at
+2k / 9k / 18k tokens depth. Scoring is pure (score_completion), so fixture tests can drive
+it without the endpoint.
 
 usage: toolcall_eval.py OUT.json [--samples 3] [--workers 3] [--url URL] [--no-think] [--temperature T]
 """
@@ -68,11 +71,17 @@ def cases():
     add("weather", u("What's the weather like in Paris right now, in celsius?"), want("get_weather", lambda a: "paris" in str(a.get("city", "")).lower() and str(a.get("unit", "celsius")).lower() == "celsius"))
     add("calc", u("Use the calculator to compute 17*23+5."), want("calculate", lambda a: "17" in str(a.get("expression", "")) and "23" in str(a.get("expression", ""))))
     add("no_tool", u("Just say hello in one short sentence. Do not use any tools."), no_tool(), expect_tool=False)
-    # multi-turn: tool result fed back, then a fix via Edit whose old_string must be a substring of the file
+    # multi-turn: tool result fed back, then the fix via Edit: the requested file, an old_string copied
+    # from that content, and the actual off-by-one correction — not any Edit call
+    def fixes_last_n(a):
+        old, new = str(a.get("old_string", "")), str(a.get("new_string", ""))
+        return (str(a.get("file_path", "")).endswith("utils.py") and old.strip() != "" and old in BUGGY
+                and "items[-n+1:]" in old and "items[-n:]" in new and "items[-n+1:]" not in new)
+
     mt = u("Read utils.py and fix the bug in last_n.")
     mt += [{"role": "assistant", "content": "", "tool_calls": [call("Read", {"file_path": "utils.py"})]},
            {"role": "tool", "tool_call_id": "call_1", "content": BUGGY}]
-    add("fix_after_read", mt, want("Edit", lambda a: str(a.get("old_string", "")) in BUGGY and "last_n" in BUGGY and str(a.get("old_string", "")).strip() != ""))
+    add("fix_after_read", mt, want("Edit", fixes_last_n))
     # multi-turn: after a passing test run the model should answer, not call again
     at = u("Run the tests with pytest -q.")
     at += [{"role": "assistant", "content": "", "tool_calls": [call("Bash", {"command": "pytest -q"})]},
@@ -86,8 +95,16 @@ def cases():
             (lambda t: (lambda tc, content, reasoning: (LEAKSTRIP(content) == t.strip(), f"want {t.strip()[:60]!r}")))(target), tools=[], expect_tool=False, tags=("long",))
     ln = 1500
     target = src_lines[ln - 1]
+    # the requested edit: the file whose contents were dumped, old_string copied from it, and '# reviewed'
+    # appended to THAT line of the new content
+    def appends_reviewed(a):
+        old, new = str(a.get("old_string", "")), str(a.get("new_string", ""))
+        return (str(a.get("file_path", "")).endswith("exl3.py") and old.strip() != "" and old in file_text
+                and target.rstrip() in old and new != old
+                and re.search(re.escape(target.rstrip()) + r"[ \t]*# reviewed[ \t]*$", new, re.M) is not None)
+
     add("edit_deep_18k", [{"role": "system", "content": SYS}, {"role": "user", "content": dump + f"Use the Edit tool to append the comment '# reviewed' to the end of line {ln}. Copy old_string exactly from the file."}],
-        want("Edit", lambda a: str(a.get("old_string", "")).strip() != "" and str(a.get("old_string", "")) in file_text and target.strip() in str(a.get("old_string", ""))), tags=("long",))
+        want("Edit", appends_reviewed), tags=("long",))
     add("bash_after_long", [{"role": "system", "content": SYS}, {"role": "user", "content": dump + "Now run this module's unit tests with pytest -q."}],
         want("Bash"), tags=("long",))  # any shell call: the probe is tool syntax after 24k tokens, not test discovery
     return cs
@@ -106,6 +123,59 @@ def post(url, body, timeout=1800):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
+def decode_args(raw):
+    """Decode a tool-call arguments payload; every checker reads named fields off an object.
+
+    JSON null/arrays/numbers/strings are syntactically valid and used to reach the predicates as-is
+    and raise there. Returns (args, invalid): args is {} when the payload is unusable, and invalid
+    marks the sample as a recorded invalid-argument failure.
+    """
+    try:
+        args = json.loads(raw or "{}")
+    except Exception:  # noqa: BLE001
+        return {}, True
+    return (args, False) if isinstance(args, dict) else ({}, True)
+
+
+def stored_tool_call(r):
+    """Rebuild a recorded tool call for --rescore; invalid marks a non-object stored arguments payload.
+
+    Records keep at most 600 characters of the payload, so one that no longer decodes to an object is
+    reported as an invalid-argument failure instead of raising out of a checker.
+    """
+    if not (r.get("tool") and r.get("args")):
+        return None, False
+    args, invalid = decode_args(r["args"])
+    return {"name": r["tool"], "args": args}, invalid
+
+
+def score_completion(c, d):
+    """Score one parsed /v1/chat/completions response. Pure: fixture tests drive it without the endpoint."""
+    ch = d["choices"][0]; m = ch["message"]
+    content = m.get("content") or ""; reasoning = m.get("reasoning_content") or m.get("reasoning") or ""
+    tcs = m.get("tool_calls") or []
+    tc = None; evidence = None; bad_json = False
+    if tcs:
+        f = tcs[0]["function"]
+        raw = f.get("arguments")
+        args, bad_json = decode_args(raw)
+        tc = {"name": f.get("name"), "args": args}
+        evidence = raw if isinstance(raw, str) else json.dumps(raw)  # keep the offending payload as evidence
+    if bad_json:
+        # bad_json: the arguments payload was absent, unparseable or not a JSON object, so no field
+        # predicate can apply and the sample is a failure rather than a checker crash.
+        ok, why = False, "tool arguments are not a JSON object"
+    else:
+        ok, why = c["check"](tc, content, reasoning)
+    leak = bool(LEAK.search(content))
+    return {"ok": bool(ok and not leak and not bad_json), "why": why,
+            "tool": tc["name"] if tc else None, "n_tool_calls": len(tcs), "bad_json": bad_json, "leak": leak,
+            "finish_reason": ch.get("finish_reason"),
+            "completion_tokens": d["usage"]["completion_tokens"], "prompt_tokens": d["usage"]["prompt_tokens"],
+            "reasoning_chars": len(reasoning), "args": evidence[:600] if evidence is not None else None,
+            "content": content[:400]}
+
+
 def run_case(url, c, sample, a):
     body = {"model": MODEL, "messages": c["messages"], "max_tokens": a.max_tokens}
     if c["tools"]:
@@ -119,24 +189,8 @@ def run_case(url, c, sample, a):
         d = post(url, body)
     except Exception as e:  # noqa: BLE001
         return {"id": c["id"], "sample": sample, "ok": False, "why": f"http: {e}", "tags": c["tags"]}
-    ch = d["choices"][0]; m = ch["message"]
-    content = m.get("content") or ""; reasoning = m.get("reasoning_content") or m.get("reasoning") or ""
-    tcs = m.get("tool_calls") or []
-    tc = None; bad_json = False
-    if tcs:
-        f = tcs[0]["function"]
-        try:
-            args = json.loads(f.get("arguments") or "{}")
-        except Exception:  # noqa: BLE001
-            args, bad_json = {}, True
-        tc = {"name": f.get("name"), "args": args}
-    ok, why = c["check"](tc, content, reasoning)
-    leak = bool(LEAK.search(content))
-    rec = {"id": c["id"], "sample": sample, "tags": c["tags"], "ok": bool(ok and not leak and not bad_json), "why": why,
-           "tool": tc["name"] if tc else None, "n_tool_calls": len(tcs), "bad_json": bad_json, "leak": leak,
-           "finish_reason": ch.get("finish_reason"), "completion_tokens": d["usage"]["completion_tokens"], "prompt_tokens": d["usage"]["prompt_tokens"],
-           "reasoning_chars": len(reasoning), "secs": round(time.time() - t0, 1),
-           "args": json.dumps(tc["args"])[:600] if tc else None, "content": content[:400]}
+    rec = score_completion(c, d)
+    rec.update({"id": c["id"], "sample": sample, "tags": c["tags"], "secs": round(time.time() - t0, 1)})
     return rec
 
 
@@ -160,9 +214,10 @@ def main():
             c = byid.get(r["id"])
             if c is None or r.get("why", "").startswith("http"):
                 continue
-            tc = {"name": r["tool"], "args": json.loads(r["args"])} if r.get("tool") and r.get("args") else None
-            ok, why = c["check"](tc, r.get("content", ""), "")
-            r["ok"] = bool(ok and not r.get("leak") and not r.get("bad_json")); r["why"] = why
+            tc, invalid = stored_tool_call(r)
+            r["bad_json"] = bool(r.get("bad_json")) or invalid  # a recorded failure is never cleared here
+            ok, why = (False, "tool arguments are not a JSON object") if invalid else c["check"](tc, r.get("content", ""), "")
+            r["ok"] = bool(ok and not r.get("leak") and not r["bad_json"]); r["why"] = why
         summarize_and_write(results, a.out, a); return
     if a.only:
         keep = set(a.only.split(",")); cs = [c for c in cs if c["id"] in keep]
