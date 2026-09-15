@@ -196,8 +196,7 @@ printf '%s\n' "$resolved" "$marker_rev"
 
 def test_failed_download_cannot_adopt_another_cached_revision() -> None:
     probe = r'''
-resolve_hf_bin() { return 0; }
-hf_download_repo() { printf '%s\n' "$*" >>"$DOWNLOAD_LOG"; return 1; }
+resolve_hf_bin() { HF_BIN_CMD=(/usr/bin/python3 "$FAKE_HF_BIN"); }
 download_weights
 '''
     with tempfile.TemporaryDirectory() as raw_tmp:
@@ -215,22 +214,39 @@ download_weights
         )
         script.chmod(0o755)
         (tmp / ".env").write_text(f"HF_HOME={hf_home}\n")
-        download_log = tmp / "download-args.txt"
-        result = _run(
-            script,
-            {
-                "GLM53_MODEL_PRESET": "abliterated",
-                "SKIP_DOWNLOAD": "0",
-                "SPEC_METHOD": "none",
-                # A caller value must not lower the pinned 120-shard gate.
-                "EXPECTED_SHARDS": "1",
-                "DOWNLOAD_LOG": str(download_log),
-            },
-        )
-        downloaded = download_log.read_text() if download_log.exists() else ""
-    assert result.returncode != 0
-    assert "119 / 120 shards in the selected snapshot" in result.stderr
-    assert f"--revision {REVISION}" in downloaded
+        fake_hf = tmp / "hf.py"
+        fake_hf.write_text("""import os
+import sys
+from pathlib import Path
+if os.environ.get("FAIL_DOWNLOAD") == "1":
+    raise SystemExit(1)
+args = sys.argv[1:]
+revision = args[args.index("--revision") + 1] if "--revision" in args else "f" * 40
+repo = Path(os.environ["FAKE_HF_REPO"])
+blob = repo / "blobs" / f"{revision}-00120"
+blob.touch()
+shard = repo / "snapshots" / revision / "model-00120-of-00120.safetensors"
+if not shard.exists():
+    shard.symlink_to(f"../../blobs/{blob.name}")
+""")
+        env = {
+            "GLM53_MODEL_PRESET": "abliterated",
+            "SKIP_DOWNLOAD": "0",
+            "SPEC_METHOD": "none",
+            # A caller value must not lower the pinned 120-shard gate.
+            "EXPECTED_SHARDS": "1",
+            "FAKE_HF_BIN": str(fake_hf),
+            "FAKE_HF_REPO": str(repo),
+        }
+        failed = _run(script, {**env, "FAIL_DOWNLOAD": "1"})
+        assert failed.returncode != 0
+        pinned_shard = repo / "snapshots" / REVISION / "model-00120-of-00120.safetensors"
+        assert not pinned_shard.exists()
+        # The real download wrapper must select the pinned revision. A request
+        # for refs/main merely refreshes the other snapshot and cannot pass.
+        completed = _run(script, env)
+        assert completed.returncode == 0, completed.stderr
+        assert pinned_shard.is_file()
 
 
 if __name__ == "__main__":
