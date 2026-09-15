@@ -41,6 +41,8 @@
 #   ./start.sh status             containers + API health
 #   ./start.sh logs               follow head logs
 #   ./start.sh logs worker        follow worker container logs
+#   ./start.sh share              NFS_SHARE=1 only: re-export the head HF
+#                                 cache and remount it on the worker
 #
 # Node IPs live in .env (copied from .env.example on first run).
 # Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 SKIP_SHIP=1 SKIP_BUILD=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
@@ -155,11 +157,21 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # 8192 chunk × long history oversubscribes GB10 persistent_topk smem (300k crash).
 # E2 one-shot 2026-09-01: 7168 keep (100k ~1148 / 300k ~1107); 2048/3548 similar or slower.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-7168}"
-# Cap a long chunked prefill so it cannot monopolize MNBT for its whole
-# duration (issue #110). 3584 = MNBT/2 at the shipped 7168. Explicit empty
-# disables the flag (stock scheduler); ${VAR-3584} not ${VAR:-3584} so that
-# empty survives.
-LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD-3584}"
+# Decode hygiene (issue #43): without a server default, omitted chat limits
+# may consume the entire remaining context budget and grow KV enough to
+# preempt other sessions. A bounded omitted-request default limits that risk.
+# This is not a cap: overlay/patch_default_max_new_tokens.py changes only the serving
+# layer's omitted-request fallback. Explicit client limits override this
+# default; independently configured server/platform and context caps remain.
+# Admission in this vLLM is chunk-based (allocate_slots per
+# chunk), so this does NOT gate admission; long-context concurrency is
+# governed by the effective KV pool (see issue #43 measurements).
+# Unset-only expansion: explicit empty preserves stock model/server limits,
+# and a caller export — including empty — beats .env.
+# Two-node start.sh only; start-tp4.sh is unchanged.
+DEFAULT_MAX_NEW_TOKENS="${DEFAULT_MAX_NEW_TOKENS-65536}"
+# An unset long-prefill threshold is derived from the validated token budget
+# below. Explicit empty preserves the stock scheduler.
 CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$SCRIPT_DIR/files/chat_template.jinja}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 VIDEO_PATCH_HOST="${VIDEO_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_video_placeholders.py}"
@@ -173,6 +185,7 @@ KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
+DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
@@ -180,8 +193,26 @@ LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
 # JSON default cannot sit in ${LIMIT_MM:-{...}} — } ends the expansion.
 if [ -z "${LIMIT_MM:-}" ]; then
-    LIMIT_MM='{"image":100,"video":1}'
+    LIMIT_MM='{"image":48,"video":1}'
 fi
+# Vision cost caps. 2026-09-14: a chat client split an 11.9 MB video into ~33
+# frames and posted them as images. The checkpoint's processor_config.json
+# allows max_image_tokens=8000, so each frame cost ~7.2k tokens and the prompt
+# reached 236k tokens of vision encode. SKIP_MM_PROFILING reserves nothing for
+# the tower, so the host OOM-killer took VLLM::Worker_TP and the engine died.
+# ${VAR-default} not ${VAR:-default}: an explicitly empty value means stock vLLM.
+#   MM_IMAGE_TOKENS        per-image token budget. Must stay <=
+#                          MAX_NUM_BATCHED_TOKENS, which is also vLLM's encoder
+#                          cache size — the checkpoint's 8000 exceeds our 7168.
+#                          A 1080p frame is 2691 tokens uncapped, 2040 at 2048.
+#   VIDEO_NUM_FRAMES       frames sampled from a real video_url item. Empty =
+#                          vLLM's VideoMediaIO default (32). Untested here: the
+#                          09-14 crash came in over the image path.
+#   MM_PROCESSOR_CACHE_GB  host RAM held for processed media. vLLM defaults to
+#                          4 GiB; on UMA that is 4 GiB the model cannot have.
+MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS-2048}"
+VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES-}"
+MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB-1}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
 # Graph-safe fused apply (device-side expert grouping). MTP k=2 decode is
@@ -329,6 +360,32 @@ log()  { printf '\033[1;36m[glm53-exl3]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[glm53-exl3]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[glm53-exl3]\033[0m ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Worker weight distribution. 0 (default) = rsync a full copy of the ~164 GiB
+# checkpoint to the worker, which is what this script has always done. 1 = the
+# worker mounts the head's HF cache read-only over NFSv4 on ConnectX and keeps
+# no copy (files/nfs-share.sh; same pattern as ~/NewModels/DS4.1). Opt in from
+# .env — nothing below changes while it is 0.
+NFS_SHARE="${NFS_SHARE:-0}"
+NFS_RANKS="1"
+# shellcheck source=files/nfs-share.sh
+if [ -f "$SCRIPT_DIR/files/nfs-share.sh" ]; then
+    source "$SCRIPT_DIR/files/nfs-share.sh"
+elif [ "$NFS_SHARE" = "1" ]; then
+    warn "files/nfs-share.sh missing — falling back to an rsync copy (NFS_SHARE=0)"
+    NFS_SHARE=0
+fi
+
+# What the worker bind-mounts at /root/.cache/huggingface. Read-only over NFS is
+# safe: the container runs HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 and its
+# writable Triton/TileLang/vLLM caches are separate node-local mounts.
+_hf_mount() {
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        nfs_hf_mount_spec
+    else
+        printf '%s:/root/.cache/huggingface' "$WORKER_CACHE_DIR"
+    fi
+}
+
 # GLM53 numeric config guard (begin)
 _glm53_canonical_positive_int() {
     local name="$1" value="$2" maximum="$3" canonical
@@ -420,9 +477,23 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    if [ "${LONG_PREFILL_TOKEN_THRESHOLD+x}" != x ]; then
+        LONG_PREFILL_TOKEN_THRESHOLD=$((MAX_NUM_BATCHED_TOKENS / 2))
+        if [ "$LONG_PREFILL_TOKEN_THRESHOLD" -lt 1 ]; then
+            LONG_PREFILL_TOKEN_THRESHOLD=1
+        elif [ "$LONG_PREFILL_TOKEN_THRESHOLD" -gt 3584 ]; then
+            LONG_PREFILL_TOKEN_THRESHOLD=3584
+        fi
+    fi
     if [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ]; then
         _glm53_canonical_positive_int LONG_PREFILL_TOKEN_THRESHOLD \
             "$LONG_PREFILL_TOKEN_THRESHOLD" "$MAX_NUM_BATCHED_TOKENS" || return
+    fi
+    # Empty preserves stock limits; a set value must canonicalize
+    # before restart stops the healthy pair.
+    if [ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ]; then
+        _glm53_canonical_positive_int DEFAULT_MAX_NEW_TOKENS \
+            "$DEFAULT_MAX_NEW_TOKENS" 1000000 || return
     fi
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
@@ -493,6 +564,7 @@ validate_overlay_artifacts() {
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
+        "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
@@ -569,7 +641,13 @@ banner() {
 
 worker_ssh() { ssh -T -o BatchMode=yes -o ConnectTimeout=15 "$WORKER_SSH" "$@"; }
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Print the whole header block: everything between the shebang and
+# `set -euo pipefail`, minus the ==== rulers. Beats a magic line number, which
+# silently truncated ./start.sh status/logs/share out of --help.
+usage() {
+    sed -n '2,/^set -euo pipefail/p' "${BASH_SOURCE[0]}" \
+        | sed -e '/^set -euo pipefail/d' -e '/^# =\{10,\}$/d' -e 's/^# \{0,1\}//'
+}
 
 count_shards() {
     local repo_path="$1" ref
@@ -718,6 +796,7 @@ preflight() {
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
+    [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "$DEFAULT_TOKENS_PATCH_HOST missing"
     [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
@@ -730,15 +809,19 @@ preflight() {
     mkdir -p "$HF_CACHE_DIR"
     avail=$(df -Pk "$HF_CACHE_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)
     [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on head for a ~164 GiB model"
-    avail=$(worker_ssh "df -Pk '$WORKER_HOME' 2>/dev/null" | awk 'NR==2{print $4}' || true)
-    [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on worker for a ~164 GiB model"
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        log "NFS_SHARE=1 — worker reads the head HF cache, no local copy to size for"
+    else
+        avail=$(worker_ssh "df -Pk '$WORKER_HOME' 2>/dev/null" | awk 'NR==2{print $4}' || true)
+        [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on worker for a ~164 GiB model"
 
-    # The worker HF cache must be writable by the SSH user before the ~164 GiB
-    # sync starts. A root-owned ~/.cache/huggingface (prior sudo/docker
-    # prepare on the worker) otherwise fails mid-sync with a bare mkdir
-    # permission error. mkdir -p is idempotent and is what sync does anyway.
-    if ! worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub' && test -w '$WORKER_CACHE_DIR/hub'"; then
-        die "worker cannot write $WORKER_CACHE_DIR/hub as $( [ -n "${WORKER_USER:-}" ] && echo "$WORKER_USER" || echo "$USER" ) — fix ownership on the worker, e.g.: ssh $WORKER_SSH \"sudo chown -R ${WORKER_USER:-\$USER}: '$WORKER_CACHE_DIR'\""
+        # The worker HF cache must be writable by the SSH user before the ~164 GiB
+        # sync starts. A root-owned ~/.cache/huggingface (prior sudo/docker
+        # prepare on the worker) otherwise fails mid-sync with a bare mkdir
+        # permission error. mkdir -p is idempotent and is what sync does anyway.
+        if ! worker_ssh "mkdir -p '$WORKER_CACHE_DIR/hub' && test -w '$WORKER_CACHE_DIR/hub'"; then
+            die "worker cannot write $WORKER_CACHE_DIR/hub as $( [ -n "${WORKER_USER:-}" ] && echo "$WORKER_USER" || echo "$USER" ) — fix ownership on the worker, e.g.: ssh $WORKER_SSH \"sudo chown -R ${WORKER_USER:-\$USER}: '$WORKER_CACHE_DIR'\""
+        fi
     fi
 
     log "preflight OK (head=$(hostname) ${HEAD_IP}, worker=${WORKER_SSH})"
@@ -814,7 +897,10 @@ overlay_recipe_hash() {
             "$SCRIPT_DIR/ablit" \
             -type f \
             ! -path '*/__pycache__/*' \
+            ! -path '*/.pytest_cache/*' \
             ! -path '*/ablit/transplant/*' \
+            ! -path '*/files/nfs-server/*' \
+            ! -path '*/files/nfs-share.sh' \
             ! -name '*.pyc' \
             2>/dev/null
     } | LC_ALL=C sort | xargs -d '\n' -r sha256sum | sha256sum | awk '{print $1}'
@@ -874,10 +960,10 @@ ensure_image() {
     local head_ok=0 worker_ok=0 head_key="" worker_key=""
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
         head_ok=1
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
     fi
     if worker_ssh "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
-        worker_key="$(worker_image_key)"
+        worker_key="$(worker_image_key || true)"
         if images_match "$head_key" "$worker_key"; then
             worker_ok=1
         else
@@ -902,13 +988,13 @@ ensure_image() {
     fi
     if [ "${BUILD:-0}" = "1" ]; then
         build_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         worker_ok=0
     elif image_from_registry && [ "$skip_pull" != "1" ]; then
         local before_key="$head_key"
         pull_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         if [ "$head_key" != "$before_key" ]; then
             log "pulled ${IMAGE} (${before_key:-missing} -> ${head_key})"
@@ -925,7 +1011,7 @@ ensure_image() {
             die "SKIP_PULL=1 but ${IMAGE} is not on the head"
         fi
         build_image
-        head_key="$(local_image_key)"
+        head_key="$(local_image_key || true)"
         head_ok=1
         worker_ok=0
     fi
@@ -934,7 +1020,7 @@ ensure_image() {
     elif [ "$worker_ok" = "0" ]; then
         if image_from_registry && [ "$skip_pull" != "1" ] && [ "${BUILD:-0}" != "1" ]; then
             if pull_image_on_worker; then
-                worker_key="$(worker_image_key)"
+                worker_key="$(worker_image_key || true)"
                 if images_match "$head_key" "$worker_key"; then
                     worker_ok=1
                     log "worker pulled ${IMAGE} — matches head"
@@ -947,7 +1033,7 @@ ensure_image() {
         fi
         if [ "$worker_ok" = "0" ]; then
             ship_image_to_worker
-            worker_key="$(worker_image_key)"
+            worker_key="$(worker_image_key || true)"
             if images_match "$head_key" "$worker_key"; then
                 worker_ok=1
             elif worker_ssh "docker image inspect '$IMAGE' >/dev/null 2>&1"; then
@@ -1152,6 +1238,13 @@ sync_repo_to_worker() {
 sync_weights() {
     [ "${SKIP_SYNC:-0}" = "1" ] && { log "SKIP_SYNC=1 — not syncing to worker"; return; }
     [ -d "$MODEL_PATH" ] || die "weights missing at $MODEL_PATH — run without SKIP_DOWNLOAD first"
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        if [ "$SPEC_METHOD" = "dflash" ] && [ ! -d "$DFLASH_PATH" ]; then
+            die "DFlash2 weights missing at $DFLASH_PATH"
+        fi
+        nfs_share_weights
+        return
+    fi
     sync_repo_to_worker "$MODEL_PATH" "$MODEL_CACHE_NAME" "weights"
     if [ "$SPEC_METHOD" = "dflash" ]; then
         [ -d "$DFLASH_PATH" ] || die "DFlash2 weights missing at $DFLASH_PATH"
@@ -1175,6 +1268,7 @@ GLM53_OVERLAY_ORDER=(
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    patch_default_max_new_tokens.py
     patch_indexer_workspace.py
     patch_ablit.py
 )
@@ -1241,8 +1335,11 @@ if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     say "language-model-only: no vision tower"
 else
     [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ -n "${MM_IMAGE_TOKENS:-}" ] && ARGS+=(--mm-processor-kwargs "{\"max_image_tokens\":${MM_IMAGE_TOKENS}}")
+    [ -n "${VIDEO_NUM_FRAMES:-}" ] && ARGS+=(--media-io-kwargs "{\"video\":{\"num_frames\":${VIDEO_NUM_FRAMES}}}")
+    [ -n "${MM_PROCESSOR_CACHE_GB:-}" ] && ARGS+=(--mm-processor-cache-gb "${MM_PROCESSOR_CACHE_GB}")
     [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
-    say "vision on: limit-mm=${LIMIT_MM:-} skip-mm-profiling=${SKIP_MM_PROFILING:-1} chat-template=${CHAT_TEMPLATE:-}"
+    say "vision on: limit-mm=${LIMIT_MM:-} image-tokens=${MM_IMAGE_TOKENS:-8000} video-frames=${VIDEO_NUM_FRAMES:-32} mm-cache-gb=${MM_PROCESSOR_CACHE_GB:-4} skip-mm-profiling=${SKIP_MM_PROFILING:-1} chat-template=${CHAT_TEMPLATE:-}"
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -1315,6 +1412,9 @@ if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
 else
     [ -n "${LIMIT_MM:-}" ] && ARGS+=(--limit-mm-per-prompt "${LIMIT_MM}")
+    [ -n "${MM_IMAGE_TOKENS:-}" ] && ARGS+=(--mm-processor-kwargs "{\"max_image_tokens\":${MM_IMAGE_TOKENS}}")
+    [ -n "${VIDEO_NUM_FRAMES:-}" ] && ARGS+=(--media-io-kwargs "{\"video\":{\"num_frames\":${VIDEO_NUM_FRAMES}}}")
+    [ -n "${MM_PROCESSOR_CACHE_GB:-}" ] && ARGS+=(--mm-processor-cache-gb "${MM_PROCESSOR_CACHE_GB}")
     [ "${SKIP_MM_PROFILING:-1}" = "1" ] && ARGS+=(--skip-mm-profiling)
 fi
 if [ -n "${EXTRA_ARGS:-}" ]; then
@@ -1370,6 +1470,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
 
     worker_ssh "rm -rf /tmp/glm53-ablit"
@@ -1457,7 +1559,10 @@ launch_cluster() {
              KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
+             MM_IMAGE_TOKENS VIDEO_NUM_FRAMES MM_PROCESSOR_CACHE_GB \
+             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED \
+             EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED \
+             DEFAULT_MAX_NEW_TOKENS MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
@@ -1471,7 +1576,7 @@ launch_cluster() {
         --gpus all --network host --ipc=host --shm-size 32g --stop-timeout 60 \
         --device /dev/infiniband --cap-add IPC_LOCK \
         --ulimit memlock=-1 --ulimit stack=67108864 \
-        -v '$WORKER_CACHE_DIR:/root/.cache/huggingface' \
+        -v '$(_hf_mount)' \
         -v '$WORKER_VLLM_CACHE:/root/.cache/vllm' \
         -v '$WORKER_TRITON_CACHE:/root/.triton/cache' \
         -v '$WORKER_TILELANG_CACHE:/root/.tilelang/cache' \
@@ -1488,6 +1593,7 @@ launch_cluster() {
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
@@ -1524,6 +1630,7 @@ launch_cluster() {
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
@@ -1542,6 +1649,7 @@ launch_cluster() {
         -e MAX_MODEL_LEN="$MAX_MODEL_LEN" -e GPU_MEM_UTIL="$GPU_MEM_UTIL" \
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
+        -e DEFAULT_MAX_NEW_TOKENS="$DEFAULT_MAX_NEW_TOKENS" \
         -e LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}" \
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
@@ -1551,6 +1659,9 @@ launch_cluster() {
         -e LANGUAGE_MODEL_ONLY="$LANGUAGE_MODEL_ONLY" \
         -e SKIP_MM_PROFILING="$SKIP_MM_PROFILING" \
         -e LIMIT_MM="$LIMIT_MM" \
+        -e MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS:-}" \
+        -e VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES:-}" \
+        -e MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB:-}" \
         -e CHAT_TEMPLATE="$CHAT_TEMPLATE" \
         -e ENFORCE_EAGER="$ENFORCE_EAGER" \
         -e EXL3_FUSED_MOE="$EXL3_FUSED_MOE" \
@@ -1670,9 +1781,11 @@ on_ready() {
     local spec="MTP k=${MTP_TOKENS}"
     [ "$SPEC_METHOD" = "dflash" ] && spec="DFlash2 k=${DFLASH_TOKENS} (${DFLASH_MODEL})"
     [ "$SPEC_METHOD" = "none" ] && spec=off
+    local mt_line="mt_default=off (stock model/server limits)"
+    [ -n "${DEFAULT_MAX_NEW_TOKENS:-}" ] && mt_line="mt_default=${DEFAULT_MAX_NEW_TOKENS}"
     local ablit="off (stock weights)"
     [ "$ABLIT" = "1" ] && ablit="ON method=${ABLIT_METHOD} direction=${ABLIT_DIRECTION} layers=${ABLIT_LAYERS} alpha=${ABLIT_ALPHA}"
-    log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}, ablit=${ablit}"
+    log "  features   : tools=glm47+auto, reasoning=glm45, spec=${spec}, vision=${vision}, ${mt_line}, ablit=${ablit}"
     local auth_line="none (VLLM_API_KEY empty)"
     if [ -n "${VLLM_API_KEY:-}" ]; then
         auth_line="bearer token set (VLLM_API_KEY) — send Authorization: Bearer <key> on /v1 requests"
@@ -1735,6 +1848,10 @@ stop() {
     log "stopping worker container on ${WORKER_SSH} ..."
     worker_ssh "docker rm -f '$CONTAINER_WORKER'" >/dev/null 2>&1 \
         || log "  (no worker container was running)"
+    if [ "${NFS_SHARE:-0}" = "1" ]; then
+        log "removing the worker NFS volume (the exporter stays up) ..."
+        nfs_unmount_workers
+    fi
     log "stopped."
 }
 
@@ -1788,6 +1905,8 @@ main() {
         restart)  stop; start ;;
         status)   status ;;
         logs)     shift || true; logs "$@" ;;
+        share)    [ "${NFS_SHARE:-0}" = "1" ] || die "NFS_SHARE=0 in .env — set NFS_SHARE=1 to share the head HF cache over NFS"
+                  nfs_share_weights ;;
         -h|--help|help) usage ;;
         *) usage; exit 1 ;;
     esac

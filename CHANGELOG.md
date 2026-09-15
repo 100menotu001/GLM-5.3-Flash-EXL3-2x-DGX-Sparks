@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — scheduling defaults and projection screening
+
+PR149 changes mixed-prefill policy to `0` and dense/KDA projections to FP8 by
+default; `GLM53_DENSE_FP8=off` retains BF16 projections. Historical projection
+measurements are conditional shared-top-K screening results, not full-distribution
+numerical qualification.
+
+The unset long-prefill threshold is derived after token-budget validation:
+half MNBT, rounded down, capped at 3584 and floored at 1. The shipped MNBT 7168
+still gives 3584; MNBT 2048 gives 1024. Explicit empty disables the flag, while
+invalid explicit values are rejected before lifecycle actions. Both launchers
+preserve caller override precedence.
+
+Projection comparisons reject incomplete/misaligned captures and disclose shared
+support coverage. Comparison drivers propagate refusal; acquisition runners
+require an explicit dataset directory and stop on child failure. Boot-arm runs
+restore the original adaptive-k configuration. These CPU checks do not establish
+runtime quality or performance for the FP8 default.
+
+## Unreleased — omitted-only output-token defaults
+
+`DEFAULT_MAX_NEW_TOKENS` now changes only omitted request limits, including
+legacy completion requests whose protocol default is 16. Explicit limits
+override this default; independent server/platform and context caps remain.
+Empty values preserve stock behavior and caller exports override `.env`.
+Malformed values fail before restart stops services.
+
+CPU checks exercise the pinned limiter and completion call, both rank argument
+blocks, configuration precedence and pre-stop rejection. Live API/streaming
+qualification remains deferred to the latest completed TheGrill.
+
 ## 2026-09-07 — E3 grouped fat-expert MoE prefill (`EXL3_FAT_GROUPED`, now the default)
 
 Cold prefill **+37–45%** on this 2× GB10 kit (16k: 1,155 → 1,578 tok/s; 128k: ~1,150 → 1,629; 256k: 1,087 → 1,576),

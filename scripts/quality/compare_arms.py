@@ -47,15 +47,39 @@ def main():
         for cid, row in cases.items():
             print(f"{cid:20s}" + "".join(f"{row.get(arm,'-'):>28s}" for arm in arms))
     ref = a.ref or (arms[0] if arms else None)
-    if ref:
-        refk = os.path.join(a.run, ref, "kl.json")
-        for arm in arms:
-            for k in sorted(glob.glob(os.path.join(a.run, arm, "kl*.json"))):
-                if os.path.abspath(k) == os.path.abspath(refk):
-                    continue
-                print(f"\n=== KL panel: ref={ref}/kl.json  vs  {arm}/{os.path.basename(k)} ===")
-                subprocess.run([sys.executable, os.path.join(HERE, "kl_panel.py"), "compare", refk, k])
+    if not arms:
+        print(f"ERROR: {a.run}: no arm directories — nothing compared", file=sys.stderr)
+        return 2
+    refk = os.path.join(a.run, ref, "kl.json")
+    if not os.path.exists(refk):
+        print(f"ERROR: reference arm {ref} has no kl.json — nothing to compare against", file=sys.stderr)
+        return 2
+    compared, failures = 0, []
+    for arm in arms:
+        captures = sorted(glob.glob(os.path.join(a.run, arm, "kl*.json")))
+        if not captures:
+            failures.append(f"{arm}: no KL capture")
+            continue
+        for k in captures:
+            if os.path.abspath(k) == os.path.abspath(refk):
+                continue
+            print(f"\n=== KL panel: ref={ref}/kl.json  vs  {arm}/{os.path.basename(k)} ===")
+            rc = subprocess.run([sys.executable, os.path.join(HERE, "kl_panel.py"), "compare", refk, k]).returncode
+            compared += 1
+            if rc != 0:  # kl_panel refuses noncomparable panels; that refusal must not read as success here
+                failures.append(f"{arm}/{os.path.basename(k)}: kl_panel compare exited {rc}")
+                print(f"FAILED (exit {rc}): {arm}/{os.path.basename(k)}", file=sys.stderr, flush=True)
+    if failures:
+        print(f"FAILED: {len(failures)} missing or refused KL comparisons; {compared} attempted", file=sys.stderr)
+        for f in failures:
+            print(f"  {f}", file=sys.stderr)
+        return 2
+    if not compared:
+        print("ERROR: no KL capture pairs to compare (expected <arm>/kl.json, plus a reference arm)", file=sys.stderr)
+        return 2
+    print(f"KL comparison OK: {compared} panel pair(s)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
