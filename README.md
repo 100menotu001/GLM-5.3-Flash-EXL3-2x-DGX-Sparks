@@ -208,7 +208,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=2, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:48,video:1}`, `--mm-processor-kwargs {max_image_tokens:2048}`, `--mm-processor-cache-gb 1`, `--skip-mm-profiling` |
+| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:48,video:1}`, `--mm-processor-kwargs {max_image_tokens:2048}`, `--mm-processor-cache-gb 1`, `--skip-mm-profiling`. Stateless chat clients resend every image each turn, so once a session holds more images than this ceiling, later turns are rejected — see `docs/images-per-request.md` |
 | Ablit | **off** (`ABLIT=0`). Stock `o_proj`. Set `ABLIT=1` to enable; see [Abliteration](#abliteration-ablit1) |
 
 Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
