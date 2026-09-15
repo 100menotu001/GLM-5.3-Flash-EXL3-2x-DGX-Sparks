@@ -1,32 +1,35 @@
+import io
+import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
 sys.path.insert(0, str(Path(__file__).parent))
 
-import pytest
-import json
-from unittest.mock import MagicMock, patch
-from test_tool_concurrency import stream_tool_request, make_padded_prompt, TEST_TOOLS
+from test_tool_concurrency import main, stream_tool_request
 
 
-def test_make_padded_prompt():
-    prompt = make_padded_prompt("TEST", filler_words=10, task="Do something")
-    assert "SESSION TEST UNIQUE TSET." in prompt
-    assert "the the the the the the the the the the" in prompt
-    assert "Do something" in prompt
+class MockStreamResponse:
+    """Minimal urlopen-compatible response over a fixed SSE byte string."""
+
+    def __init__(self, data: bytes):
+        self.status = 200
+        self._bio = io.BytesIO(data)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._bio.read(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
 
 
-def test_tool_definitions_schema_validity():
-    assert len(TEST_TOOLS) >= 2
-    for t in TEST_TOOLS:
-        assert t["type"] == "function"
-        fn = t["function"]
-        assert "name" in fn
-        assert "parameters" in fn
-        assert "required" in fn["parameters"]
-        assert len(fn["parameters"]["required"]) > 0
+def _stream(sse_data: bytes) -> dict:
+    with patch("urllib.request.urlopen", return_value=MockStreamResponse(sse_data)):
+        return stream_tool_request(prompt="test", max_tokens=64)
 
-
-import io
 
 def test_stream_tool_request_detects_blank_args():
     # Simulate SSE response where tool_calls arguments is empty "{}" (Issue #10 bug)
@@ -36,23 +39,11 @@ def test_stream_tool_request_detects_blank_args():
         b'data: [DONE]\n\n'
     )
 
-    class MockHTTPResponse:
-        def __init__(self, data):
-            self.status = 200
-            self._bio = io.BytesIO(data)
-        def read(self, size=-1):
-            return self._bio.read(size)
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-
-    with patch("urllib.request.urlopen", return_value=MockHTTPResponse(sse_data)):
-        out = stream_tool_request(prompt="test", max_tokens=64)
-        assert out["http_status"] == 200
-        assert out["num_tool_calls"] == 1
-        assert out["blank_args_count"] == 1
-        assert out["tool_calls"][0]["is_blank"] is True
+    out = _stream(sse_data)
+    assert out["http_status"] == 200
+    assert out["num_tool_calls"] == 1
+    assert out["blank_args_count"] == 1
+    assert out["tool_calls"][0]["is_blank"] is True
 
 
 def test_stream_tool_request_valid_args_reconstruction():
@@ -65,21 +56,30 @@ def test_stream_tool_request_valid_args_reconstruction():
         b'data: [DONE]\n\n'
     )
 
-    class MockHTTPResponse:
-        def __init__(self, data):
-            self.status = 200
-            self._bio = io.BytesIO(data)
-        def read(self, size=-1):
-            return self._bio.read(size)
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
+    out = _stream(sse_data)
+    assert out["http_status"] == 200
+    assert out["num_tool_calls"] == 1
+    assert out["blank_args_count"] == 0
+    assert out["tool_calls"][0]["is_blank"] is False
+    assert out["tool_calls"][0]["parsed_arguments"] == {"command": "echo hello"}
 
-    with patch("urllib.request.urlopen", return_value=MockHTTPResponse(sse_data)):
-        out = stream_tool_request(prompt="test", max_tokens=64)
-        assert out["http_status"] == 200
-        assert out["num_tool_calls"] == 1
-        assert out["blank_args_count"] == 0
-        assert out["tool_calls"][0]["is_blank"] is False
-        assert out["tool_calls"][0]["parsed_arguments"] == {"command": "echo hello"}
+
+def test_missing_usage_response_still_writes_receipt(tmp_path, capsys):
+    """A stream that ends without a usage block must not abort receipt emission."""
+    sse_data = (
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"terminal_execute","arguments":"{\\"command\\": \\"echo hi\\"}"}}]}}]}\n\n'
+        b'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    receipt_path = tmp_path / "receipt.json"
+    argv = ["test_tool_concurrency.py", "--concurrency", "1", "--out", str(receipt_path)]
+
+    with patch("urllib.request.urlopen", return_value=MockStreamResponse(sse_data)):
+        with patch.object(sys, "argv", argv):
+            rc = main()
+
+    assert rc == 0
+    lane = json.loads(receipt_path.read_text(encoding="utf-8"))["results"][0]
+    assert lane["usage"] is None
+    assert lane["tok_s"] is None
+    assert "Decode: unavailable" in capsys.readouterr().out

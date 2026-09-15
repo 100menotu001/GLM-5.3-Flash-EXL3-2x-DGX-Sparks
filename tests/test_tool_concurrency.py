@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Tool-call concurrency, streaming integrity & argument validation suite (Issue #10).
+"""Tool-call concurrency, streaming integrity & argument-integrity suite (Issue #10).
 
 Validates tool calling under multi-sequence concurrent load on GLM-5.3-Flash EXL3 (:8888):
-1. Drives multi-tool calls (2+ tools, required string/object arguments) at c=1, c=4, c=8.
+1. Drives multi-tool calls (2+ tools with string/object arguments) at any `--concurrency` (default 4).
 2. Supports mixed prefill+decode load with long cold/shared system prompts (prefix caching stress).
-3. Compares SSE streaming delta reconstruction vs non-streaming mode.
-4. Verifies argument integrity: detects and flags blank `{}` / missing required arguments.
+3. Reconstructs tool_calls from the SSE stream and reports TTFT and decode rate per lane.
+4. Flags argument integrity problems: blank `{}` / empty argument strings and malformed JSON.
 5. Distinguishes `finish_reason=tool_calls` from `finish_reason=length` truncation.
 6. Emits structured JSON benchmark receipts for issue reproduction and regression verification.
+
+A timing the engine did not report stays None in the receipt and prints as "unavailable"; the
+harness never substitutes 0 for a measurement it did not make. It does not compare against
+non-streaming mode, and it does not validate the tools' declared `required` argument lists.
 """
 from __future__ import annotations
 
@@ -315,8 +319,13 @@ def run_concurrency_wave(
     return results
 
 
+def format_timing(value: Optional[float], spec: str, unit: str) -> str:
+    """Render a measured timing; a measurement the engine did not report stays explicit."""
+    return "unavailable" if value is None else format(value, spec) + unit
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Tool-call concurrency & argument validation benchmark (Issue #10)")
+    parser = argparse.ArgumentParser(description="Tool-call concurrency & argument integrity benchmark (Issue #10)")
     parser.add_argument("--concurrency", "-c", type=int, default=4, help="Concurrent request streams (default: 4)")
     parser.add_argument("--filler-words", "-f", type=int, default=0, help="Number of padding words per prompt (default: 0)")
     parser.add_argument("--thinking", action="store_true", help="Enable reasoning / thinking mode")
@@ -361,9 +370,9 @@ def main() -> int:
 
         tc_names = [f"{t['name']}({'BLANK' if t['is_blank'] else 'ok'})" for t in tc_list]
         print(
-            f"[Lane {i}] HTTP 200 | TTFT: {res.get('ttft_s', 0):.2f}s | "
-            f"Decode: {res.get('tok_s', 0):.1f} tok/s | Finish: {res.get('finish_reason')} | "
-            f"Tools: {tc_names}",
+            f"[Lane {i}] HTTP 200 | TTFT: {format_timing(res.get('ttft_s'), '.2f', 's')} | "
+            f"Decode: {format_timing(res.get('tok_s'), '.1f', ' tok/s')} | "
+            f"Finish: {res.get('finish_reason')} | Tools: {tc_names}",
             flush=True
         )
 
@@ -390,7 +399,7 @@ def main() -> int:
     print(f"\n--- Summary ---")
     print(f"Success: {successful_requests}/{total_requests} | Timeouts: {total_timeouts}")
     print(f"Tool Calls Emitted: {total_tool_calls}")
-    print(f"Blank/Missing Arguments: {total_blank_args}")
+    print(f"Blank/Empty Arguments: {total_blank_args}")
     print(f"Malformed JSON: {total_malformed}")
 
     # Return non-zero exit code if blank arguments or malformed JSON detected (Issue #10 detection)
