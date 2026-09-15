@@ -1,4 +1,4 @@
-<h1 align="center">GLM-5.3 Flash EXL3 for 2x DGX Sparks</h1>
+<h1 align="center">GLM-5.3 Flash EXL3 for 2-4x DGX Sparks</h1>
 
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
