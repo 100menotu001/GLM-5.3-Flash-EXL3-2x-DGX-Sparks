@@ -477,13 +477,17 @@ RUN python3 /opt/glm53/patch_scheduler_decode_floor.py
 RUN GLM53_KV_COORDINATOR_PY_SRC=/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py \
     python3 /opt/glm53/test_apc_per_group_retention.py
 RUN python3 /opt/glm53/patch_hybrid_prefix_hit.py
-# Runs BEFORE the patch it validates: Part A needs the pristine
-# sampling_params.py / v1/request.py / v1/core/block_pool.py, and Part C
-# (real BlockPool / KVCacheManager / hybrid coordinator on patched copies)
-# is mandatory in-image (GLM53_REQUIRE_VLLM=1), including the KpoolTailSpec
-# group when the fork exposes it.
-RUN GLM53_VLLM_SRC_ROOT=/usr/local/lib/python3.12/dist-packages/vllm GLM53_REQUIRE_VLLM=1 python3 /opt/glm53/test_apc_no_store.py
 RUN python3 /opt/glm53/patch_apc_per_group_retention.py
+# Runs BEFORE the no-store patch it validates, but AFTER the hybrid and
+# per-group retention overlays: Part A still stages the pre-no-store
+# sampling_params.py / v1/request.py / v1/core/block_pool.py and applies the
+# no-store patch to copies of them (the retention overlay leaves those anchors
+# and their patch mechanics untouched), while Part C composes the exact
+# hybrid + per-group + no-store stack on the real BlockPool / KVCacheManager /
+# coordinator. Both are mandatory in-image (GLM53_REQUIRE_VLLM=1,
+# GLM53_REQUIRE_COMPOSITION=1), including the fork's seven-group KpoolTailSpec
+# layout and the env-driven SWA-retention legs.
+RUN GLM53_VLLM_SRC_ROOT=/usr/local/lib/python3.12/dist-packages/vllm GLM53_REQUIRE_VLLM=1 GLM53_REQUIRE_COMPOSITION=1 python3 /opt/glm53/test_apc_no_store.py
 RUN python3 /opt/glm53/patch_apc_no_store.py
 RUN python3 /opt/glm53/patch_xgrammar_termination.py
 RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py

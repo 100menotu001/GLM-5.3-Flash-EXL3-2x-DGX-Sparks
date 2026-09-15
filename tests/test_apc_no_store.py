@@ -19,6 +19,22 @@ Part C  behaviour on a real vLLM (CPU is enough): patched COPIES of the three
         ``HybridKVCacheCoordinator`` / managers run on top of the patched code.
         Skipped with a loud line when ``import vllm`` fails; set
         ``GLM53_REQUIRE_VLLM=1`` to make that a failure (the Dockerfile does).
+        The in-image gate runs this file AFTER patch_hybrid_prefix_hit.py and
+        patch_apc_per_group_retention.py, so Part C also composes the real
+        hybrid + per-group retention + no-store stack. The live-shape legs run
+        once per retention mode (``VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA``
+        unset = inherit the global policy, ``"0"`` = boundary-only retention
+        for the EAGLE-exempt drafter group) and assert the resolved per-group
+        retention vector, the drafter-priority free wiring, and that
+        suppression/num_cached_block/recycling behaviour is unchanged on that
+        stack. The fixture pins the global retention to dense (``None``, the
+        pinned runtime's default) so this image-level gate does not depend on
+        the deployment's launcher environment. Group layouts are asserted and
+        printed: a runtime that exposes the fork's ``KpoolTailSpec`` must
+        construct it, otherwise the seven-group composition fails instead of
+        silently reporting a six-group upstream shape under the fork's name.
+        Set ``GLM53_REQUIRE_COMPOSITION=1`` (the Dockerfile does) to make a
+        missing per-group retention overlay a failure rather than a skip.
 Part D  launcher (host-only: the image copy carries no start.sh): the
         "GLM53 numeric config guard" block accepts GLM53_APC_NO_STORE only as
         exactly 0 or 1 (unset -> 1), the knob is forwarded to both ranks, and
@@ -35,6 +51,9 @@ the replicas only and Part C is skipped.
 Run:  python3 tests/test_apc_no_store.py
       GLM53_VLLM_SRC_ROOT=/path/to/vllm python3 tests/test_apc_no_store.py
       (Part C on the Mac: PYTHONPATH=<upstream clone> <cpu venv python> ...)
+      In-image composition gate (hybrid + per-group retention already applied):
+      GLM53_VLLM_SRC_ROOT=<pinned fork package> GLM53_REQUIRE_VLLM=1 \
+          GLM53_REQUIRE_COMPOSITION=1 python3 tests/test_apc_no_store.py
 """
 
 from __future__ import annotations
@@ -257,6 +276,28 @@ def func_src(text: str, name: str) -> str:
     return ""
 
 
+# Other overlays a staged source may already carry: the in-image gate runs this
+# file after patch_hybrid_prefix_hit.py and patch_apc_per_group_retention.py.
+# Reported (not asserted) so a Part A pass is not misread as pristine-upstream
+# application.
+OVERLAY_MARKS = {
+    "# [glm53-hybrid-apc]": "hybrid-apc",
+    "# [glm53-apc-per-group]": "apc-per-group",
+    "# [glm53-apc-drafter-priority]": "drafter-priority",
+}
+
+
+def overlay_provenance(root: Path | None) -> str:
+    if root is None:
+        return "vendored replicas"
+    parts = []
+    for rel in REL.values():
+        text = (root / rel).read_text()
+        marks = [name for mark, name in OVERLAY_MARKS.items() if mark in text]
+        parts.append(f"{Path(rel).name}={'+'.join(marks) or 'clean'}")
+    return f"{root} [{', '.join(parts)}]"
+
+
 # ---------------------------------------------------------------- part A ----
 
 
@@ -267,7 +308,9 @@ def part_a(root: Path | None) -> None:
         tmp = Path(raw)
         staged = stage(tmp, root, pristine_only=True)
         using_real = root is not None and all(MARK not in (root / r).read_text() for r in REL.values())
-        print(f"  sources: {'pristine ' + str(root) if using_real else 'vendored replicas'}")
+        print(f"  sources: {'pre-no-store ' + str(root) if using_real else 'vendored replicas'}")
+        if using_real:
+            print(f"  staged-source overlays: {overlay_provenance(root)}")
         for p in staged.values():
             check(MARK not in p.read_text(), f"A0 {p.name} starts pristine")
         pristine = {k: p.read_text() for k, p in staged.items()}
@@ -559,6 +602,24 @@ check(kvc_mod.BlockPool is BlockPool, "C0 the coordinator (and so KVCacheManager
 check("skip_writing_prefix_cache" in BlockPool.cache_full_blocks.__code__.co_consts and "skip_writing_prefix_cache" in BlockPool.cache_partial_block.__code__.co_consts, "C0 guards present in the loaded BlockPool")
 init_none_hash(sha256)
 
+# Provenance + deterministic fixture config. This file runs in-image AFTER
+# patch_hybrid_prefix_hit.py and patch_apc_per_group_retention.py; record what
+# was imported, and pin the global retention to dense -- the pinned runtime's
+# default and the .env.example guidance ("leave GLM53_APC_RETENTION_INTERVAL
+# unset") -- so the gate does not silently inherit a launcher's deployment
+# value. The env-driven SWA override is still exercised per mode in C3L.
+import vllm.envs as vllm_envs
+previous_global_retention = getattr(vllm_envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
+vllm_envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL = None
+coordinator_path = str(getattr(kvc_mod, "__file__", ""))
+retention_mark = "unreadable"
+if coordinator_path.endswith(".py"):
+    try:
+        retention_mark = "# [glm53-apc-per-group]" in Path(coordinator_path).read_text()
+    except OSError as exc:
+        retention_mark = f"unreadable ({exc})"
+print(f"       provenance: vllm={getattr(vllm, '__file__', '?')} coordinator={coordinator_path} retention_mark={retention_mark} src_root={ROOT} global_retention={previous_global_retention!r} -> None (dense)")
+
 records = []
 class H(logging.Handler):
     def emit(self, rec):
@@ -585,17 +646,48 @@ def hybrid_cfg(hbs, block, num_blocks):
         KVCacheGroupSpec(["mamba"], MambaSpec(block_size=block, shapes=(1, 1), dtypes=(torch.float32,), mamba_cache_mode="align")),
     ])
 
+class LayoutError(RuntimeError):
+    pass
+
+# The live GLM-5.3 group layout this fixture reproduces, by manager class. The
+# fork adds the KpoolTailSpec group; the upstream shape has six groups. A pass
+# on one shape is never reported as the other.
+LIVE_MANAGERS = {
+    True: ["FullAttentionManager", "KpoolTailManager", "MambaManager", "MambaManager", "MambaManager", "MambaManager", "SlidingWindowManager"],
+    False: ["FullAttentionManager", "MambaManager", "MambaManager", "MambaManager", "MambaManager", "SlidingWindowManager"],
+}
+
 def live_cfg(hbs, block, num_blocks):
+    """Live-shape fixture: MLA + [KpoolTail] + 4 Mamba(align) + EAGLE SWA drafter.
+
+    Returns ``(config, spec_names, fork_shaped)``. ``KpoolTailSpec`` is fork-only
+    and part of the layout under test: when this runtime exposes it, it must also
+    be constructible. Dropping it would run a six-group upstream shape while the
+    checks claim the fork's seven-group composition.
+    """
+    names = ["MLAAttentionSpec"]
     groups = [KVCacheGroupSpec(["mla"], MLAAttentionSpec(block_size=block, num_kv_heads=1, head_size=1, dtype=torch.float32))]
     if KpoolTailSpec is not None:
         try:
-            groups.append(KVCacheGroupSpec(["kpool"], KpoolTailSpec(block_size=hbs, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=block)))
-        except Exception as exc:  # constructor shape differs -> say so, keep going
-            print(f"       note: KpoolTailSpec present but not constructible here ({exc}); 6-group layout")
+            tail = KpoolTailSpec(block_size=hbs, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=block)
+        except Exception as exc:
+            raise LayoutError(
+                "KpoolTailSpec is exposed by this runtime but not constructible "
+                f"({exc!r}); a six-group fixture must not stand in for the fork's "
+                "seven-group layout"
+            ) from None
+        groups.append(KVCacheGroupSpec(["kpool"], tail))
+        names.append("KpoolTailSpec")
     for i in range(4):
         groups.append(KVCacheGroupSpec([f"m{i}"], MambaSpec(block_size=block, shapes=((1, 1),), dtypes=(torch.float32,), mamba_cache_mode="align")))
+        names.append("MambaSpec")
     groups.append(KVCacheGroupSpec(["swa"], SlidingWindowSpec(block_size=hbs, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=block), is_eagle_group=True))
-    return KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups)
+    names.append("SlidingWindowSpec")
+    return (
+        KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups),
+        names,
+        KpoolTailSpec is not None,
+    )
 
 def manager(cfg, hbs, sched, **kw):
     return KVCacheManager(cfg, max_model_len=8192, scheduler_block_size=sched, hash_block_size=hbs, enable_caching=True, **kw)
@@ -754,27 +846,150 @@ c0 = mk("c0", [0, 0, 1, 1, 2, 2]); cb, n, _ = m.get_computed_blocks(c0); m.alloc
 r1 = mk("r1", [0, 0, 1, 1, 2, 2, 3, 3]); cb, n, _ = m.get_computed_blocks(r1); m.allocate_slots(r1, 2, n, cb)
 check(m.get_blocks("r1").blocks[1][1].block_hash_num_tokens == 8, "C3d control: normal reader's CoW block is hashed at 8 tokens")
 
-# C3L -- the live layout: MLA + [KpoolTail] + 4 Mamba(align) + EAGLE SWA drafter, chunked prefill + decode
-for label, ns in (("normal", False), ("nostore", True)):
-    m = manager(live_cfg(2, 4, 96), 2, 4, use_eagle=True)
-    if label == "normal":
-        print(f"       layout: {[type(x).__name__ for x in managers(m)]} eagle={sorted(m.coordinator.eagle_group_ids)}")
-    req = mk(label, list(range(2000, 2014)), no_store=ns)
-    n, trace = prefill(m, req, (4, 4, 4, 2))
-    req.append_output_token_ids([9]); check(m.allocate_slots(req, 1) is not None, f"C3L [{label}] decode step after chunked prefill")
-    req.num_computed_tokens += 1; req.append_output_token_ids([9]); check(m.allocate_slots(req, 1) is not None, f"C3L [{label}] second decode step")
-    legs[label] = (m, req, trace)
-mN, rN, tN = legs["normal"]; mQ, rQ, tQ = legs["nostore"]
-check([t[0] for t in tN] == [t[0] for t in tQ], f"C3L per-group num_cached_block traces identical across all groups -> {[t[0] for t in tQ]}")
-check(all(t[1] for t in tN), "C3L [normal] hashes present")
-check(not any_hash(mQ, "nostore"), "C3L [nostore] no hash in ANY group (MLA, mamba x4, EAGLE SWA) after prefill + decode")
-check(all(mgr.cached_blocks_this_step == set() for mgr in managers(mQ) if hasattr(mgr, "cached_blocks_this_step")), "C3L [nostore] mamba cached_blocks_this_step stays empty")
-f = mk("f", list(range(2000, 2016)))
-_, nQ, _ = mQ.get_computed_blocks(f); _, nN, _ = mN.get_computed_blocks(mk("f2", list(range(2000, 2016))))
-check(nQ == 0 and nN > 0, f"C3L same-prefix follow-up: normal hits {nN}, no-store hits {nQ}")
-idsQ = block_ids(mQ, "nostore"); mQ.free(rQ)
-nxt = mQ.block_pool.get_new_blocks(4)
-check({b.block_id for b in nxt} <= idsQ, "C3L [nostore] freed blocks are the very next ids recycled")
+# C3L -- live-shape layout (see live_cfg): chunked prefill + two decode steps +
+# free-queue recycling, once per retention mode this runtime supports. The
+# composed gate runs this file AFTER patch_hybrid_prefix_hit.py and
+# patch_apc_per_group_retention.py, so these legs run on the real hybrid +
+# per-group retention + injected-no-store stack.
+SWA_ENV = "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA"
+RETENTION_HELPERS = ("_glm53_swa_retention_env", "_glm53_min_exempt_group_ids", "_glm53_resolve_retention_by_group")
+retention_overlay = all(hasattr(kvc_mod, _name) for _name in RETENTION_HELPERS)
+require_composition = os.environ.get("GLM53_REQUIRE_COMPOSITION", "") == "1"
+# Sparse global for the wiring-only mode: above the fixture's MambaSpec block
+# size (4) and a multiple of its scheduler_block_size (2), so the four mamba
+# groups resolve sparse and the retained #130 prior-replay policy arms.
+SPARSE_GLOBAL = 8
+if retention_overlay:
+    live_modes = [
+        ("inherit", "", None, False),
+        ("SWA=0", "0", None, False),
+        ("SWA=0+sparse-global", "0", SPARSE_GLOBAL, True),
+    ]
+else:
+    live_modes = [("no-retention-runtime", None, None, False)]
+    check(
+        not require_composition,
+        "C3L the per-group retention overlay is missing from the loaded coordinator "
+        "(hybrid + per-group retention must be installed before this run)"
+        + (" -- GLM53_REQUIRE_COMPOSITION=1" if require_composition else "; the live leg still runs without it"),
+    )
+
+def retention_state(m, mode, env_value, n_groups):
+    """Per-group retention state + free/replay wiring this mode must resolve."""
+    vector = getattr(m.coordinator, "retention_interval_by_group", None)
+    global_value = getattr(m.coordinator, "retention_interval", "<missing>")
+    check(isinstance(vector, tuple) and len(vector) == n_groups, f"C3L [{mode}] resolved per-group retention vector sized to the runtime layout -> {vector}")
+    if not isinstance(vector, tuple) or len(vector) != n_groups:
+        return
+    if env_value == "":
+        check(set(vector) == {global_value}, f"C3L [{mode}] unset {SWA_ENV} inherits the global value ({global_value!r}) for every group -> {vector}")
+        check(m.block_pool.low_priority_cache_group_ids == frozenset(), f"C3L [{mode}] no drafter-priority free class without an explicit SWA interval -> {sorted(m.block_pool.low_priority_cache_group_ids)}")
+    else:
+        drafter = n_groups - 1
+        check(vector[drafter] == 0 and all(v == global_value for v in vector[:drafter]), f"C3L [{mode}] explicit SWA 0 applies only to the min-exempt drafter group -> {vector} (global={global_value!r})")
+        check(m.block_pool.low_priority_cache_group_ids == frozenset({drafter}), f"C3L [{mode}] explicit SWA 0 puts the drafter group in the low-priority free class -> {sorted(m.block_pool.low_priority_cache_group_ids)}")
+        order = getattr(m.coordinator, "_glm53_free_manager_order", ())
+        check(len(order) == n_groups and set(order) == set(range(n_groups)) and order[0] == drafter, f"C3L [{mode}] free order releases the low-priority drafter manager first -> {order}")
+    prior = getattr(m.coordinator, "dflash_replay_prior_group_ids", None)
+    if prior is not None:
+        mgrs = managers(m)
+        sparse = {
+            i
+            for i, mgr in enumerate(mgrs)
+            if type(mgr).__name__ == "MambaManager"
+            and (vector[i] == 0 or (vector[i] is not None and vector[i] > getattr(mgr, "block_size", 0)))
+        }
+        armed = {i for i, mgr in enumerate(mgrs) if getattr(mgr, "_glm53_retain_previous_dflash_boundary", False)}
+        check(set(prior) == sparse and armed == sparse, f"C3L [{mode}] prior-boundary replay arming follows the resolved retention vector -> prior={sorted(prior)} sparse_mamba={sorted(sparse)} armed={sorted(armed)}")
+
+def partial_state(m, rid):
+    """Managers holding this request as a partial-tail reader/producer."""
+    out = []
+    for mgr in managers(m):
+        hit = rid in getattr(mgr, "_partial_hit_reqs", {})
+        prod = rid in getattr(mgr, "_producer_partial_tail_reqs", {})
+        if hit or prod:
+            out.append(type(mgr).__name__)
+    return out
+
+def live_manager(mode, print_layout=True):
+    """Build the live-shape manager; ``(manager, group_count)`` or ``None``."""
+    try:
+        cfg, spec_names, fork_shaped = live_cfg(2, 4, 96)
+        m = manager(cfg, 2, 4, use_eagle=True)
+    except LayoutError as exc:
+        check(False, f"C3L [{mode}] {exc}")
+        return None
+    except Exception as exc:  # e.g. the retention overlay's fail-closed boot
+        check(False, f"C3L [{mode}] manager construction raised {type(exc).__name__}: {exc}")
+        return None
+    got = [type(x).__name__ for x in managers(m)]
+    want = LIVE_MANAGERS[fork_shaped]
+    if print_layout:
+        partial_hits = getattr(m.coordinator, "enable_partial_hash_hits", "<missing>")
+        print(f"       layout [{mode}]: specs={spec_names} managers={got} fork_seven_group={fork_shaped} eagle={sorted(m.coordinator.eagle_group_ids)} partial_hits={partial_hits}")
+    check(got == want, f"C3L [{mode}] runtime group layout is explicit: {want} -> {got}")
+    return m, len(want)
+
+def live_mode(mode, env_value, global_value=None, wiring_only=False):
+    saved_swa = os.environ.get(SWA_ENV)
+    saved_global = getattr(vllm_envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
+    if env_value is not None:
+        os.environ[SWA_ENV] = env_value
+    if global_value is not None:
+        vllm_envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL = global_value
+    try:
+        built = live_manager(mode)
+        if built is None:
+            return
+        m, n_groups = built
+        if env_value is not None:
+            retention_state(m, mode, env_value, n_groups)
+        if wiring_only:
+            return
+        legs = {}
+        for label, ns in (("normal", False), ("nostore", True)):
+            made = live_manager(f"{mode}/{label}", print_layout=False)
+            if made is None:
+                return
+            m, _ = made
+            req = mk(label, list(range(2000, 2014)), no_store=ns)
+            n, trace = prefill(m, req, (4, 4, 4, 2))
+            req.append_output_token_ids([9])
+            check(m.allocate_slots(req, 1) is not None, f"C3L [{mode}/{label}] decode step after chunked prefill")
+            req.num_computed_tokens += 1
+            req.append_output_token_ids([9])
+            check(m.allocate_slots(req, 1) is not None, f"C3L [{mode}/{label}] second decode step")
+            legs[label] = (m, req, trace)
+        mN, rN, tN = legs["normal"]
+        mQ, rQ, tQ = legs["nostore"]
+        check([t[0] for t in tN] == [t[0] for t in tQ], f"C3L [{mode}] per-group num_cached_block traces identical across the normal and no-store legs -> {[t[0] for t in tQ]}")
+        check(all(t[1] for t in tN), f"C3L [{mode}] [normal] hashes present (control)")
+        check(not any_hash(mQ, "nostore"), f"C3L [{mode}] [nostore] no hash in ANY group after prefill + decode (full site)")
+        check(all(mgr.cached_blocks_this_step == set() for mgr in managers(mQ) if hasattr(mgr, "cached_blocks_this_step")), f"C3L [{mode}] [nostore] mamba cached_blocks_this_step stays empty")
+        # Partial-site provenance: the normal leg's registrations are printed,
+        # not asserted (this runtime decides whether the partial path is reached
+        # in this shape); the discriminating partial-site legs are C2 and C3a.
+        print(f"       partial-tail readers/producers on the normal leg [{mode}]: {partial_state(mN, 'normal') or 'none'}")
+        check(partial_state(mQ, "nostore") == [], f"C3L [{mode}] [nostore] no manager registered it as a partial-tail reader/producer")
+        f = mk("f", list(range(2000, 2016)))
+        _, nQ, _ = mQ.get_computed_blocks(f)
+        _, nN, _ = mN.get_computed_blocks(mk("f2", list(range(2000, 2016))))
+        check(nQ == 0 and nN > 0, f"C3L [{mode}] same-prefix follow-up: normal hits {nN}, no-store hits {nQ}")
+        idsQ = block_ids(mQ, "nostore")
+        mQ.free(rQ)
+        nxt = mQ.block_pool.get_new_blocks(4)
+        check({b.block_id for b in nxt} <= idsQ, f"C3L [{mode}] [nostore] freed blocks are the very next ids recycled")
+    finally:
+        if env_value is not None:
+            if saved_swa is None:
+                os.environ.pop(SWA_ENV, None)
+            else:
+                os.environ[SWA_ENV] = saved_swa
+        vllm_envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL = saved_global
+
+for _mode, _swa, _global, _wiring in live_modes:
+    live_mode(_mode, _swa, _global, _wiring)
 
 # C4 -- preemption bookkeeping: cold no-store recomputes from 0; a read-hit no-store resumes from what it read.
 m = manager(full_cfg(4, 20), 2, 4)
@@ -853,6 +1068,10 @@ def part_c(root: Path | None) -> None:
         script.write_text(PART_C)
         env = {k: v for k, v in os.environ.items() if not k.startswith("GLM53_")}
         env.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
+        # GLM53_* is stripped above (patch-path overrides); carry the strictness
+        # flag through explicitly so C3L can require the retention composition.
+        if os.environ.get("GLM53_REQUIRE_COMPOSITION", "") == "1":
+            env["GLM53_REQUIRE_COMPOSITION"] = "1"
         r = subprocess.run([sys.executable, str(script), str(root), str(PATCH), str(tmp)], capture_output=True, text=True, env=env)
         for line in r.stdout.splitlines():
             if line.startswith("  ok") or line.startswith("  FAIL") or line.startswith("       "):
