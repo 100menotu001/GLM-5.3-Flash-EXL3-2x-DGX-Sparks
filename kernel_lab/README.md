@@ -8,6 +8,12 @@ The workload interface is model-agnostic. Model IDs and operator names are
 receipt provenance; arbitrary future models provide their actual `M/N/K`
 shapes without being added to a registry.
 
+This lab is development-only source in this repository. The production
+Dockerfile neither copies nor installs `kernel_lab/`, so the lab is absent
+from the served image and no production launch path imports it. Nothing here
+is a speedup claim for the production pin: the SM121 tactic sweep has not yet
+run on target hardware.
+
 ## Portable correctness
 
 The NumPy oracle supports the upstream MCG trellis at every integer bitrate
@@ -86,20 +92,26 @@ the supported-model set.
 
 ## Upstream comparison
 
-The production image remains pinned to ExLlamaV3 `c5d9c657` (0.0.43). The
-Docker build already accepts an alternate immutable revision, and now exposes
-that revision to receipts through `EXLLAMAV3_COMMIT`:
+The production image remains pinned to ExLlamaV3 `c5d9c657` (0.0.43). Building
+and self-checking an alternate immutable revision stays an isolated experiment
+in a source checkout of this repository: the production Dockerfile carries no
+benchmark build argument, commit stamp or copy of `kernel_lab/` for it, and
+this branch does not silently replace the production pin.
 
-```bash
-docker build \
-  --build-arg RUNTIME_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  --build-arg EXLLAMAV3_COMMIT=0c49587a7c235e6303a6bbedc8b665272ad3a2ea \
-  -t exl3-sm121-candidate .
-```
+Measured receipts take their runtime-source provenance from `--runtime-commit`
+or from the Git identity of the clean checkout that produced them. The
+`RUNTIME_SOURCE_COMMIT` environment override is honored only when the caller
+set it to the exact source commit that is loaded; it is a declaration, not
+attestation. If no full SHA can be resolved, the runner fails instead of
+emitting a receipt with unknown provenance.
 
-That current upstream candidate adds the QTIP-style small-M GEMV and fused
-mul1 int8-activation GEMV. It must be built and self-checked as an isolated
-candidate; this branch does not silently replace the production pin.
+The current upstream candidate at
+`0c49587a7c235e6303a6bbedc8b665272ad3a2ea` adds the QTIP-style small-M GEMV
+and fused mul1 int8-activation GEMV. A developer-provided backend must set
+`EXLLAMAV3_COMMIT` to its actual commit before the metadata module is imported;
+the pinned fallback describes only the production pin and cannot prove an
+arbitrary installed extension's identity. Unknown or mismatched backend/source
+identity is not measurement evidence.
 
 Grouped MoE, prefill, mixed EXL3/NVFP4 dispatch, vLLM/SGLang-wide integration,
 attention, KV, scheduling, and networking remain outside this first measured

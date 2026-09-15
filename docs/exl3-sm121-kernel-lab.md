@@ -13,7 +13,7 @@ SM121 device:
 - enumerate ExLlamaV3's built-in tile shapes and SM quotas;
 - emit native Atlas receipts for every exact measured tactic;
 - keep the production ExLlamaV3 pin unchanged while enabling an isolated
-  current-upstream comparison image.
+  current-upstream comparison from this development-only source checkout.
 
 No speedup is claimed until the checked-in sweep runs on SM121.
 
@@ -23,6 +23,10 @@ CUDA/runtime work belongs in this serving repository. Atlas owns profiling,
 candidate decisions, receipt import, and promotion gates. This lab is the
 bridge: it produces `atlas.kernel-benchmark/v1` measurements that Atlas can
 rank without importing CUDA infrastructure.
+
+The lab is development-only source: the production Dockerfile neither copies
+nor installs `kernel_lab/`, and no production launch path imports it. Receipts
+come from a source checkout, never from a served image.
 
 The surrounding deployment remains GLM-specific, but the kernel-lab API is
 not. `model_id`, `operator`, and `phase` are receipt provenance strings.
@@ -49,9 +53,18 @@ integer upstream bitrate K1-K8. Fractional model-wide rates remain allocations
 across integer-rate tensors, not an invented fractional tensor format.
 
 Production remains pinned to ExLlamaV3
-`c5d9c657966ffeeaa9353f0cc899f18629da4a13`. The Docker build argument can
-select a different immutable upstream commit for an isolated experiment, and
-the selected commit is embedded into benchmark receipts.
+`c5d9c657966ffeeaa9353f0cc899f18629da4a13`. An alternate immutable upstream
+commit can still be built and self-checked as an isolated source-checkout
+experiment, but this lab is development-only: the production Dockerfile carries
+no build stamp or copy for it. Measured receipts take the runtime source commit
+from `--runtime-commit` or from the Git identity of the clean checkout that
+produced them, and fail instead of emitting a receipt when no full SHA
+resolves. The `RUNTIME_SOURCE_COMMIT` and `EXLLAMAV3_COMMIT` environment
+values are declarations, not attestation: the first is honored only when it is
+exactly the loaded source, and the second must be supplied before the metadata
+module is imported because the pinned fallback describes only the production
+pin and cannot prove an arbitrary installed extension's identity. Unknown or
+mismatched backend/source identity is not measurement evidence.
 
 ## Reference and direct paths
 
@@ -105,6 +118,11 @@ should focus on M=1/2/4/8; wider M values locate the direct-to-reconstruction
 crossover.
 
 ## Evidence so far
+
+The entries below are the author's recorded results for the dates given. They
+were not re-run at the development-only cutover head and are not exact-head
+qualification; the counts belong to their own runs and are not reconciled into
+a single figure.
 
 ### Measured — portable host
 
