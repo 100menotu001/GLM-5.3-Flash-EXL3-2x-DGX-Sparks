@@ -4,11 +4,28 @@
 # graph-enabled boot, once real traffic (or a bench) has produced >100 drafts.
 # Healthy: pos0 ratio well below 1.0 and monotone decay across positions.
 # Source: tonyd2wild/GLM-5.3-Flash-NVFP4-1M-KV-4x-DGX-Spark docs/OPEN-PROBLEMS.md #7.
+#
+# Usage: spec-accept-gate.sh [metrics-base-url]  (default http://127.0.0.1:8888)
+# Exit codes: 0 PASS, or SKIP when <100 drafts have accumulated since boot;
+#             1 FAIL: pos0 pinned at ~1.00 (the vllm#53030 signature);
+#             2 cannot judge: the endpoint is unreachable, or a required
+#             series is missing or ambiguous. An unreadable acceptance curve
+#             must never be reported as PASS, FAIL or SKIP.
 set -euo pipefail
-BASE="${1:-http://192.168.100.126:8888}"
+BASE="${1:-http://127.0.0.1:8888}"
 
-metrics=$(curl --noproxy '*' -fsS --max-time 10 "${BASE}/metrics")
-drafts=$(printf '%s\n' "$metrics" | grep -F 'spec_decode_num_drafts_total{' | grep -oE '[0-9.e+]+$' || echo 0)
+die() { echo "ERROR: $*" >&2; exit 2; }
+
+metrics=$(curl --noproxy '*' -fsS --max-time 10 "${BASE}/metrics") ||
+  die "cannot read ${BASE}/metrics (curl rc $?)"
+
+# Two label sets (e.g. one endpoint serving two model_name values) have no
+# defensible aggregate here; concatenating them silently corrupts every ratio.
+drafts_series=$(printf '%s\n' "$metrics" | grep -F 'spec_decode_num_drafts_total{' || true)
+drafts_n=$(printf '%s\n' "$drafts_series" | grep -cE '[0-9.e+]+$' || true)
+[ "$drafts_n" -le 1 ] ||
+  die "${drafts_n} spec_decode_num_drafts_total series in /metrics — ambiguous label sets, refusing to pick a denominator"
+drafts=$(printf '%s\n' "$drafts_series" | grep -oE '[0-9.e+]+$' || echo 0)
 drafts=${drafts%%.*}
 if [ "${drafts:-0}" -lt 100 ]; then
   echo "SKIP: only ${drafts:-0} drafts since boot (<100); send a bench round first"
@@ -16,15 +33,26 @@ if [ "${drafts:-0}" -lt 100 ]; then
 fi
 
 echo "drafts_total=${drafts}"
-fail=0
-printf '%s\n' "$metrics" | grep -F 'accepted_tokens_per_pos_total{' | while IFS= read -r line; do
-  pos=$(printf '%s' "$line" | grep -oE 'position="[0-9]+"' | grep -oE '[0-9]+')
-  val=$(printf '%s' "$line" | grep -oE '[0-9.e+]+$'); val=${val%%.*}
+
+# Per-position series must exist once >100 drafts have run; their absence used
+# to end the script mid-run (rc 1, with nothing but drafts_total printed).
+pos_series=$(printf '%s\n' "$metrics" | grep -F 'accepted_tokens_per_pos_total{' || true)
+[ -n "$pos_series" ] ||
+  die "no accepted_tokens_per_pos_total series in /metrics — model is not spec-decoding, or the metric name drifted; cannot judge acceptance"
+positions=$(printf '%s\n' "$pos_series" | grep -oE 'position="[0-9]+"' | grep -oE '[0-9]+' | sort -n | uniq)
+printf '%s\n' "$positions" | grep -qx '0' ||
+  die 'per-position series present but position="0" is missing — cannot judge the pinned-1.00 signature'
+
+for pos in $positions; do
+  n=$(printf '%s\n' "$pos_series" | grep -cF "position=\"${pos}\"" || true)
+  [ "$n" -eq 1 ] ||
+    die "${n} series for position=\"${pos}\" — ambiguous label sets, refusing to aggregate them into one ratio"
+  val=$(printf '%s\n' "$pos_series" | grep -F "position=\"${pos}\"" | grep -oE '[0-9.e+]+$'); val=${val%%.*}
   ratio=$(awk -v a="$val" -v d="$drafts" 'BEGIN{printf "%.4f", a/d}')
   echo "pos${pos}: accepted=${val} ratio=${ratio}"
 done
 
-pos0=$(printf '%s\n' "$metrics" | grep -F 'accepted_tokens_per_pos_total{' | grep -F 'position="0"' | grep -oE '[0-9.e+]+$'); pos0=${pos0%%.*}
+pos0=$(printf '%s\n' "$pos_series" | grep -F 'position="0"' | grep -oE '[0-9.e+]+$'); pos0=${pos0%%.*}
 ratio0=$(awk -v a="$pos0" -v d="$drafts" 'BEGIN{printf "%.4f", a/d}')
 pinned=$(awk -v r="$ratio0" 'BEGIN{print (r>0.999)?1:0}')
 if [ "$pinned" = "1" ]; then
