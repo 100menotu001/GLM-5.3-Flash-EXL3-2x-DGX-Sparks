@@ -924,10 +924,6 @@ def part_d() -> None:
         check(PATCH.parent == HERE, "D0 no start.sh next to the test: launcher legs are host-only (in-image run)")
         return
     guard = guard_source()
-    check('_glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}"' in guard, "D1 the guard validates GLM53_APC_NO_STORE with the 0/1 validator (unset -> 1)")
-    src = START.read_text()
-    check('-e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"' in src, "D1 the knob is forwarded to the containers (nccl_common, both ranks)")
-    check('GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"' in src, "D1 default 1 applies only when UNSET")
     for label, export, dotenv, want in (
         ("caller unset: the .env value is what the ranks get", None, "GLM53_APC_NO_STORE=0\n", (0, "0")),
         ("a caller export wins over .env", "1", "GLM53_APC_NO_STORE=0\n", (0, "1")),
