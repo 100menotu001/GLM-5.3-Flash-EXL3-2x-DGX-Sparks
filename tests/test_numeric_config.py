@@ -185,6 +185,8 @@ def test_mixed_prefill_contract() -> None:
         assert '-e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"' in source
         if launcher.name == "start-tp3.sh":
             assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-0}"' in source
+        elif launcher.name == "start-tp4.sh":
+            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"' in source
         else:
             assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"' in source
         guard = guard_source(launcher)
@@ -195,7 +197,7 @@ def test_mixed_prefill_contract() -> None:
     for env_example, chunk in (
         (ROOT / ".env.example", "fair"),
         (ROOT / ".env.tp3.example", "0"),
-        (ROOT / ".env.tp4.example", "fair"),
+        (ROOT / ".env.tp4.example", "skip"),
     ):
         text = env_example.read_text()
         assert f"GLM53_MIXED_PREFILL_CHUNK={chunk}" in text, env_example

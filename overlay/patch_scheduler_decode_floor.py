@@ -15,8 +15,8 @@ GLM53_MIXED_PREFILL_CHUNK:
                The cap is fed into hybrid Mamba alignment so N < block_size
                still makes sub-block progress. 128 still stalls ~10 tok/s.
   0 / off    — disable the extra isolation policy.
-  fair       — service-time mixing (default on TP=2/TP=4 since 2026-09-15,
-               v5; opt-in on TP=3). Decode-only
+  fair       — service-time mixing (TP=2 default since 2026-09-15, v5;
+               opt-in on TP=3/TP=4). Decode-only
                steps between prefill turns; at most
                GLM53_FAIR_PREFILL_MAX_CHUNKS chunks per turn (default 1).
                Only prefill that contends with a decoder is charged (solo

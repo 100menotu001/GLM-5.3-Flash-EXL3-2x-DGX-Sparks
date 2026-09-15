@@ -16,7 +16,7 @@ A ~30k unique newcomer on the same recipe also finished **during** the essay (**
 
 Incumbent decode did **not** collapse to the reporter’s 0.8–2.8 tok/s under `CHUNK=0`. On the essay, overlap rate stayed **~20.6–20.9 tok/s** vs ~24.7 solo (about **1.18–1.20×**). In-run, vs the 10 s of decode before B: **1.06×** (2k B) and **1.21×** (30k B).
 
-`start.sh`, `.env.example`, `start-tp4.sh`, and `.env.tp4.example` default `GLM53_MIXED_PREFILL_CHUNK` to **`fair`**. TP=3 (`start-tp3.sh`, `.env.tp3.example`) stays **`0`**. Revert TP=2/4 with `skip`.
+`start.sh` and `.env.example` default `GLM53_MIXED_PREFILL_CHUNK` to **`fair`**. TP=3 stays **`0`**; TP=4 stays **`skip`**. Opt in on those launchers with `fair`.
 
 | Claim | `skip` | v4 `fair` (prior) | **v5 `fair` (this retest)** |
 |---|---|---|---|
