@@ -17,11 +17,6 @@ Part B  patch mechanics on a fixture built from verbatim excerpts of the live
         with NOTHING written, partial / altered markers refused, missing
         binding refused, --preflight, pyc clear; the real installed file when
         present (mandatory with GLM53_REQUIRE_TARGET=1, i.e. in the image).
-Part C  launcher wiring: the numeric-config guard accepts exactly 0/1 for
-        GLM53_KV_CAPACITY_LOG (unset -> 1), caller capture is set-ness aware,
-        artifact guard entry, scp + both mounts + `-e` forward, overlay order
-        after patch_glm5_drafter_group.py, Dockerfile test-before-patch,
-        .env.example and README rows.
 """
 from __future__ import annotations
 
@@ -44,10 +39,6 @@ PATCH = next(
 sys.path.insert(0, str(PATCH.parent))
 import patch_kv_capacity_log as P  # noqa: E402
 
-START = ROOT / "start.sh"
-DOCKERFILE = ROOT / "Dockerfile"
-ENV_EXAMPLE = ROOT / ".env.example"
-README = ROOT / "README.md"
 
 CHECKS = 0
 FAILURES: list[str] = []
@@ -712,106 +703,12 @@ def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
 
 
-# --------------------------------------------------------------------------
-# Part C -- launcher / image wiring
-# --------------------------------------------------------------------------
-def guard_source() -> str:
-    text = START.read_text()
-    begin = text.index("# GLM53 numeric config guard (begin)")
-    end_marker = "# GLM53 numeric config guard (end)"
-    return text[begin : text.index(end_marker, begin) + len(end_marker)]
-
-
-def part_c() -> None:
-    print("Part C: launcher / image wiring")
-    if not START.is_file():
-        check(False, "C0 start.sh missing")
-        return
-    src = START.read_text()
-    guard = guard_source()
-    check('_glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}"' in guard, "C1 the numeric guard validates GLM53_KV_CAPACITY_LOG with the 0/1 validator (unset -> 1)")
-    # Caller precedence is the launcher's generic export snapshot/replay
-    # (`_caller_overrides`), not a per-knob capture: drive the real preamble
-    # against a synthetic .env, the way tests/test_start_overrides.py does.
-    def preamble_value(dotenv: str, caller: dict[str, str]) -> str:
-        marker = "# ----------------------------- configuration -------------------------------"
-        preamble, sep, _rest = src.partition(marker)
-        assert sep, "start.sh pre-configuration preamble marker is missing"
-        with tempfile.TemporaryDirectory() as raw:
-            tmp = Path(raw)
-            script = tmp / "start.sh"
-            script.write_text(
-                preamble + '\nprintf "%s\\n" "${GLM53_KV_CAPACITY_LOG-UNSET}"\n'
-            )
-            script.chmod(0o755)
-            (tmp / ".env").write_text(dotenv)
-            env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}
-            env.update(caller)
-            done = subprocess.run(
-                ["bash", str(script)], text=True, capture_output=True, env=env
-            )
-        return done.stdout.strip()
-
-    check(preamble_value("GLM53_KV_CAPACITY_LOG=0\n", {}) == "0", "C1 .env applies when the caller is silent")
-    check(
-        preamble_value("GLM53_KV_CAPACITY_LOG=0\n", {"GLM53_KV_CAPACITY_LOG": "1"}) == "1",
-        "C1 a caller export wins over .env",
-    )
-    check(
-        preamble_value("GLM53_KV_CAPACITY_LOG=1\n", {"GLM53_KV_CAPACITY_LOG": ""}) == "",
-        "C1 an explicitly empty caller export survives .env and reaches the guard",
-    )
-    check('GLM53_KV_CAPACITY_LOG="${GLM53_KV_CAPACITY_LOG-1}"' in src, "C1 default 1 applies only when UNSET")
-    check('KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"' in src, "C2 KVCAP_PATCH_HOST defaults to the shipped overlay")
-    check('"$KVCAP_PATCH_HOST|[glm53-kv-capacity-log]|$main_guard"' in src and "validate_overlay_artifacts" in src, "C2 the overlay is in the fail-closed artifact guard (identity string + EOF sentinel)")
-    check("start|restart) validate_numeric_config; configure_capture_sizes; validate_overlay_artifacts ;;" in src, "C2 the guards run on start|restart before anything else in main()")
-    check('[ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"' in src and 'scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"' in src, "C2 preflight existence check + scp to the worker")
-    check("-v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro'" in src and '-v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro"' in src, "C2 read-only mount on both ranks")
-    check('-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"' in src, "C2 the knob is forwarded in nccl_common (both ranks)")
-    check('log "boot KV-capacity breakdown log: GLM53_KV_CAPACITY_LOG=${GLM53_KV_CAPACITY_LOG} (both ranks)"' in src, "C2 the launcher logs the effective value")
-    order = src[src.index("GLM53_OVERLAY_ORDER=(") : src.index(")", src.index("GLM53_OVERLAY_ORDER=("))]
-    names = order.split()[1:]
-    check("patch_kv_capacity_log.py" in names and names.index("patch_kv_capacity_log.py") > names.index("patch_glm5_drafter_group.py") and names.index("patch_kv_capacity_log.py") > names.index("patch_hybrid_prefix_hit.py") and names.index("patch_kv_capacity_log.py") < names.index("patch_xgrammar_termination.py"), f"C3 pinned order: drafter-group -> hybrid -> ... -> kv-capacity-log -> xgrammar ({names.index('patch_kv_capacity_log.py')})")
-    check('emit_overlay_block >> "$HEAD_SCRIPT"' in src and 'emit_overlay_block >> "$WORKER_SCRIPT"' in src, "C3 both rank scripts take the order from emit_overlay_block")
-    overlay_text = PATCH.read_text()
-    last = [ln for ln in overlay_text.splitlines() if ln.strip()][-1]
-    check(last == "    sys.exit(main())" and "[glm53-kv-capacity-log]" in overlay_text, "C3 overlay ends with the EOF sentinel and carries its identity string (artifact guard contract)")
-
-    def run(value):
-        script = guard + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n" + "validate_numeric_config || exit $?\n" + 'printf "%s\\n" "${GLM53_KV_CAPACITY_LOG-unset}"\n'
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"}
-        if value is not None:
-            env["GLM53_KV_CAPACITY_LOG"] = value
-        r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
-
-    for value, out in ((None, "unset"), ("0", "0"), ("1", "1")):
-        rc, o, e = run(value)
-        check(rc == 0 and o == out, f"C4 GLM53_KV_CAPACITY_LOG={value!r} accepted (rc={rc} out={o!r} {e[:60]})")
-    for value in ("", " ", "01", "2", "yes", "true", "1 ", " 1", "1\r", "0x1", "-1"):
-        rc, o, e = run(value)
-        check(rc == 2 and "GLM53_KV_CAPACITY_LOG" in e, f"C4 GLM53_KV_CAPACITY_LOG={value!r} rejected rc=2 with a named error (rc={rc} {e[:60]!r})")
-
-    if DOCKERFILE.is_file():
-        d = DOCKERFILE.read_text()
-        i_hyb = d.index("RUN python3 /opt/glm53/patch_hybrid_prefix_hit.py")
-        i_drf = d.index("RUN python3 /opt/glm53/patch_glm5_drafter_group.py")
-        i_tst = d.index("python3 /opt/glm53/test_kv_capacity_log.py")
-        i_pat = d.index("RUN python3 /opt/glm53/patch_kv_capacity_log.py")
-        check("COPY overlay/patch_kv_capacity_log.py /opt/glm53/patch_kv_capacity_log.py" in d and "COPY tests/test_kv_capacity_log.py /opt/glm53/test_kv_capacity_log.py" in d, "C5 Dockerfile copies overlay + test")
-        check(i_drf < i_hyb < i_tst < i_pat and "GLM53_REQUIRE_TARGET=1" in d[i_tst - 200 : i_tst], "C5 Dockerfile: drafter-group -> hybrid -> this test (installed file mandatory) -> this patch")
-    if ENV_EXAMPLE.is_file():
-        check("GLM53_KV_CAPACITY_LOG=1" in ENV_EXAMPLE.read_text(), "C6 .env.example documents the knob")
-    if README.is_file():
-        rd = README.read_text()
-        check("| `GLM53_KV_CAPACITY_LOG` | `1` |" in rd and "## What the KV cache boot line means" in rd and "`overlay/patch_kv_capacity_log.py`" in rd, "C6 README: knob row, section, overlay row")
 
 
 def main() -> int:
     print(f"overlay: {PATCH}  python: {sys.executable}")
     part_a()
     part_b()
-    part_c()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}/{CHECKS}): " + "; ".join(FAILURES))

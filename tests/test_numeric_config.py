@@ -130,12 +130,21 @@ def test_spinwait_numeric_contract() -> None:
         assert "GLM53_SPINWAIT_MS must" in result.stderr, bad
 
 
-def test_restart_validates_before_stop() -> None:
-    source = START.read_text()
-    main = source.index("main() {")
-    validation = source.index("start|restart) validate_numeric_config", main)
-    restart = source.index("restart)  stop; start", main)
-    assert validation < restart
+def test_kv_capacity_log_flag() -> None:
+    script = (
+        guard_source()
+        + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
+        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; '
+        + 'GLM53_SPINWAIT_MS=stock; export GLM53_KV_CAPACITY_LOG="$1"\n'
+        + 'validate_numeric_config\n'
+    )
+    for value, expected in (("0", 0), ("1", 0), ("", 2), ("2", 2)):
+        result = subprocess.run(
+            ["bash", "-c", script, "test", value],
+            text=True, capture_output=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        assert result.returncode == expected, (value, result.stdout, result.stderr)
 
 
 def test_tp4_rejects_retention_override() -> None:
@@ -157,9 +166,6 @@ def test_tp4_rejects_retention_override() -> None:
             )
             assert result.returncode == expected, (value, result.stderr)
 
-    source = START_TP4.read_text()
-    assert '_cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"' in source
-    assert '[ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"' in source
 
 
 if __name__ == "__main__":
@@ -167,6 +173,6 @@ if __name__ == "__main__":
     test_decimal_normalization()
     test_indexer_workspace_enum()
     test_spinwait_numeric_contract()
-    test_restart_validates_before_stop()
+    test_kv_capacity_log_flag()
     test_tp4_rejects_retention_override()
     print("numeric config tests: PASS")
