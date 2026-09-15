@@ -730,12 +730,41 @@ def part_c() -> None:
     src = START.read_text()
     guard = guard_source()
     check('_glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}"' in guard, "C1 the numeric guard validates GLM53_KV_CAPACITY_LOG with the 0/1 validator (unset -> 1)")
-    check('_cli_kvcap_set="${GLM53_KV_CAPACITY_LOG+1}"' in src and '_cli_kvcap="${GLM53_KV_CAPACITY_LOG-}"' in src and '[ -n "${_cli_kvcap_set}" ] && GLM53_KV_CAPACITY_LOG="$_cli_kvcap"' in src, "C1 caller export wins over .env, set-ness aware (an explicitly empty export is captured, then rejected)")
-    check(src.index('_cli_kvcap_set="${GLM53_KV_CAPACITY_LOG+1}"') < src.index('source "$SCRIPT_DIR/.env"') < src.index('[ -n "${_cli_kvcap_set}" ] && GLM53_KV_CAPACITY_LOG="$_cli_kvcap"'), "C1 capture before .env is sourced, replay after")
+    # Caller precedence is the launcher's generic export snapshot/replay
+    # (`_caller_overrides`), not a per-knob capture: drive the real preamble
+    # against a synthetic .env, the way tests/test_start_overrides.py does.
+    def preamble_value(dotenv: str, caller: dict[str, str]) -> str:
+        marker = "# ----------------------------- configuration -------------------------------"
+        preamble, sep, _rest = src.partition(marker)
+        assert sep, "start.sh pre-configuration preamble marker is missing"
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            script = tmp / "start.sh"
+            script.write_text(
+                preamble + '\nprintf "%s\\n" "${GLM53_KV_CAPACITY_LOG-UNSET}"\n'
+            )
+            script.chmod(0o755)
+            (tmp / ".env").write_text(dotenv)
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}
+            env.update(caller)
+            done = subprocess.run(
+                ["bash", str(script)], text=True, capture_output=True, env=env
+            )
+        return done.stdout.strip()
+
+    check(preamble_value("GLM53_KV_CAPACITY_LOG=0\n", {}) == "0", "C1 .env applies when the caller is silent")
+    check(
+        preamble_value("GLM53_KV_CAPACITY_LOG=0\n", {"GLM53_KV_CAPACITY_LOG": "1"}) == "1",
+        "C1 a caller export wins over .env",
+    )
+    check(
+        preamble_value("GLM53_KV_CAPACITY_LOG=1\n", {"GLM53_KV_CAPACITY_LOG": ""}) == "",
+        "C1 an explicitly empty caller export survives .env and reaches the guard",
+    )
     check('GLM53_KV_CAPACITY_LOG="${GLM53_KV_CAPACITY_LOG-1}"' in src, "C1 default 1 applies only when UNSET")
     check('KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"' in src, "C2 KVCAP_PATCH_HOST defaults to the shipped overlay")
     check('"$KVCAP_PATCH_HOST|[glm53-kv-capacity-log]|$main_guard"' in src and "validate_overlay_artifacts" in src, "C2 the overlay is in the fail-closed artifact guard (identity string + EOF sentinel)")
-    check("start|restart) validate_numeric_config; validate_overlay_artifacts ;;" in src, "C2 the guard runs on start|restart before anything else in main()")
+    check("start|restart) validate_numeric_config; configure_capture_sizes; validate_overlay_artifacts ;;" in src, "C2 the guards run on start|restart before anything else in main()")
     check('[ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"' in src and 'scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"' in src, "C2 preflight existence check + scp to the worker")
     check("-v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro'" in src and '-v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro"' in src, "C2 read-only mount on both ranks")
     check('-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"' in src, "C2 the knob is forwarded in nccl_common (both ranks)")
