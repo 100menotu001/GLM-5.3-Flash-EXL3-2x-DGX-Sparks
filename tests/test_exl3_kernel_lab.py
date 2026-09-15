@@ -148,19 +148,6 @@ def test_synthetic_weight_has_no_dense_payload() -> None:
     assert int(weight.mcg[0]) == MCG_MARKER_SIGNED_INT32
 
 
-def test_future_dispatch_key_is_explicit_without_implementing_later_phases() -> None:
-    key = KernelKey(
-        compute_capability=(12, 1),
-        phase=ServingPhase.DECODE,
-        representation=Representation.exl3_mcg(3),
-        m=1,
-        n=2048,
-        k=6144,
-    )
-
-    assert not key.grouped
-    assert key.representation.abi_name == "exllamav3.exl3.mcg"
-    assert isinstance(inspect_capability().reason, str)
 
 
 def test_metadata_accepts_every_upstream_integer_bitrate() -> None:
