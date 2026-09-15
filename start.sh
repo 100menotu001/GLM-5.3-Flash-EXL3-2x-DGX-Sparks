@@ -44,6 +44,13 @@
 #   ./start.sh share              NFS_SHARE=1 only: re-export the head HF
 #                                 cache and remount it on the worker
 #
+# Lifecycle commands on this checkout are serialized by a flock on
+# logs/cluster.lock: start/restart refuse immediately when another lifecycle
+# command owns it, and stop waits up to 30s and then exits 1 WITHOUT stopping
+# anything — retry once the running command exits. The lock is per checkout
+# and covers TP=2 only: another clone, manual docker commands and the
+# start-tp3.sh / start-tp4.sh stacks are not serialized by it.
+#
 # Node IPs live in .env (copied from .env.example on first run).
 # Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 SKIP_SHIP=1 SKIP_BUILD=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
 # ============================================================================
@@ -380,6 +387,11 @@ TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.triton/cache}"
 TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/root/.tilelang/cache}"
 
 LOGDIR="$SCRIPT_DIR/logs"
+# TP2 lifecycle lock (helpers below). start/restart take it without waiting;
+# stop waits CLUSTER_LOCK_WAIT seconds and then refuses with exit 1.
+CLUSTER_LOCK="$LOGDIR/cluster.lock"
+CLUSTER_LOCK_PID="$LOGDIR/cluster.lock.pid"
+CLUSTER_LOCK_WAIT=30
 HEAD_SCRIPT="$SCRIPT_DIR/.glm53-exl3-head.inner.sh"
 WORKER_SCRIPT="$SCRIPT_DIR/.glm53-exl3-worker.inner.sh"
 EXPECTED_SHARDS="${EXPECTED_SHARDS:-120}"
@@ -709,6 +721,36 @@ validate_overlay_artifacts() {
 }
 # GLM53 overlay artifact guard (end)
 
+# Serialize the TP2 lifecycle commands (start / restart / stop) so a second
+# launcher cannot docker-rm the first's containers mid wait_for_health (false
+# "head container exited" + empty logs). The flock on $CLUSTER_LOCK is the
+# authoritative owner; $CLUSTER_LOCK_PID is advisory diagnostics only — never
+# proof of ownership, and no PID is ever signalled.
+with_cluster_lock() {
+    mkdir -p "$LOGDIR"
+    exec 9>"$CLUSTER_LOCK"
+    if ! flock -n 9; then
+        local holder
+        holder="$(tr -d '[:space:]' <"$CLUSTER_LOCK_PID" 2>/dev/null || true)"
+        die "another start.sh/restart is already running${holder:+ (pid $holder)} — retry after it exits"
+    fi
+    echo $$ >"$CLUSTER_LOCK_PID" 2>/dev/null || true
+}
+
+# stop waits up to CLUSTER_LOCK_WAIT for the same lock and then refuses with
+# exit 1: no container is stopped, no PID metadata is written, and the lock
+# file is left alone. Retry once the start/restart holding it exits.
+with_cluster_lock_for_stop() {
+    mkdir -p "$LOGDIR"
+    exec 9>"$CLUSTER_LOCK"
+    if ! flock -w "$CLUSTER_LOCK_WAIT" 9; then
+        local holder
+        holder="$(tr -d '[:space:]' <"$CLUSTER_LOCK_PID" 2>/dev/null || true)"
+        die "cluster lock still held after ${CLUSTER_LOCK_WAIT}s${holder:+ (pid $holder)} — nothing was stopped; retry once that start.sh/restart exits"
+    fi
+    echo $$ >"$CLUSTER_LOCK_PID" 2>/dev/null || true
+}
+
 banner() {
     local label="${1:-start.sh}"
     printf '\n'
@@ -787,7 +829,9 @@ check_port_free() {
     local port="$1" envname="$2"
     command -v ss >/dev/null 2>&1 || return 0
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
-        if docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
+        # Do not pipe docker inspect into grep -q: pipefail can turn grep's
+        # early close into a false negative when docker gets SIGPIPE.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null || true)" = "true" ]; then
             die "port ${port} is held by ${CONTAINER_HEAD} — use './start.sh restart' or './start.sh stop' first"
         fi
         die "port ${port} is already in use — stop it or rerun with ${envname}=<free-port>"
@@ -1908,22 +1952,38 @@ wait_for_health() {
         logpid=""
     }
     trap '_stop_logtail; warn "interrupted — containers keep running ('"'"'./start.sh logs'"'"' / '"'"'./start.sh stop'"'"')"; exit 130' INT
-    docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 &
+    # 9>&-: the follower must not inherit the lifecycle lock fd. Bash passes
+    # `exec 9>` descriptors through exec, so a follower that somehow outlives
+    # this shell (SIGKILL, no trap) would keep the flock held.
+    docker logs -f --tail 0 "$CONTAINER_HEAD" 2>&1 9>&- &
     logpid=$!
 
-    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0
+    local elapsed=0 healthy=0 exited=0 dead_side="" worker_fail=0 head_fail=0
     while [ "$elapsed" -lt "$READY_TIMEOUT" ]; do
         if curl -fsS -m 5 "$url" >/dev/null 2>&1; then healthy=1; break; fi
-        if ! docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null | grep -q true; then
-            log "head container exited during startup"
-            exited=1; dead_side="head"; break
+        # Keep the inspect result out of a grep -q pipeline. With pipefail,
+        # grep can close early and make a running container look dead.
+        # Same 3-strike window as the worker: one transient docker miss must
+        # not abort a multi-minute weight load.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_HEAD" 2>/dev/null || true)" = "true" ]; then
+            head_fail=0
+        else
+            head_fail=$((head_fail + 1))
+            if [ "$head_fail" -ge 3 ]; then
+                if docker inspect "$CONTAINER_HEAD" >/dev/null 2>&1; then
+                    log "head container not running during startup (3 consecutive checks)"
+                else
+                    log "head container missing during startup (removed by concurrent stop/restart?)"
+                fi
+                exited=1; dead_side="head"; break
+            fi
         fi
         # A dead worker rank can never make the head healthy — fail fast with
         # the log dump instead of polling for the full READY_TIMEOUT (issue
         # #22, item 4). Transient ssh/docker hiccups are tolerated; only
         # three consecutive non-running answers (~30 s) count as a dead
         # worker.
-        if worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" | grep -q true; then
+        if [ "$(worker_ssh "docker inspect -f '{{.State.Running}}' '$CONTAINER_WORKER' 2>/dev/null" || true)" = "true" ]; then
             worker_fail=0
         else
             worker_fail=$((worker_fail + 1))
@@ -2011,7 +2071,7 @@ on_ready() {
 }
 
 # ------------------------------- start -------------------------------------
-start() {
+start_unlocked() {
     preflight
     ensure_image
     download_weights
@@ -2034,7 +2094,7 @@ start() {
     if wait_for_health; then
         post_ready_warmup
         on_ready
-        return
+        return 0
     fi
     collect_failure_logs
     echo "---- last 60 lines of head log ($LOGDIR/head.log) ----"
@@ -2044,8 +2104,12 @@ start() {
     die "server did not become healthy — full logs in $LOGDIR/"
 }
 
-# ------------------------------- stop --------------------------------------
-stop() {
+start() {
+    with_cluster_lock
+    start_unlocked
+}
+
+stop_containers() {
     log "stopping head container ..."
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || log "  (no head container was running)"
     log "stopping worker container on ${WORKER_SSH} ..."
@@ -2056,6 +2120,13 @@ stop() {
         nfs_unmount_workers
     fi
     log "stopped."
+}
+
+# ------------------------------- stop --------------------------------------
+stop() {
+    with_cluster_lock_for_stop
+    stop_containers
+    rm -f "$CLUSTER_LOCK_PID" || true
 }
 
 # ------------------------------ status -------------------------------------
@@ -2105,7 +2176,11 @@ main() {
         start)    shift || true; start ;;
         download) download_only ;;
         stop)     stop ;;
-        restart)  stop; start ;;
+        restart)
+            with_cluster_lock
+            stop_containers
+            start_unlocked
+            ;;
         status)   status ;;
         logs)     shift || true; logs "$@" ;;
         share)    [ "${NFS_SHARE:-0}" = "1" ] || die "NFS_SHARE=0 in .env — set NFS_SHARE=1 to share the head HF cache over NFS"

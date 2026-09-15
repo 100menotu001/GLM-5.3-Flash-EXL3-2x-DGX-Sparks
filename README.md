@@ -600,6 +600,14 @@ BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # force rebuild overlay 
 ./start.sh stop                # or ./stop.sh
 ```
 
+Concurrent lifecycle commands on the same checkout are serialized by a `flock`
+on `logs/cluster.lock`: `start`/`restart` refuse immediately when another
+lifecycle command owns it, and `stop` waits up to 30 s for it and then exits 1
+**without stopping anything** — retry once the running command exits. No PID is
+ever signalled to break the lock. The lock is per checkout and covers TP=2
+only: another clone, manual `docker rm`, and the `start-tp3.sh` /
+`start-tp4.sh` stacks are not serialized by it.
+
 ### Sharing weights from the head (`NFS_SHARE=1`)
 
 **On this kit this is on.** `.env` sets `NFS_SHARE=1`; `start-tp3.sh` sources
