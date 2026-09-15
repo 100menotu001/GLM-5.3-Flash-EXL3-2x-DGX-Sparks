@@ -980,6 +980,10 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
 
 ## Concurrency ladder (2026-08-31, 1M ctx, MNBT 2048, MAX_NUM_SEQS 16, `GLM53_MIXED_PREFILL_CHUNK=512`)
 
+Both tables are historical measurements of the configuration named in their own
+heading, not of current main. Only the 2026-09-01 run has raw cells checked in
+(`docs/ladder-final-2026-09-01.json`).
+
 `tests/bench_concurrency.py` runs N simultaneous streams per level (modes `code` / `data` / `chat`; optional cached context per lane),
 counts tokens from the server's `usage`, and writes per-cell JSON (`agg_tps`, `stream_tps_median`, TTFT/ITL p50/p95/p99, cache hit
 ratio, preemptions). `tests/bench_live.html` renders the JSON (or a live `status.json`) while it runs. Canonical run (idle server):
@@ -994,7 +998,13 @@ ratio, preemptions). `tests/bench_live.html` renders the JSON (or a live `status
 | chat — per stream | 18.5 | 14.1 | 10.0 | 7.7 | 6.1 | 5.2 |
 | TTFT median (s), any mode | 0.4–0.6 | 0.7–1.0 | 0.8–1.0 | 1.1–1.3 | 1.1–1.6 | 1.3–1.6 |
 
-Warm-context ladder (2026-09-01, per-group retention + fine-grained hits + gate v2, `docs/ladder-final-2026-09-01.json`):
+Warm-context ladder (2026-09-01, `docs/ladder-final-2026-09-01.json`), recorded on the
+then-unmerged overlay stack per-group retention + fine-grained hits + gate v2
+(PRs #83 / #84 / #80) — none of which is current main. #83 was closed unmerged;
+main carries per-KV-cache-group retention via merged #130, where an empty
+`GLM53_APC_RETENTION_INTERVAL_SWA` inherits the global retention interval instead of
+applying #83's automatic rule. #84's overlay patch and the #80 gate-v2 knobs are not
+in main, which still defaults `GLM53_MIXED_PREFILL_CHUNK=skip`.
 
 | ctx 50K per lane (distinct prefixes, verified warm) | ×1 | ×2 | ×4 | ×8 | ×16 |
 |---|---:|---:|---:|---:|---:|
@@ -1003,9 +1013,10 @@ Warm-context ladder (2026-09-01, per-group retention + fine-grained hits + gate 
 | cache hit | 1.0 | 1.0 | 0.999 | 0.25–0.75 | 0.19 |
 | TTFT p95 (s) | 0.4 | 0.8 | 1.2–1.4 | 173–454 | 899–963 |
 
-What it shows: with the cache fixes, **up to 4 concurrent 50K-context lanes run fully warm** (hits 0.999, TTFT ≤1.4 s,
-aggregate equal to the ctx-0 ladder); at 8×50K the total cached working set (~400K tokens + in-flight) exceeds the pool's
-~455K-token budget (642 block ids / ~5 per 3584-token segment) and hit rates collapse — the ladder now documents the capacity
-envelope, not a bug. Speed is set by the DFlash2 drafter's acceptance (code ~35–44 tok/s solo, prose chat ~18), not by
-temperature (0 vs 0.7 within noise) or thinking on/off; the interactive knee is ~4 lanes. Under the original `skip` policy the
-second stream waited 15–17 s (requests served one at a time) — fixed by the mixed-prefill gate v2 knobs.
+What it shows on that stack: **up to 4 concurrent 50K-context lanes ran fully warm** (hits 0.999, TTFT ≤1.4 s,
+aggregate equal to the same run's ctx-0 cells); at 8×50K the recorded cached working set (~400K tokens + in-flight) exceeds the
+~455K-token budget measured then (642 block ids / ~5 per 3584-token segment) and hit rates collapse. The ladder alone does not
+establish that budget as the cause — later whole-stack comparisons (#174) neither confirm the attribution nor isolate a single
+root cause. Speed is set by the DFlash2 drafter's acceptance (code ~35–44 tok/s solo, prose chat ~18), not by temperature
+(0 vs 0.7 within noise) or thinking on/off; the interactive knee is ~4 lanes. Under the original `skip` policy the second stream
+waited 15–17 s (requests served one at a time) — fixed by the mixed-prefill gate v2 knobs on this stack.
