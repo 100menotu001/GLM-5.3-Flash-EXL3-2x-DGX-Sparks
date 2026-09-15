@@ -473,8 +473,46 @@ python3 tests/bench_prefix_cache.py --runs 3
 Note the page math: hits are **block-aligned to the 3584-token hybrid MLA
 page**, so a warm prompt only ever reuses `floor(tokens / 3584) × 3584`
 tokens — the 7168 / 10752 / 14336 hit rows above are exactly 2 / 3 / 4 full
-pages. And since this build exposes **no cache-reset endpoint**, the bench
-salts its filler content per invocation so every cold is genuinely cold.
+pages. The bench POSTs `/reset_prefix_cache` between colds when that route is
+enabled (`GLM53_EXPOSE_CACHE_RESET=1`; opt-in, see the API surface notes
+below) and salts its filler content per invocation on top — repeated runs
+stay genuinely cold even with the reset route off.
+
+## API surface notes (this build, 2026-08-29)
+
+Two things that cost us time (#31), documented so the next person does not
+chase ghosts:
+
+**Cache reset.** `overlay/patch_cache_reset.py` mounts the upstream dev
+cache router on the head API server, so a genuinely cold prefix cache no
+longer needs a container restart. It is **opt-in**: the patch is always
+applied, but the router is only attached when `GLM53_EXPOSE_CACHE_RESET=1`
+is exported for the launcher (default `0`):
+
+```bash
+GLM53_EXPOSE_CACHE_RESET=1 ./start.sh restart   # then:
+curl -s -X POST http://127.0.0.1:8888/reset_prefix_cache    # -> {"success": true}
+```
+
+It returns `{"success": bool}` and reports `false` while blocks are still
+held (running requests, in-flight async KV offload) — retry after they
+drain. Unset (the default) leaves the stock surface, where a restart is the
+only reset; `VLLM_SERVER_DEV_MODE=1` still mounts the whole dev set
+(`/sleep`, `/rlhf`, `/rpc`, `/server_info`) if ever needed.
+Auth caveat: the bearer middleware only guards `/v1`, `/v2`, `/inference`,
+`/cohere` (upstream `GUARDED_PREFIX`), so root-mounted routes — the stock
+`/tokenize` / `/detokenize` and the cache-reset routes — answer without the
+key even with `VLLM_API_KEY` set. That is why the exposure is opt-in: leave
+`GLM53_EXPOSE_CACHE_RESET` unset (0) on kits that serve untrusted clients.
+
+**Tokenize.** It is mounted at the **root** (`/v1/tokenize` is 404) and the
+request validates `prompt` (or `messages` for the chat shape), not `text`:
+
+```bash
+curl -s http://127.0.0.1:8888/tokenize -H 'Content-Type: application/json' \
+     -d '{"model": "GLM-5.3-Flash-EXL3", "prompt": "hello world"}'
+# -> {"count":2,"max_model_len":1000000,"tokens":[14978,1879],"token_strs":null}
+```
 
 ### Optional sparse retention and DFlash replay
 
@@ -846,6 +884,7 @@ that are now documented/enforced:
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
+| `GLM53_EXPOSE_CACHE_RESET` | `0` (off) | opt-in. `1` attaches the upstream cache-reset dev routes (`/reset_prefix_cache`, `/reset_mm_cache`, `/reset_encoder_cache`, #31) on the head API server. This flag does not enable other dev routes; independent `VLLM_SERVER_DEV_MODE` retains precedence and can enable the full dev surface. Root routes are outside the bearer guard—leave this flag off where clients are untrusted. Takes effect on restart. TP=2 `start.sh` only; `start-tp3.sh` / `start-tp4.sh` are unchanged |
 | `ABLIT` | `0` (off) | opt-in. `1` = apply o_proj edit at load (both ranks). Unset = stock weights |
 | `GLM53_ADAPTIVE_K` | `off` | `ema` = adaptive verification length (prose +13–21 %); needs the capture-size list in `EXTRA_ARGS`. See *Faster prose decode* |
 | `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1 |
@@ -998,6 +1037,8 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_scheduler_decode_floor.py` | v5 migration from v1/v2/v3/v4; cost fit, ladder climb-back, prompt probe, async accounting, bounded credit, alignment and actual scheduler budget regressions |
 | `overlay/patch_xgrammar_termination.py` | source-exact vLLM #52805/#53046 backports; stop at termination and validate post-reasoning speculative drafts before FSM advance |
 | `tests/test_xgrammar_termination.py` | exact two-file patch, idempotence, cross-file fail-closed drift, termination/rollback/reset and post-reasoning draft behavior, launcher wiring |
+| `overlay/patch_cache_reset.py` | mount only the upstream cache-reset dev router (`/reset_prefix_cache` et al., #31) when `GLM53_EXPOSE_CACHE_RESET=1`; runtime-mounted by `start.sh` (`CACHE_RESET_PATCH_HOST`) |
+| `tests/test_cache_reset_endpoint.py` | exact `build_app` anchor, flag semantics (off / on / dev precedence), fail-closed drift, idempotence, installed copy |
 | `overlay/patch_kpool_tail_slotmap.py` | clamp KpoolTail one-block circular slot mapping; identity for other KV groups |
 | `tests/test_kpool_tail_slotmap.py` | circular addressing math, exact kernel patch, idempotence, fail-closed drift, launcher wiring |
 | `overlay/patch_kv_capacity_log.py` | log-only: after the stock `GPU KV cache size` line (kept byte-identical) log per-group `blocks/request` (the stock line's own denominator) and the usable-block-ids / ids-per-aligned-segment / cached-conversation-capacity summary; unmodelled spec kinds withhold the figure; knob `GLM53_KV_CAPACITY_LOG` (0/1); two pinned anchors, preflighted before either is written, atomic, idempotent |
