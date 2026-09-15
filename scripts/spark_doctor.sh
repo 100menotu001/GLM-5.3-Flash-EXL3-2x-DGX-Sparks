@@ -3,13 +3,15 @@
 # spark_doctor.sh — Hardware, RoCEv2 & Preflight Diagnostics for 2x DGX Spark
 # ============================================================================
 #
-# Inspects cluster health across Head and Worker nodes before or during serve:
-# 1. RoCEv2 / CX7 InfiniBand interfaces, GID table, and link state
-# 2. SSH passwordless connectivity and round-trip latency
-# 3. GB10 Unified Memory Architecture (UMA) vs GPU_MEM_UTIL budget
-# 4. Docker daemon, GPU container toolkit, and GHCR image availability
-# 5. HuggingFace weights cache integrity (EXL3 shards + DFlash2 drafter)
-# 6. Live OpenAI API /health and token generation latency (if running)
+# Read-only preflight for the Head and Worker nodes:
+# 1. Inter-node connectivity: ICMP ping and passwordless SSH to the worker
+# 2. RoCEv2 / CX7 interfaces: presence and link state (Head + Worker)
+# 3. GPU presence and the GPU_MEM_UTIL sanity band
+# 4. Docker daemon access and local GHCR image presence
+# 5. Serving endpoint reachability on PORT (/health, /v1/models), if running
+#
+# Model weights, engine load and token generation are not tested, so a clean run
+# is a connectivity/config preflight, not a serving-readiness verdict.
 # ============================================================================
 set -euo pipefail
 
@@ -32,7 +34,7 @@ HEAD_CX7_IF="${HEAD_CX7_IF:-enp1s0f1np1}"
 WORKER_CX7_IF="${WORKER_CX7_IF:-enp1s0f0np0}"
 HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"
 WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.87}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 
 PASS_COUNT=0
 WARN_COUNT=0
@@ -128,13 +130,18 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     gpu_mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -n 1)
     ok "Head GPU detected: $gpu_name (Total Memory: $gpu_mem)."
     
-    # Check GPU memory utilization sanity
-    if (( $(echo "$GPU_MEM_UTIL > 0.95" | bc -l 2>/dev/null || echo 0) )); then
-        warn "GPU_MEM_UTIL=$GPU_MEM_UTIL is dangerously high (>0.95), risking UMA OOM on mixed load."
-    elif (( $(echo "$GPU_MEM_UTIL < 0.70" | bc -l 2>/dev/null || echo 0) )); then
-        warn "GPU_MEM_UTIL=$GPU_MEM_UTIL may under-allocate the 1.75M token KV pool on GB10."
+    # GPU_MEM_UTIL: accept exactly what start.sh's validate_numeric_config accepts
+    # (0 < util <= 1), then warn outside the 0.70 - 0.95 band. An unjudgeable value
+    # is a FAIL, never a silent PASS; the band is sanity only, not a UMA admission model.
+    if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+       || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
+        fail "GPU_MEM_UTIL must be greater than 0 and at most 1 (got: '$GPU_MEM_UTIL'); start.sh refuses this value, so the UMA budget cannot be judged."
+    elif awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0.95) }'; then
+        warn "GPU_MEM_UTIL=$GPU_MEM_UTIL is above the 0.95 ceiling this check warns on, risking UMA OOM on mixed load."
+    elif awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u < 0.70) }'; then
+        warn "GPU_MEM_UTIL=$GPU_MEM_UTIL is below the 0.70 floor this check warns on; the 1.75M token KV pool may be under-allocated on GB10."
     else
-        ok "GPU_MEM_UTIL=$GPU_MEM_UTIL is within recommended recipe envelope (0.80 - 0.90)."
+        ok "GPU_MEM_UTIL=$GPU_MEM_UTIL is inside the 0.70 - 0.95 band this check accepts (band sanity only, not a memory-admission guarantee)."
     fi
 else
     fail "nvidia-smi not found on host. Ensure NVIDIA drivers are installed."
@@ -163,20 +170,20 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 5. Live Service Health Probe
+# 5. Live Service Endpoint Reachability (if running)
 # ----------------------------------------------------------------------------
-section "5. Live Service Health & API Readiness"
+section "5. Live Service Endpoint Reachability"
 
 health_url="http://127.0.0.1:${PORT}/health"
 if command -v curl >/dev/null 2>&1; then
     http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$health_url" || echo "000")
     if [ "$http_code" = "200" ]; then
-        ok "vLLM /health endpoint returned HTTP 200 (Service Active & Healthy)."
+        ok "vLLM /health endpoint returned HTTP 200 (endpoint reachable; engine load and token generation are not verified)."
         
         # Probe model list
         models_out=$(curl -s --max-time 3 "http://127.0.0.1:${PORT}/v1/models" || echo "")
         if echo "$models_out" | grep -q "GLM-5.3"; then
-            ok "OpenAI /v1/models serves GLM-5.3-Flash-EXL3."
+            ok "OpenAI /v1/models lists a GLM-5.3 model (endpoint reachable)."
         fi
     elif [ "$http_code" = "000" ]; then
         warn "Service is not currently running on port $PORT (start via ./start.sh)."
@@ -193,7 +200,8 @@ printf "Results: \033[1;32m%d Passed\033[0m | \033[1;33m%d Warnings\033[0m | \03
     "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
 
 if [ "$FAIL_COUNT" -eq 0 ]; then
-    printf "\n\033[1;32m✔ Spark cluster diagnostics ready for GLM-5.3-Flash EXL3 serving!\033[0m\n\n"
+    printf "\n\033[1;32m✔ Preflight passed: no failures in the checks above.\033[0m\n"
+    printf "  Scope: connectivity, config and container checks only - model weights, engine load and token generation are not tested.\n\n"
     exit 0
 else
     printf "\n\033[1;31m✘ Please resolve the failure items above before running ./start.sh\033[0m\n\n"
