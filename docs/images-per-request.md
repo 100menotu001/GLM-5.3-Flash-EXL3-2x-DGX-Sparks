@@ -7,8 +7,8 @@ LibreChat, most agent harnesses). Reported from a stock deployment of this kit (
 
 > **Reconciled with current main (2026-09-15):** main now ships `LIMIT_MM='{"image":48,"video":1}'` (`b3bd1f6`).
 > Everything below was measured 2026-09-05 against the **then-default 4**, and is kept as the historical
-> reproduction. The mechanism is unchanged — stateless clients resend the whole history and the limit is checked per
-> request — with the current default the same session survives until the 49th distinct image.
+> reproduction. Stateless clients still resend the whole history, and the limit is checked per request. The current
+> image-count check permits up to 48 image items and rejects 49; memory, context and other limits can prevent completion below that ceiling.
 
 ---
 
@@ -95,7 +95,8 @@ N are forwarded, and to ask for a resend only if needed, ends that.
     curl -s http://<head>:8888/v1/chat/completions -H 'Content-Type: application/json' --data-binary @six.json
 
 Then-default `.env` (`image:4`): the error — six images exceed 4. On current main (`image:48`) the same six-image
-conversation is accepted; a 49-image conversation would reproduce the rejection. `LIMIT_MM` ≥ 6: the model answers
+conversation passes the image-count check; 49 image items exceed it. This does not guarantee successful completion.
+For a completed request with `LIMIT_MM` ≥ 6, the expected count is
 `6`. Through a trimming proxy with N=4: `4` (asked to count, it may still say `6` when the omitted slots carry a note
 that an image was attached — that is the note doing its job).
 (`max_tokens` needs room for the thinking tokens; with 40 the answer comes back empty.)
