@@ -120,6 +120,36 @@ def test_extra_env_guard() -> None:
             )
 
 
+def test_malformed_input_redaction() -> None:
+    """Malformed entries fail closed without echoing any fragment of the list.
+
+    The guard word-splits GLM53_EXTRA_ENV, so a whitespace-containing value
+    arrives as separate fragments: the raw token and the not-yet-validated name
+    both carry value text. A rejection may report the entry position only.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        h = Harness(Path(raw))
+        cases = (
+            ("bare fragment after a whitespace split", "VLLM_LOGGING_LEVEL=top s3cr3t-fragment"),
+            ("fragment shaped like NAME=VALUE", "VLLM_LOGGING_LEVEL=top s3cr3t-fragment=1"),
+            ("lowercase name", "s3cr3t-fragment=1"),
+            ("no '=' at all", "s3cr3t-fragment"),
+        )
+        for label, value in cases:
+            r = h.run(
+                "launch_cluster",
+                entry="start.fn.sh",
+                MODEL_DIR=MODEL_DIR,
+                GLM53_EXTRA_ENV=value,
+            )
+            check(
+                r.returncode != 0
+                and not container_starts(h)
+                and "s3cr3t-fragment" not in r.stdout + r.stderr,
+                f"F7 {label} is rejected without echoing it (rc={r.returncode})",
+            )
+
+
 def test_caller_precedence() -> None:
     """GLM53_EXTRA_ENV rides the generic caller-export replay, with no per-knob capture."""
     dotenv = "GLM53_EXTRA_ENV=VLLM_LOGGING_LEVEL=DEBUG\n"
@@ -141,6 +171,7 @@ def test_caller_precedence() -> None:
 
 if __name__ == "__main__":
     test_extra_env_guard()
+    test_malformed_input_redaction()
     test_caller_precedence()
     print()
     if FAILURES:

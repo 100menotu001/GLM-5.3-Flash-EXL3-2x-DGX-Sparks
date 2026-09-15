@@ -1619,9 +1619,10 @@ launch_cluster() {
     # last duplicate -e, so a same-named entry would silently override the knob
     # and skip its range check. Values: [A-Za-z0-9_./:@,+=-]* only (no spaces,
     # quotes, globs or shell metacharacters — the worker command line is built as
-    # shell text). Only names are logged; values may carry credentials.
+    # shell text). Only names are logged; values may carry credentials, so a
+    # rejected entry is reported by position only and is never echoed.
     if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
-        local _kv _name _value _entry _names="" _owned=" "
+        local _kv _name _value _entry _names="" _owned=" " _idx=0
         # Read the owned set off the arguments this launch builds, so a knob added
         # to either list cannot be shadowed here without a second list to keep in sync.
         for _entry in "${nccl_common[@]}" "${serve_env_names[@]}" \
@@ -1632,9 +1633,13 @@ launch_cluster() {
         done
         set -f
         for _kv in $GLM53_EXTRA_ENV; do
-            case "$_kv" in *=*) ;; *) die "GLM53_EXTRA_ENV entries must be NAME=VALUE (got '$_kv')";; esac
+            _idx=$((_idx + 1))
+            # The word split above delivers a whitespace-containing value as
+            # fragments, so the raw token and the unvalidated name can both carry
+            # part of a credential: neither is interpolated into a rejection.
+            case "$_kv" in *=*) ;; *) die "GLM53_EXTRA_ENV entry $_idx must be NAME=VALUE";; esac
             _name="${_kv%%=*}"; _value="${_kv#*=}"
-            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV: bad name '$_name'"
+            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV entry $_idx: name must match [A-Z_][A-Z0-9_]*"
             [[ "$_value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]] || die "GLM53_EXTRA_ENV: unsafe value for $_name (allowed: A-Z a-z 0-9 _ . / : @ , + = -)"
             case "$_name" in
                 NCCL_*|HF_*|GLM53_*|EXL3_*|FLASHINFER_*|PATH|PYTHONPATH|VLLM_PREFIX_CACHE_RETENTION_INTERVAL*)

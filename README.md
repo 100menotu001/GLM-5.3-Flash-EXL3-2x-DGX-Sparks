@@ -931,7 +931,7 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): retention validation, pre-stop artifact checks, ordered hybrid/per-group overlays, and matching rank environments and mounts |
 | `tests/bench_decode.py` | streaming decode + coherence; `--structured` is the count-1→200 median |
 | `tests/test_start_overrides.py` | CPU-only caller precedence: `.env` keys, empty exports, shell assignments, and child inheritance |
-| `tests/test_launcher_extra_env.py` | launcher (CPU-only, docker/ssh stubbed): non-owned `GLM53_EXTRA_ENV` diagnostics reach both ranks as `-e` pairs, launcher-owned names fail the launch before any container starts, values stay out of the log |
+| `tests/test_launcher_extra_env.py` | launcher (CPU-only, docker/ssh stubbed): non-owned `GLM53_EXTRA_ENV` diagnostics reach both ranks as `-e` pairs, launcher-owned names fail the launch before any container starts, values stay out of the log, and malformed entries are rejected by position without echoing any fragment |
 | `start.sh` / `stop.sh` / `download.sh` | 2-node launch; Hub fetch on the head only. `./stop.sh` also stops TP=3 when that stack is up (`tp2` / `tp3` / `all`) |
 | `start-tp3.sh` / `.env.tp3.example` | 3-node TP=3 launch (head padding + expert parallel + `overlay/tp3/`); knobs stay out of `.env`. Boots this kit 2026-09-14 |
 | `overlay/tp3/` | TP=3-only shape overlays (FlyCockpit MIT): head/vocab/shared-expert/A_log pads, EP loader, SM120 decode pad. Not on the TP=2 path |
