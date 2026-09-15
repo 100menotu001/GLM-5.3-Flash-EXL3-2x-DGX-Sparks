@@ -15,13 +15,14 @@ Hardening asked for by the production-like tester run on PRs #83/#84:
      overlay, exits 2 BEFORE the first docker or ssh call, so healthy
      containers are never stopped for a launch that cannot succeed.
   C  Overlay order -- one list (GLM53_OVERLAY_ORDER) pinned
-     hybrid -> per-group -> fine-grained is emitted verbatim into BOTH rank
-     inner scripts.
+     hybrid -> per-group -> kv-capacity-log (the log-only overlay, where
+     shipped) is emitted verbatim into BOTH rank inner scripts.
   D  Rank parity -- for every /opt/glm53 patch the head bind-mounts host
      file S, the worker's mount is fed from /tmp/X and the scp that produced
      /tmp/X read the same S; both ranks receive identical effective values
-     for GLM53_APC_RETENTION_INTERVAL, GLM53_APC_RETENTION_INTERVAL_SWA and
-     GLM53_FINEGRAINED_APC (launcher names) and the container-side names they
+     for GLM53_APC_RETENTION_INTERVAL, GLM53_APC_RETENTION_INTERVAL_SWA,
+     GLM53_FINEGRAINED_APC and GLM53_KV_CAPACITY_LOG (launcher names) and the
+     container-side names they
      map to (VLLM_PREFIX_CACHE_RETENTION_INTERVAL[_SWA], GLM53_FINEGRAINED_APC);
      a knob the launcher wires must be PRESENT on both ranks, not merely
      equal. The comparison itself is exercised with a synthetic one-rank
@@ -63,10 +64,12 @@ SWA = "GLM53_APC_RETENTION_INTERVAL_SWA"
 SWA_FORWARD = '-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA"'
 FG = "GLM53_FINEGRAINED_APC"
 FG_FORWARD = '-e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"'
+KV = "GLM53_KV_CAPACITY_LOG"
+KV_FORWARD = '-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"'
 
 # Launcher knobs the tester asked to see reach both ranks identically, and the
 # container-side names the launcher maps them to.
-LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, FG)
+LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, FG, KV)
 CONTAINER_NAMES = LAUNCHER_KNOBS + (
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA",
@@ -76,9 +79,15 @@ PINNED = (
     "patch_hybrid_prefix_hit.py",
     "patch_apc_per_group_retention.py",
 )
+# Ships on its own (kv_cache_utils.py only, log-only; no coordinator anchors).
+# Where listed it must follow patch_glm5_drafter_group.py (same file) and the
+# per-group retention slot.
+KVCAP = "patch_kv_capacity_log.py"
+DRAFTER = "patch_glm5_drafter_group.py"
 APC_HOST_VARS = {
     "APC_PATCH_HOST": "patch_hybrid_prefix_hit.py",
     "PERGROUP_PATCH_HOST": "patch_apc_per_group_retention.py",
+    "KVCAP_PATCH_HOST": KVCAP,
 }
 
 SEP = "\x1f"
@@ -148,6 +157,10 @@ def wires_swa() -> bool:
 
 def wires_fg() -> bool:
     return FG_FORWARD in source()
+
+
+def wires_kv() -> bool:
+    return KV_FORWARD in source()
 
 
 # ------------------------------------------------------------------ part A --
@@ -376,6 +389,9 @@ def part_b(h: Harness) -> None:
         )
     if wires_fg():
         fails_closed(f"B3 restart with {FG}=yes exits 2 with nothing stopped", **{FG: "yes"})
+    if wires_kv():
+        fails_closed(f"B3 restart with {KV}=yes exits 2 with nothing stopped", **{KV: "yes"})
+        fails_closed(f"B3 restart with {KV}= (explicitly empty) exits 2 with nothing stopped", **{KV: ""})
 
     broken = h.tmp / "broken_patch.py"
     broken.write_text("def (:\n    pass\n")
@@ -472,6 +488,16 @@ def part_c(h: Harness) -> None:
         len(idx) == 2 and idx[PINNED[0]] < idx[PINNED[1]],
         "C1 pinned order hybrid -> per-group",
     )
+    if wires_kv() or KVCAP in order:
+        check(
+            KVCAP in order and len(idx) == 2 and order.index(KVCAP) > idx[PINNED[1]],
+            "C1 kv-capacity-log is listed after per-group retention (no shared anchors, but one pinned order)",
+        )
+        check(
+            KVCAP in order and DRAFTER in order and order.index(KVCAP) > order.index(DRAFTER)
+            and order.index(KVCAP) < order.index("patch_xgrammar_termination.py"),
+            "C1 kv-capacity-log follows patch_glm5_drafter_group (same kv_cache_utils.py) and rides the retention slot before xgrammar",
+        )
     check(
         'emit_overlay_block >> "$HEAD_SCRIPT"' in text and 'emit_overlay_block >> "$WORKER_SCRIPT"' in text,
         "C2 both inner scripts take the block from emit_overlay_block",
@@ -502,6 +528,12 @@ def part_c(h: Harness) -> None:
                 and body.index("patch_kpool_tail_slotmap.py") < body.index("python3 /opt/glm53/patch_ablit.py"),
                 f"C3 {s.name}: ablit still applies last",
             )
+            if KVCAP in order:
+                check(
+                    body.index(f"/opt/glm53/{DRAFTER}") < body.index("/opt/glm53/patch_apc_per_group_retention.py")
+                    < body.index(f"/opt/glm53/{KVCAP}") < body.index("/opt/glm53/patch_xgrammar_termination.py"),
+                    f"C3 {s.name}: drafter-group -> per-group -> kv-capacity-log -> xgrammar in the generated script",
+                )
             check(
                 re.search(r"if \[ -f /opt/glm53/patch_apc_per_group_retention\.py \]; then\n\s+python3", body) is not None,
                 f"C3 {s.name}: every slot is `[ -f ]`-guarded (unmounted sibling slot is a no-op)",
@@ -585,6 +617,8 @@ def part_d(h: Harness) -> None:
         scenarios += [("FINEGRAINED=0", {FG: "0"}), ("FINEGRAINED=1", {FG: "1"})]
     if wires_swa() and wires_fg():
         scenarios.append(("SWA=14336 + FINEGRAINED=0", {SWA: "14336", FG: "0"}))
+    if wires_kv():
+        scenarios += [("KVCAP=0", {KV: "0"}), ("KVCAP=1", {KV: "1"}), ("KVCAP unset (default 1)", {})]
 
     first = None
     for label, env in scenarios:
@@ -599,6 +633,8 @@ def part_d(h: Harness) -> None:
             required["VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA"] = env[SWA]
         if wires_fg():
             required[FG] = env.get(FG, "1")
+        if wires_kv():
+            required[KV] = env.get(KV, "1")
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:
@@ -787,7 +823,7 @@ def main() -> int:
     if not START.is_file():
         raise SystemExit(f"missing {START}")
     print(f"launcher: {START}")
-    print(f"ships: {', '.join(f'{v}={b}' for v, b in shipped_apc_vars().items())}; forwards SWA={wires_swa()} FINEGRAINED={wires_fg()}")
+    print(f"ships: {', '.join(f'{v}={b}' for v, b in shipped_apc_vars().items())}; forwards SWA={wires_swa()} FINEGRAINED={wires_fg()} KVCAP={wires_kv()}")
     part_a()
     with tempfile.TemporaryDirectory() as raw:
         h = Harness(Path(raw))
