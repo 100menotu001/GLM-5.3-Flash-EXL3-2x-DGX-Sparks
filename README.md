@@ -1,4 +1,4 @@
-<h1 align="center">GLM-5.3 Flash EXL3 for 2x DGX Sparks</h1>
+<h1 align="center">GLM-5.3 Flash EXL3 for 2-4x DGX Sparks</h1>
 
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
@@ -208,7 +208,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
 | Graphs | on (`ENFORCE_EAGER=0`) — MTP capture `1 2 3 4 6 8 12`; DFlash2 capture `1 2 4 8 16 24 32` |
 | Spec | **DFlash2 k=7** (`incoai/GLM-5.3-Flash-DFlash2`); draft KV `auto`/bf16, draft TP=2, FLASH_ATTN. Rollback `SPEC_METHOD=mtp` |
-| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:48,video:1}`, `--mm-processor-kwargs {max_image_tokens:2048}`, `--mm-processor-cache-gb 1`, `--skip-mm-profiling` |
+| Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:48,video:1}`, `--mm-processor-kwargs {max_image_tokens:2048}`, `--mm-processor-cache-gb 1`, `--skip-mm-profiling`. Stateless chat clients resend every image each turn, so once a session holds more images than this ceiling, later turns are rejected — see `docs/images-per-request.md` |
 | Ablit | **off** (`ABLIT=0`). Stock `o_proj`. Set `ABLIT=1` to enable; see [Abliteration](#abliteration-ablit1) |
 
 Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
@@ -473,8 +473,46 @@ python3 tests/bench_prefix_cache.py --runs 3
 Note the page math: hits are **block-aligned to the 3584-token hybrid MLA
 page**, so a warm prompt only ever reuses `floor(tokens / 3584) × 3584`
 tokens — the 7168 / 10752 / 14336 hit rows above are exactly 2 / 3 / 4 full
-pages. And since this build exposes **no cache-reset endpoint**, the bench
-salts its filler content per invocation so every cold is genuinely cold.
+pages. The bench POSTs `/reset_prefix_cache` between colds when that route is
+enabled (`GLM53_EXPOSE_CACHE_RESET=1`; opt-in, see the API surface notes
+below) and salts its filler content per invocation on top — repeated runs
+stay genuinely cold even with the reset route off.
+
+## API surface notes (this build, 2026-08-29)
+
+Two things that cost us time (#31), documented so the next person does not
+chase ghosts:
+
+**Cache reset.** `overlay/patch_cache_reset.py` mounts the upstream dev
+cache router on the head API server, so a genuinely cold prefix cache no
+longer needs a container restart. It is **opt-in**: the patch is always
+applied, but the router is only attached when `GLM53_EXPOSE_CACHE_RESET=1`
+is exported for the launcher (default `0`):
+
+```bash
+GLM53_EXPOSE_CACHE_RESET=1 ./start.sh restart   # then:
+curl -s -X POST http://127.0.0.1:8888/reset_prefix_cache    # -> {"success": true}
+```
+
+It returns `{"success": bool}` and reports `false` while blocks are still
+held (running requests, in-flight async KV offload) — retry after they
+drain. Unset (the default) leaves the stock surface, where a restart is the
+only reset; `VLLM_SERVER_DEV_MODE=1` still mounts the whole dev set
+(`/sleep`, `/rlhf`, `/rpc`, `/server_info`) if ever needed.
+Auth caveat: the bearer middleware only guards `/v1`, `/v2`, `/inference`,
+`/cohere` (upstream `GUARDED_PREFIX`), so root-mounted routes — the stock
+`/tokenize` / `/detokenize` and the cache-reset routes — answer without the
+key even with `VLLM_API_KEY` set. That is why the exposure is opt-in: leave
+`GLM53_EXPOSE_CACHE_RESET` unset (0) on kits that serve untrusted clients.
+
+**Tokenize.** It is mounted at the **root** (`/v1/tokenize` is 404) and the
+request validates `prompt` (or `messages` for the chat shape), not `text`:
+
+```bash
+curl -s http://127.0.0.1:8888/tokenize -H 'Content-Type: application/json' \
+     -d '{"model": "GLM-5.3-Flash-EXL3", "prompt": "hello world"}'
+# -> {"count":2,"max_model_len":1000000,"tokens":[14978,1879],"token_strs":null}
+```
 
 ### Optional sparse retention and DFlash replay
 
@@ -561,6 +599,14 @@ BUILD=1 SKIP_DOWNLOAD=1 SKIP_SYNC=1 ./start.sh restart  # force rebuild overlay 
 ./start.sh logs worker
 ./start.sh stop                # or ./stop.sh
 ```
+
+Concurrent lifecycle commands on the same checkout are serialized by a `flock`
+on `logs/cluster.lock`: `start`/`restart` refuse immediately when another
+lifecycle command owns it, and `stop` waits up to 30 s for it and then exits 1
+**without stopping anything** — retry once the running command exits. No PID is
+ever signalled to break the lock. The lock is per checkout and covers TP=2
+only: another clone, manual `docker rm`, and the `start-tp3.sh` /
+`start-tp4.sh` stacks are not serialized by it.
 
 ### Sharing weights from the head (`NFS_SHARE=1`)
 
@@ -697,6 +743,35 @@ and weights, does not change the supported 2× path. First run copies
 
 Do not pull `glm53-flash-sm121:v8` — that is the older NVFP4/Ray kernel.
 
+**Measured on a 4-Spark kit (2026-09-02).** Four DGX Sparks (two at 200G, two
+at 100G, CRS812 switch), this image and overlay at 493cb88, DFlash2 draft TP=4,
+1M context, launched per rank with the same `docker run` shape as `start.sh`.
+TP=4 vs the 2-node baseline on the same production-mix bench (temperature 0,
+30-min soak): decode 1.45x, mixed phases 20-35 % shorter, **cold prefill only
++29 %** at 282k tokens (1162 vs 901 tok/s: a 4-node TP job is fabric-bound on
+prefill). One caveat found by a 150-minute soak on 2026-09-03: with the DFlash2
+draft on, a 96k chunked prefill sharing steps with 6-7 speculative decode
+streams hangs all four ranks (3/3 runs, 31-78 min; independent of the E2
+fat-expert kernel). The draft was not the cause: the draft-off soak that first
+passed clean stalled an hour later on a lone 282k cold prefill, and the
+packet-loss-only explanation that followed was withdrawn as well (later stalls
+reproduced with the RoCE loss counters flat). On that kit the failure was still
+reproducing in September 2026, where an H16 sparse-attention progress failure
+was localized at the same step (the internal race is not identified); the
+mitigation in use there is a bounded final sparse-attention call (at most 64
+query rows), not the knobs below. Kit-scoped attribution, updated 2026-09-09:
+<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/115#issuecomment-5599489540>
+(details and receipts in the linked repo). The defaults above are tuned for 2 nodes; on 4 nodes an autoresearch
+loop (one knob per relaunch, hard reliability gates) settled on the values now
+in `.env.tp4.example`: `GPU_MEM_UTIL=0.75` (0.85 left <2 GiB host memory per
+rank and preceded two engine deaths), `MAX_NUM_SEQS=8` (135 vs 84 tok/s
+aggregate at 8 streams, worst first token 1.0 s vs 27 s), `DFLASH_TOKENS=3`
+(53 % accepted vs 30 % at 7; prose decode 31-33 vs 26-28 tok/s),
+`MAX_NUM_BATCHED_TOKENS=2048` (larger chunks do not prefill faster on TP=4 and
+hurt first-token latency), `GLM53_MIXED_PREFILL_CHUNK=off`. Full recipe,
+launcher, watchdog, benchmark and every receipt:
+<https://github.com/punkjazz-labs/glm-5.3-flash-exl3-4x-dgx-spark>.
+
 API: `http://127.0.0.1:8888/v1` (LAN: `http://10.0.0.1:8888/v1`).
 `/v1` is unauthenticated unless you set `VLLM_API_KEY` in `.env` (opt-in;
 empty = no auth). vLLM reads the env var natively so the key never lands in
@@ -817,6 +892,7 @@ that are now documented/enforced:
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
+| `GLM53_EXPOSE_CACHE_RESET` | `0` (off) | opt-in. `1` attaches the upstream cache-reset dev routes (`/reset_prefix_cache`, `/reset_mm_cache`, `/reset_encoder_cache`, #31) on the head API server. This flag does not enable other dev routes; independent `VLLM_SERVER_DEV_MODE` retains precedence and can enable the full dev surface. Root routes are outside the bearer guard—leave this flag off where clients are untrusted. Takes effect on restart. TP=2 `start.sh` only; `start-tp3.sh` / `start-tp4.sh` are unchanged |
 | `ABLIT` | `0` (off) | opt-in. `1` = apply o_proj edit at load (both ranks). Unset = stock weights |
 | `GLM53_ADAPTIVE_K` | `off` | `ema` = adaptive verification length (prose +13–21 %); needs the capture-size list in `EXTRA_ARGS`. See *Faster prose decode* |
 | `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1 |
@@ -849,7 +925,14 @@ that are now documented/enforced:
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
 | `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | TP=2 DFlash2 drafter retention. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. TP=4 rejects a non-empty value. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
 | `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
-| `GLM53_MIXED_PREFILL_CHUNK` | `skip` | do not mix a peer prefill into a decode step (issue #6). `N>0` = cap tokens; `0` = off. Solo prefill stays MNBT (7168) |
+| `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
+| `GLM53_MIXED_PREFILL_CHUNK` | `fair` on `start.sh` / `.env.example`; **`0` on `start-tp3.sh` / `.env.tp3.example`**; **`skip` on `start-tp4.sh` / `.env.tp4.example`** | Mixed-prefill policy while a peer decodes. **`skip` starves prefills until decode ends** (the reported multi-minute newcomer freeze). `N>0` caps mixed chunks with hybrid alignment support; `0`/`off` disables isolation (admits newcomers in ~1 s but collapses the incumbent 10–36× on TP=2). `fair` v5 allocates decodes first, charges only prefill that contends with a decoder, fits a fixed-plus-per-token step cost, runs the largest chunk that fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, and gives a newcomer one prompt probe. Measured on TP=2 (reporter recipe, thinking essay at ~24 tok/s): 2k newcomer first token ~12 s, 30k newcomer ~164 s while the essay still streams, incumbent keeps ~80–90% of its in-run rate. TP=3 and TP=4 stay off-fair until measured. See [receipts](docs/diditfix.md) and [design](docs/astra-fix.md). |
+| `GLM53_FAIR_PREFILL_CHUNK` | `256` | Probe chunk until timing samples exist. Afterwards fair v5 fits a fixed-plus-per-token step cost from solo and mixed samples and targets the largest ladder rung (128..2048) whose estimated step fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, saving credit for it instead of spending on small chunks (every prefill-bearing step costs ~0.3 s fixed on this kit, so 128-token steps ran at ~70 tok/s under v4). Base scheduler token/input and long-prefill caps still apply. |
+| `GLM53_FAIR_PREFILL_SHARE` | `0.20` | Credit accrual fraction of accounted busy engine wall time (`0..1`), using a host timing proxy. Whole mixed-step cost is charged; queued async spans are counted once. |
+| `GLM53_FAIR_PREFILL_MAX_INTERVAL_MS` | `2000` | Age at which an already-served prefill may borrow one step-bounded chunk after all shared debt is repaid; a never-served newcomer gets that probe promptly. Resource, credit, and step limits can defer service beyond this age. |
+| `GLM53_FAIR_PREFILL_MAX_STEP_MS` | `1000` | Limit on estimated aggregate mixed-step duration (`1..600000` ms), forwarded to all ranks. It also bounds the target chunk and any borrowed probe, so it is the one knob for how long the incumbent may pause per mixed step (1000 ms selects 1024-token chunks on this kit; 500 ms selects 256–512). Estimates do not guarantee client delivery gaps; overrun debt must be repaid. |
+| `GLM53_FAIR_PREFILL_MAX_CHUNKS` | `1` | Maximum distinct prefills per turn, sharing one aggregate credit and step budget. Increasing this does not multiply one request's chunk. |
+| `GLM53_EXTRA_ENV` | (empty) | space-separated `NAME=VALUE` list of extra container env for both ranks, for diagnostics (e.g. `VLLM_DEBUG_WORKSPACE=1`, `VLLM_LOGGING_LEVEL=DEBUG`). Names and values validated; launcher-owned names (everything the launcher forwards, plus `NCCL_*`/`HF_*`/`GLM53_*`/`EXL3_*`/`FLASHINFER_*`) are rejected instead of adding a duplicate `-e`. Only names are logged, and a rejected entry is reported by position only, never echoed; caller export wins over `.env`. Validation occurs during launch: invalid entries can fail after existing containers have been removed. |
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_DEFAULT_REASONING_EFFORT` | *(empty)* | `low` / `high` / `max` via `--default-chat-template-kwargs` on both ranks. Empty sends no flag, so omitted effort renders Max. Per-request `chat_template_kwargs.reasoning_effort` overrides the default; `medium` is rejected because the template maps it to Max |
 | `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
@@ -916,6 +999,54 @@ engine — do not trust an A/B measured without it. Not covered:
 KV connectors / CPU offload (none on this kit), pooling requests. Kill switch: `GLM53_APC_NO_STORE=0`.
 Design + receipts protocol: `docs/DESIGN-apc-no-store.md`.
 
+## What the KV cache boot line means
+
+vLLM logs once per boot (`v1/core/kv_cache_utils.py`, `update_kv_cache_capacity`):
+
+```
+GPU KV cache size: 1,553,140 tokens, Maximum concurrency for 1,000,000 tokens per request: 1.55x
+```
+
+The first number is `int(max_concurrency × max_model_len)`, with `max_concurrency = num_blocks /
+num_blocks_per_request` and `num_blocks_per_request` a **sum over KV-cache groups** of
+`cdiv(spec.max_memory_usage_bytes, spec.page_size_bytes)`. It is a concurrency figure in token units, not the
+size of a prefix cache. On this hybrid model (MLA + kpool tail + 4 mamba + DFlash2 drafter SWA, one shared
+`BlockPool` with globally unique block ids) the pool behind that line was **643 block ids** (642 usable; id 0 is
+the null block) and one cached 3584-token segment costs **38** of them (1 MLA + 4 mamba + 33 drafter), so
+about **57K tokens** of cached conversation fit with nothing running — not 1.5M. Neither `num_blocks` nor
+`num_blocks_per_request` is logged by stock vLLM (feature request
+[vllm-project/vllm#54662](https://github.com/vllm-project/vllm/issues/54662)).
+
+Overlay `patch_kv_capacity_log.py` (`GLM53_KV_CAPACITY_LOG=1`, default) keeps that line byte-identical and adds,
+from the same config objects, one line per group and one summary — on the 643-id boot:
+
+```
+[glm53-kv-capacity-log] group 0: MLAAttentionSpec layers=11 block_size=3584 page_size=… B blocks/request@1,000,000=280 prefix_caching=yes
+[glm53-kv-capacity-log] group 1: KpoolTailSpec layers=11 block_size=4 page_size=… B blocks/request@1,000,000=1 prefix_caching=no (scratch) window=4 eagle=no
+[glm53-kv-capacity-log] group 2: MambaSpec layers=9 block_size=3584 page_size=… B blocks/request@1,000,000=9 prefix_caching=yes mamba_cache_mode=align
+… groups 3-5 identical to group 2 …
+[glm53-kv-capacity-log] group 6: SlidingWindowSpec layers=1 block_size=64 page_size=… B blocks/request@1,000,000=97 prefix_caching=yes window=2048 eagle=yes
+[glm53-kv-capacity-log] usable block ids: 642 (num_blocks=643 incl. the null block; 414 ids per 1,000,000-token request => 1.55x); ids per 3584-token cached segment across groups: 38 (per group: [1, 0, 1, 1, 1, 1, 33]); cached-conversation capacity at this alignment ≈ 57,344 tokens = 16 segments (aligned dense-retention prefix-cache upper bound: nothing running, every reachable block hashed, block-aligned hits). The 'GPU KV cache size' line above is max_concurrency x max_model_len, not this figure.
+```
+
+`blocks/request` is the same `cdiv` expression the stock line is built from (its column sum, 414, is the stock
+denominator). "Ids per cached segment" is the dense-retention cost with block-aligned hits — what each manager's
+`reachable_block_mask` hashes with no retention interval: every block for `FullAttentionSpec` / `MLAAttentionSpec`
+and for `MambaSpec` in `align`/`all` mode (read from the spec the manager acts on),
+`min(cdiv(window − 1, 64) + 1 (EAGLE), 3584 / 64)` = 33 for the drafter (`SlidingWindowSpec` /
+`SlidingWindowMLASpec`), 0 for the kpool tail (opts out of prefix caching). Exact class names only: any other
+spec — subclasses such as `SinkFullAttentionSpec` included, since they come with their own manager rule — is
+reported as unmodelled and the capacity is withheld rather than guessed, as it is under DCP/PCP > 1 (block sizes
+are rescaled per rank there). The alignment is the lcm of the group block sizes (the coordinator's scheduler
+block). The figure is an upper bound: a running request holds its own blocks, and PR #83's per-group retention
+lowers the drafter's cost to boundary tails only (not modelled here — the summary states its assumption).
+
+The numbers move with the boot, the arithmetic does not: the figures elsewhere in this README (690 blocks /
+1,754,237 tokens / 1.75× at 1M) are the same quantity on the reference kit's boot (690 / 1.75 ≈ 394 ids per
+1M-token request under that config); our 2026-08-31 boot had 643 ids at 414 per request, and the current
+rightsized-workspace boot 820 (`usable block ids: 819 … ≈ 75,264 tokens = 21 segments`). Read your own boot's
+summary line rather than any number in this section.
+
 ## Image / overlay
 
 ```bash
@@ -939,15 +1070,18 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0`, E2 diag schema, E3 grouped tables/parity/graph-replay/fallback checks |
 | `tests/test_apc_per_group_retention.py` | host: overlay apply/idempotence, min-exemption derivation, routing, env validation, composition with `patch_hybrid_prefix_hit.py` in both orders, id-cost/capacity arithmetic (needs `GLM53_KV_COORDINATOR_PY_SRC` + `_PRISTINE` copies of the fork's coordinator) |
 | `overlay/patch_apc_no_store.py` | per-request GPU prefix-cache no-store (`skip_writing_prefix_cache` / `vllm_xargs`): strict 0/1 validation in `SamplingParams.__post_init__`, never-raising resolver on `Request`, guards at the two `_insert_block_hash` sites in `BlockPool`; transactional, fail-closed; kill switch `GLM53_APC_NO_STORE` |
-| `tests/test_apc_no_store.py` | host: anchors / idempotence / per-anchor drift with nothing written / partial-marker refusal; resolver accept-reject matrix + kill-switch matrix; on a CPU vLLM (`GLM53_VLLM_SRC_ROOT`, mandatory in the image): real `BlockPool` LIFO-front vs LRU-back, chunked-prefill `num_cached_block` parity with a normal twin, hybrid mamba partial-tail producer/reader/CoW, the live MLA+mamba×4+EAGLE-SWA layout (+`KpoolTailSpec` in-image), preemption, `skip_reading`+`skip_writing`, receipts; launcher 0/1 guard |
-| `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): `GLM53_APC_RETENTION_INTERVAL[_SWA]` guard matrix, host template-interpreter selection, `restart` fails closed on a bad knob or a missing / mis-pointed / broken overlay (every artifact) before anything is stopped, the `hybrid -> per-group -> no-store` overlay list emitted to both rank scripts, and matching rank environments and mounts (head mount = scp source = worker mount; `GLM53_APC_RETENTION_INTERVAL[_SWA]` / `GLM53_APC_NO_STORE` identical) |
+| `tests/test_apc_no_store.py` | host: apply / idempotence / drift with nothing written / partial-application refusal; resolver accept-reject and kill-switch behavior; on CPU vLLM (`GLM53_VLLM_SRC_ROOT`, mandatory in the image): real `BlockPool` free-queue policy, chunked-prefill bookkeeping parity, hybrid partial-tail producer/reader/CoW, seven-group fork layout, env-driven retention and cache lookup, preemption, `skip_reading`+`skip_writing`, and log receipts |
+| `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): retention and kill-switch validation, pre-stop artifact checks, ordered hybrid/per-group/no-store overlays (kv-capacity-log after its shared-file drafter-group patch and before xgrammar), and matching rank environments and mounts including no-store, KV-capacity-log, and cache-reset values |
 | `tests/bench_decode.py` | streaming decode + coherence; `--structured` is the count-1→200 median |
 | `tests/test_start_overrides.py` | CPU-only caller precedence: `.env` keys, empty exports, shell assignments, and child inheritance |
+| `tests/test_launcher_extra_env.py` | launcher (CPU-only, docker/ssh stubbed): non-owned `GLM53_EXTRA_ENV` diagnostics reach both ranks as `-e` pairs, launcher-owned names fail the launch before any container starts, values stay out of the log, and malformed entries are rejected by position without echoing any fragment |
 | `start.sh` / `stop.sh` / `download.sh` | 2-node launch; Hub fetch on the head only. `./stop.sh` also stops TP=3 when that stack is up (`tp2` / `tp3` / `all`) |
 | `start-tp3.sh` / `.env.tp3.example` | 3-node TP=3 launch (head padding + expert parallel + `overlay/tp3/`); knobs stay out of `.env`. Boots this kit 2026-09-14 |
 | `overlay/tp3/` | TP=3-only shape overlays (FlyCockpit MIT): head/vocab/shared-expert/A_log pads, EP loader, SM120 decode pad. Not on the TP=2 path |
 | `files/nfs-share.sh` / `files/nfs-server/` | `NFS_SHARE=1`: workers mount the head's HF cache over NFSv4 instead of holding a copy. Used by `start.sh` and `start-tp3.sh`. This kit has it on |
 | `start-tp4.sh` / `.env.tp4.example` | experimental 4-node TP=4 launch; knobs stay out of `.env` |
+| `kernel_lab/exl3/` | model-agnostic EXL3 K1-K8 oracle, SM121 tactic sweep, and Atlas receipt producer (development-only; not in the production image) |
+| `docs/exl3-sm121-kernel-lab.md` | kernel ABI, measurements, upstream sources, decisions, and next gate |
 | `files/chat_template.jinja` | GLM-5.3 MM template (`<|image|>` / `<|video|>`); checkpoint jinja is language-only |
 | `overlay/qwen3_dflash2.py` | DFlash2 draft (grouped conv + candidate selector) |
 | `overlay/dflash2_speculator.py` | DFlash2 selector walk (V2 speculator) |
@@ -956,11 +1090,16 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-share (`block=64`, `page_size_padded=mla_page`); runtime-mounted by `start.sh` (`DRAFTER_PATCH_HOST`) |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
-| `overlay/patch_scheduler_decode_floor.py` | skip (or cap) peer prefill while another seq is decoding |
+| `overlay/patch_scheduler_decode_floor.py` | skip / cap / off / `fair` mixed-prefill; v5 fixed-cost step fit + largest step-fitting chunk + bounded contention credit, decode first; versioned installer |
+| `tests/test_scheduler_decode_floor.py` | v5 migration from v1/v2/v3/v4; cost fit, ladder climb-back, prompt probe, async accounting, bounded credit, alignment and actual scheduler budget regressions |
 | `overlay/patch_xgrammar_termination.py` | source-exact vLLM #52805/#53046 backports; stop at termination and validate post-reasoning speculative drafts before FSM advance |
 | `tests/test_xgrammar_termination.py` | exact two-file patch, idempotence, cross-file fail-closed drift, termination/rollback/reset and post-reasoning draft behavior, launcher wiring |
+| `overlay/patch_cache_reset.py` | mount only the upstream cache-reset dev router (`/reset_prefix_cache` et al., #31) when `GLM53_EXPOSE_CACHE_RESET=1`; runtime-mounted by `start.sh` (`CACHE_RESET_PATCH_HOST`) |
+| `tests/test_cache_reset_endpoint.py` | exact `build_app` anchor, flag semantics (off / on / dev precedence), fail-closed drift, idempotence, installed copy |
 | `overlay/patch_kpool_tail_slotmap.py` | clamp KpoolTail one-block circular slot mapping; identity for other KV groups |
 | `tests/test_kpool_tail_slotmap.py` | circular addressing math, exact kernel patch, idempotence, fail-closed drift, launcher wiring |
+| `overlay/patch_kv_capacity_log.py` | log-only: after the stock `GPU KV cache size` line (kept byte-identical) log per-group `blocks/request` (the stock line's own denominator) and the usable-block-ids / ids-per-aligned-segment / cached-conversation-capacity summary; unmodelled spec kinds withhold the figure; knob `GLM53_KV_CAPACITY_LOG` (0/1); two pinned anchors, preflighted before either is written, atomic, idempotent |
+| `tests/test_kv_capacity_log.py` | CPU-only execution of the shipped derivation helpers against hybrid, single-group, uniform-type, unsupported-spec, and null-block cases; patch application and idempotence on a pinned fixture, fail-closed anchor drift, and installed-source preflight when available (required in the image). Launcher flag validation belongs to `tests/test_numeric_config.py`. |
 | `overlay/patch_indexer_workspace.py` | opt-in `GLM53_INDEXER_WORKSPACE=rightsize`: size the sparse-indexer prefill workspace to the legal per-step maximum instead of `max_model_len * 40`; boot-time compress-ratio cross-check |
 | `tests/test_indexer_workspace.py` | sizing formula (MNBT/`max_num_seqs`/spec-token edge cases, stock clamp), chunk-list equivalence vs stock by exhaustion, exact three-site patch, idempotence, fail-closed drift, launcher wiring |
 | `overlay/patch_spinwait.py` | opt-in numeric `GLM53_SPINWAIT_MS`: fail-closed runtime patch of SpinCondition's reader busy-loop window on both ranks |
@@ -971,9 +1110,17 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, transplant byte-copy + TP slice, hook gating |
 | `tests/test_default_reasoning_effort.sh` | `GLM53_DEFAULT_REASONING_EFFORT` enum guard (`""`/`low`/`high`/`max`; `medium` rejected) and the `--default-chat-template-kwargs` flag at both rank sites, sliced out of `start.sh` and evaluated |
 | `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
+| `tests/test_boot_shape_warmup.py` | the shipped warmup script end-to-end with `WARMUP_CURL` stubbed: all 9 ladder/prefill prompts (65536 rung included) arrive byte-exact, the 24-request tally holds, and the tokenize-mismatch / smaller-context runs exit 1 while still warming the rest |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
+
+The kernel lab is development-only source: the production Dockerfile does not
+copy or install `kernel_lab/`, so the served image does not contain it. The lab
+accepts arbitrary `OPERATOR:K:N` shapes or a JSON workload file; GLM/Hy4 names
+are optional historical fixtures, not a supported-model list. See
+[`kernel_lab/README.md`](kernel_lab/README.md) for the portable correctness
+gate and isolated SM121 tuning command.
 
 ## Do not
 
@@ -1024,3 +1171,51 @@ DFlash2 stays [CC BY-NC-ND 4.0](https://huggingface.co/incoai/GLM-5.3-Flash-DFla
   [outstandly/glm53-flash-3x-dgx-spark](https://github.com/outstandly/glm53-flash-3x-dgx-spark)
   (MIT). Those projects run their own launcher (`fleetctl.py`);
   orchestration, E3, adaptive-k and the FP8 path stay this repo's.
+
+## Concurrency ladder (2026-08-31, 1M ctx, MNBT 2048, MAX_NUM_SEQS 16, `GLM53_MIXED_PREFILL_CHUNK=512`)
+
+Both tables are historical measurements of the configuration named in their own
+heading, not of current main. Only the 2026-09-01 run has raw cells checked in
+(`docs/ladder-final-2026-09-01.json`).
+
+`tests/bench_concurrency.py` runs N simultaneous streams per level (modes `code` / `data` / `chat`; optional cached context per lane),
+counts tokens from the server's `usage`, and writes per-cell JSON (`agg_tps`, `stream_tps_median`, TTFT/ITL p50/p95/p99, cache hit
+ratio, preemptions) plus a live `logs/status.json` (gitignored; `--status` moves it). Canonical run (idle server):
+`python3 tests/bench_concurrency.py --levels 1,2,4,8,12,16 --modes code,data,chat --ctx 0,50000,100000 --reps 3 --out logs/ladder.json`.
+
+`tests/bench_live.html` renders that live file by default, or a checked-in receipt via `?src=` (paths resolve under `tests/`).
+It must be served over loopback HTTP — `fetch()` from a `file://` page is blocked and the page only shows "waiting": from the repo
+root run `python3 -m http.server 8765 --bind 127.0.0.1`, then open `http://127.0.0.1:8765/tests/bench_live.html`, e.g.
+`.../tests/bench_live.html?src=../docs/ladder-final-2026-09-01.json` for the 2026-09-01 receipt.
+
+| job (temp 0) | ×1 | ×2 | ×4 | ×8 | ×12 | ×16 |
+|---|---:|---:|---:|---:|---:|---:|
+| code — aggregate tok/s | 41.9 | 52.3 | 77.9 | 93.8 | 116.2 | 127.2 |
+| code — per stream | 44.3 | 28.8 | 21.0 | 13.9 | 11.9 | 10.2 |
+| data (JSON/CSV) — aggregate | 31.6 | 53.0 | 72.0 | 83.2 | – | – |
+| chat — aggregate | 18.1 | 26.3 | 36.1 | 55.9 | 66.4 | 76.7 |
+| chat — per stream | 18.5 | 14.1 | 10.0 | 7.7 | 6.1 | 5.2 |
+| TTFT median (s), any mode | 0.4–0.6 | 0.7–1.0 | 0.8–1.0 | 1.1–1.3 | 1.1–1.6 | 1.3–1.6 |
+
+Warm-context ladder (2026-09-01, `docs/ladder-final-2026-09-01.json`), recorded on the
+then-unmerged overlay stack per-group retention + fine-grained hits + gate v2
+(PRs #83 / #84 / #80) — none of which is current main. #83 was closed unmerged;
+main carries per-KV-cache-group retention via merged #130, where an empty
+`GLM53_APC_RETENTION_INTERVAL_SWA` inherits the global retention interval instead of
+applying #83's automatic rule. #84's overlay patch and the #80 gate-v2 knobs are not
+in main, which still defaults `GLM53_MIXED_PREFILL_CHUNK=skip`.
+
+| ctx 50K per lane (distinct prefixes, verified warm) | ×1 | ×2 | ×4 | ×8 | ×16 |
+|---|---:|---:|---:|---:|---:|
+| code — aggregate tok/s | 35 | 50 | 67 | 8.5–29 | 6.8 |
+| chat — aggregate tok/s | 18.5 | 26 | 35 | 5–7 | 5.2 |
+| cache hit | 1.0 | 1.0 | 0.999 | 0.25–0.75 | 0.19 |
+| TTFT p95 (s) | 0.4 | 0.8 | 1.2–1.4 | 173–454 | 899–963 |
+
+What it shows on that stack: **up to 4 concurrent 50K-context lanes ran fully warm** (hits 0.999, TTFT ≤1.4 s,
+aggregate equal to the same run's ctx-0 cells); at 8×50K the recorded cached working set (~400K tokens + in-flight) exceeds the
+~455K-token budget measured then (642 block ids / ~5 per 3584-token segment) and hit rates collapse. The ladder alone does not
+establish that budget as the cause — later whole-stack comparisons (#174) neither confirm the attribution nor isolate a single
+root cause. Speed is set by the DFlash2 drafter's acceptance (code ~35–44 tok/s solo, prose chat ~18), not by temperature
+(0 vs 0.7 within noise) or thinking on/off; the interactive knee is ~4 lanes. Under the original `skip` policy the second stream
+waited 15–17 s (requests served one at a time) — fixed by the mixed-prefill gate v2 knobs on this stack.
