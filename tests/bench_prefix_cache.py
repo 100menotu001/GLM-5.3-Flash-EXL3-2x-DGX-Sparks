@@ -12,12 +12,11 @@ Protocol (mirrors the kit README's prefix-caching table):
         vllm:prefix_cache_{hits,queries} counter deltas around the turn.
 
   A prefix-cache reset (POST /reset_prefix_cache, with /flush_cache fallbacks)
-  runs before each cold turn when the server offers one. Since #31 is
-  implemented (overlay/patch_cache_reset.py, GLM53_EXPOSE_CACHE_RESET=1) the
-  image answers /reset_prefix_cache; every chat is still salted with a
-  per-invocation session id so repeated runs measure true colds even when the
-  reset route is disabled (GLM53_EXPOSE_CACHE_RESET=0) — instead of silently
-  hitting the previous session's pages.
+  runs before each cold turn when the server offers one. That route is opt-in
+  since #31 (overlay/patch_cache_reset.py, GLM53_EXPOSE_CACHE_RESET=1), so
+  every chat is also salted with a per-invocation session id: repeated runs
+  measure true colds whether or not the reset route is mounted — instead of
+  silently hitting the previous session's pages.
 
 Page granularity (IMPORTANT on this stack): the sparse-MLA KpoolTailManager
 only counts BLOCK-ALIGNED hits at the 3584-token hybrid MLA page. Hits are
@@ -63,8 +62,8 @@ _CHARS_PER_TOKEN = 4.5
 DEFAULT_PAGE_TOKENS = 3584
 # Unique per invocation: colds must not reuse pages cached by a previous bench
 # session (observed 2026-08-29: reruns reused chat content and "cold" TTFT
-# dropped 10.3s -> 1.9s). /reset_prefix_cache is exposed since #31, but the
-# salt keeps colds honest even with GLM53_EXPOSE_CACHE_RESET=0.
+# dropped 10.3s -> 1.9s). /reset_prefix_cache is available since #31 when
+# GLM53_EXPOSE_CACHE_RESET=1, so the salt keeps colds honest with the route off.
 _SESSION_SALT = f"{int(time.time()) % 100000000:08d}"
 
 _DOC_SENTENCE = (
