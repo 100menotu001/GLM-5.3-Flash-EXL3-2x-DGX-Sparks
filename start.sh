@@ -290,9 +290,9 @@ READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 # 1 = suppress client stop strings until </think> (DSpark #42 class).
 GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
-# fair = time-share mixing (TP=2 default since 2026-09-15, overlay v5);
+# fair = time-share mixing (default since 2026-09-15, overlay v5);
 # skip = do not mix (starves waiting prefills until the decode ends);
-# N>0 = cap mixed prefill tokens; 0 = off.
+# N>0 = cap mixed prefill tokens; 0 / off = no isolation.
 # Fair knobs are forwarded on every rank even when CHUNK is not fair.
 # fair v5: fixed+per-token step-cost fit, largest chunk that fits MAX_STEP_MS,
 # prompt step-bounded newcomer probe, bounded contention credit, decode first.

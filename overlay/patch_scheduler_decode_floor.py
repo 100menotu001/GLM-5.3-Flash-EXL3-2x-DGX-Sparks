@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mixed-prefill policy: skip / cap / off / opt-in fair (issue #6).
+"""Mixed-prefill policy: skip / cap / off / fair (issue #6).
 
 A decode lane on this backend needs ~8 tokens (1 + DFlash2 k=7). The leftover
 MNBT budget otherwise goes to a peer FLASHINFER_MLA_SPARSE_SM120 prefill
@@ -8,16 +8,15 @@ chunk. Mixed execution leaves the uniform decode FULL-graph path, and a
 budget.
 
 GLM53_MIXED_PREFILL_CHUNK:
-  skip / -1  — do not mix prefill with decode (TP=4 default; TP=2 until
-               2026-09-15). Starves every
+  skip / -1  — do not mix prefill with decode. Starves every
                waiting/running prefill while any peer is decoding; there is
                no age limit. Solo prefill is unchanged.
   N>0        — cap mixed prefill chunks to N tokens while a peer decodes.
                The cap is fed into hybrid Mamba alignment so N < block_size
                still makes sub-block progress. 128 still stalls ~10 tok/s.
   0 / off    — disable the extra isolation policy.
-  fair       — service-time mixing (TP=2 default since 2026-09-15, v5;
-               opt-in on TP=3/TP=4). Decode-only
+  fair       — service-time mixing (default on TP=2/3/4 since 2026-09-15,
+               v5). Decode-only
                steps between prefill turns; at most
                GLM53_FAIR_PREFILL_MAX_CHUNKS chunks per turn (default 1).
                Only prefill that contends with a decoder is charged (solo
