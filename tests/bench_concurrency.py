@@ -14,8 +14,10 @@ Canonical run (server must be idle):
 Long-context cells use a *distinct* cached prefix per lane: a warm-up pass prefills each
 lane's prefix (max_tokens=1), then the measured pass sends prefix + a 200-token suffix and
 asserts the prefix-cache hit ratio from /metrics. `--shared-prefix` measures the
-shared-prefix variant instead. `tests/bench_live.html` renders the JSON (or status.json
-while running).
+shared-prefix variant instead. `tests/bench_live.html` renders the JSON (or the live
+status file, default logs/status.json) and must be served over loopback HTTP - a file://
+page cannot fetch(): `python3 -m http.server 8765 --bind 127.0.0.1` from the repo root,
+then http://127.0.0.1:8765/tests/bench_live.html
 """
 from __future__ import annotations
 
@@ -198,11 +200,7 @@ def run_cell(mode: str, ctx: int, level: int, rep: int, args: argparse.Namespace
         for p in prompts:
             stream_one(p, 1, 0.0, False, {})
         time.sleep(1.0)
-        mw = metrics()
-        cell_warm = {"warm_queries": mw.get("prefix_cache_queries_total"), "warm_hits": mw.get("prefix_cache_hits_total")}
     m0 = metrics()
-    if not ctx:
-        cell_warm = {}
     t_cell = time.time()
     outs: list[dict[str, Any]] = [dict() for _ in range(level)]
     ths = []
@@ -256,7 +254,7 @@ def main() -> int:
     ap.add_argument("--chat-temp0", action="store_true", help="run chat at temperature 0 instead of 0.7")
     ap.add_argument("--min-hit-ratio", type=float, default=0.8)
     ap.add_argument("--spread-tolerance", type=float, default=0.10, help="re-run a cell once if rep spread on agg_tps exceeds this")
-    ap.add_argument("--status", default="status.json", help="live status file for tests/bench_live.html")
+    ap.add_argument("--status", default="logs/status.json", help="live status file for tests/bench_live.html (default: %(default)s)")
     ap.add_argument("--out", default="logs/ladder.json")
     ap.add_argument("--force", action="store_true", help="run even if requests are in flight")
     args = ap.parse_args()
@@ -269,7 +267,7 @@ def main() -> int:
     modes = args.modes.split(",")
     ctxs = [int(x) for x in args.ctx.split(",")]
     out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path = Path(args.status)
+    status_path = Path(args.status); status_path.parent.mkdir(parents=True, exist_ok=True)
     state: dict[str, Any] = {"phase": "running", "started": time.time(), "cells": [], "live": {}}
 
     def dump():

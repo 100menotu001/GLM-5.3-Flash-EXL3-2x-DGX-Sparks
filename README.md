@@ -986,8 +986,13 @@ heading, not of current main. Only the 2026-09-01 run has raw cells checked in
 
 `tests/bench_concurrency.py` runs N simultaneous streams per level (modes `code` / `data` / `chat`; optional cached context per lane),
 counts tokens from the server's `usage`, and writes per-cell JSON (`agg_tps`, `stream_tps_median`, TTFT/ITL p50/p95/p99, cache hit
-ratio, preemptions). `tests/bench_live.html` renders the JSON (or a live `status.json`) while it runs. Canonical run (idle server):
+ratio, preemptions) plus a live `logs/status.json` (gitignored; `--status` moves it). Canonical run (idle server):
 `python3 tests/bench_concurrency.py --levels 1,2,4,8,12,16 --modes code,data,chat --ctx 0,50000,100000 --reps 3 --out logs/ladder.json`.
+
+`tests/bench_live.html` renders that live file by default, or a checked-in receipt via `?src=` (paths resolve under `tests/`).
+It must be served over loopback HTTP — `fetch()` from a `file://` page is blocked and the page only shows "waiting": from the repo
+root run `python3 -m http.server 8765 --bind 127.0.0.1`, then open `http://127.0.0.1:8765/tests/bench_live.html`, e.g.
+`.../tests/bench_live.html?src=../docs/ladder-final-2026-09-01.json` for the 2026-09-01 receipt.
 
 | job (temp 0) | ×1 | ×2 | ×4 | ×8 | ×12 | ×16 |
 |---|---:|---:|---:|---:|---:|---:|
