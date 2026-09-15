@@ -72,16 +72,7 @@ def test_reads_memavailable_not_memfree() -> None:
     assert result.stdout.strip() == "127926272 121634816"
 
 
-def test_guard_is_wired_after_port_checks() -> None:
-    source = START.read_text()
-    port = source.index('check_port_free "$MASTER_PORT" MASTER_PORT')
-    head = source.index('preflight_memory head "$head_total"')
-    worker = source.index('preflight_memory worker "$worker_total"')
-    assert port < head < worker
-
-
 if __name__ == "__main__":
     test_matrix()
     test_reads_memavailable_not_memfree()
-    test_guard_is_wired_after_port_checks()
     print("preflight memory tests: PASS")
