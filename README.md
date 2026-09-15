@@ -1203,7 +1203,8 @@ then-unmerged overlay stack per-group retention + fine-grained hits + gate v2
 main carries per-KV-cache-group retention via merged #130, where an empty
 `GLM53_APC_RETENTION_INTERVAL_SWA` inherits the global retention interval instead of
 applying #83's automatic rule. #84's overlay patch and the #80 gate-v2 knobs are not
-in main, which still defaults `GLM53_MIXED_PREFILL_CHUNK=skip`.
+in main. Current TP=2 main defaults to `GLM53_MIXED_PREFILL_CHUNK=fair` (v5);
+the historical gate-v2 measurements below do not qualify that policy.
 
 | ctx 50K per lane (distinct prefixes, verified warm) | ×1 | ×2 | ×4 | ×8 | ×16 |
 |---|---:|---:|---:|---:|---:|
