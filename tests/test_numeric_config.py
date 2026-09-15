@@ -130,6 +130,53 @@ def test_spinwait_numeric_contract() -> None:
         assert "GLM53_SPINWAIT_MS must" in result.stderr, bad
 
 
+def test_mixed_prefill_contract() -> None:
+    script = (
+        guard_source()
+        + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
+        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_SPINWAIT_MS=stock; '
+        + 'GLM53_INDEXER_WORKSPACE=stock\n'
+        + 'validate_numeric_config || exit $?\n'
+        + 'printf "%s|%s|%s\\n" "${GLM53_MIXED_PREFILL_CHUNK-}" '
+        + '"${GLM53_FAIR_PREFILL_CHUNK-}" "${GLM53_FAIR_PREFILL_SHARE-}"\n'
+    )
+
+    def run(extra: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("GLM53_MIXED") and not k.startswith("GLM53_FAIR")}
+        env["LC_ALL"] = "C"
+        env.update(extra)
+        return subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, check=False, env=env
+        )
+
+    for good in ("skip", "-1", "0", "off", "no", "fair", "128", "1024"):
+        result = run({"GLM53_MIXED_PREFILL_CHUNK": good})
+        assert result.returncode == 0, (good, result.stderr)
+    for bad in ("", "Skip", "true", "-2", "1025", "1.5", "fair "):
+        result = run({"GLM53_MIXED_PREFILL_CHUNK": bad})
+        assert result.returncode == 2, (bad, result.returncode, result.stdout, result.stderr)
+    result = run({
+        "GLM53_MIXED_PREFILL_CHUNK": "fair",
+        "GLM53_FAIR_PREFILL_CHUNK": "256",
+        "GLM53_FAIR_PREFILL_SHARE": "0.20",
+        "GLM53_FAIR_PREFILL_MAX_INTERVAL_MS": "2000",
+        "GLM53_FAIR_PREFILL_MAX_CHUNKS": "1",
+    })
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fair|256|0.20"
+    result = run({
+        "GLM53_MIXED_PREFILL_CHUNK": "fair",
+        "GLM53_FAIR_PREFILL_SHARE": "1.1",
+    })
+    assert result.returncode == 2
+    result = run({
+        "GLM53_MIXED_PREFILL_CHUNK": "fair",
+        "GLM53_FAIR_PREFILL_CHUNK": "0",
+    })
+    assert result.returncode == 2
+
+
 def test_restart_validates_before_stop() -> None:
     source = START.read_text()
     main = source.index("main() {")
@@ -167,6 +214,7 @@ if __name__ == "__main__":
     test_decimal_normalization()
     test_indexer_workspace_enum()
     test_spinwait_numeric_contract()
+    test_mixed_prefill_contract()
     test_restart_validates_before_stop()
     test_tp4_rejects_retention_override()
     print("numeric config tests: PASS")
