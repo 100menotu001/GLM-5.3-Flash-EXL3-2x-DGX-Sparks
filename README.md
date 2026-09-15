@@ -924,6 +924,7 @@ that are now documented/enforced:
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
 | `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | TP=2 DFlash2 drafter retention. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. TP=4 rejects a non-empty value. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
+| `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_MIXED_PREFILL_CHUNK` | `fair` (`start.sh`, `start-tp3.sh`, `start-tp4.sh`, `.env.example`, `.env.tp3.example`, `.env.tp4.example`) | Mixed-prefill policy while a peer decodes. **`skip` starves prefills until decode ends** (the reported multi-minute newcomer freeze). `N>0` caps mixed chunks with hybrid alignment support; `0`/`off` disables isolation (admits newcomers in ~1 s but collapses the incumbent 10–36× on TP=2). `fair` v5 allocates decodes first, charges only prefill that contends with a decoder, fits a fixed-plus-per-token step cost, runs the largest chunk that fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, and gives a newcomer one prompt probe. Measured on TP=2 (reporter recipe, thinking essay at ~24 tok/s): 2k newcomer first token ~12 s, 30k newcomer ~164 s while the essay still streams, incumbent keeps ~80–90% of its in-run rate. TP=3 same recipe: 2k in 8.7 s, 30k in 110 s, both during the essay, incumbent ~83–87%. TP=4 inherits the same default; that topology was not re-measured. See [receipts](docs/diditfix.md) and [design](docs/astra-fix.md). |
 | `GLM53_FAIR_PREFILL_CHUNK` | `256` | Probe chunk until timing samples exist. Afterwards fair v5 fits a fixed-plus-per-token step cost from solo and mixed samples and targets the largest ladder rung (128..2048) whose estimated step fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, saving credit for it instead of spending on small chunks (every prefill-bearing step costs ~0.3 s fixed on this kit, so 128-token steps ran at ~70 tok/s under v4). Base scheduler token/input and long-prefill caps still apply. |
@@ -953,6 +954,50 @@ that are now documented/enforced:
 `DEFAULT_MAX_NEW_TOKENS` preserves omitted completion limits through Pydantic normalization; an explicit `max_tokens: null` retains the pinned runtime's native normalization to 16. The overlay validates the limiter, completion caller, and protocol validator before writing any target. The CPU regression (`python3 tests/test_gen_defaults.py`) requires Pydantic v2 and exercises its real before-validator, not fabricated field-set metadata.
 
 **Default from this checkout:** E2 fat kernel on (`EXL3_FAT_KERNEL=1`) and `MAX_NUM_BATCHED_TOKENS=7168`; the E3 grouped tier is the launcher default (`EXL3_FAT_GROUPED=1`, see *Cold prefill (E3)*). The pre-E2 C4 keep was 2048; the current E2 cold-prefill baseline is the linked PR77 table; E2 at 7168 is ~1,150–1,185 tok/s cold, E3 ~1,580–1,640.
+## Opting a request out of the prefix cache
+
+`BlockPool.free_blocks` puts **hashed** blocks at the back of the free queue (LRU) and unhashed
+ones at the front (LIFO). A one-off batch/eval request therefore stores its blocks *behind* the
+owner's idle 80K conversation and the owner's blocks are what gets evicted next — the batch job
+re-orders the LRU in its own favour. `cache_salt` namespaces and still stores; vLLM's
+`skip_reading_prefix_cache` is read-side only. Overlay `patch_apc_no_store.py` adds the write-side
+opt-out: `SamplingParams.skip_writing_prefix_cache`, reachable on `/v1/chat/completions`,
+`/v1/completions` and `/v1/responses` through `vllm_xargs` (no entrypoint edits):
+
+```bash
+curl -s "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+  "model": "GLM-5.3-Flash-EXL3", "messages": [{"role": "user", "content": "classify: ..."}],
+  "max_tokens": 64, "cache_salt": "batch-lane-07",
+  "vllm_xargs": {"skip_writing_prefix_cache": 1}}'
+```
+
+Send the integer `1` (`"1"` and JSON `true` also work: `vllm_xargs` is typed
+`dict[str, str | int | float | list]` and pydantic coerces a JSON boolean to `1`/`0` — verified on
+pydantic 2.13). Any other value (`1.0`, `"yes"`, `2`, …) is rejected with HTTP 400 naming the field
+(validated in `SamplingParams.__post_init__`, i.e. in the API server — never a silent no-op). The
+request then:
+
+- is **still allowed to read** the cache (a lane that shares the system prompt gets the free prefix;
+  reading touches blocks, i.e. refreshes their LRU position — the flag is write-only);
+- inserts **no** block hash in any KV-cache group (MLA, mamba partial tails, drafter SWA) and emits no
+  `BlockStored` event; all allocation bookkeeping (`num_cached_block`, partial-hit CoW for what it
+  *read*) proceeds exactly as for a normal request — the guards sit at the two `_insert_block_hash`
+  sites in `BlockPool`, not at `allocate_slots`, because `num_cached_block` doubles as the
+  running-request sentinel for SWA/drafter allocation;
+- has its blocks freed to the **front** of the free queue, so they are the next ids recycled and the
+  resident conversation is not displaced;
+- if preempted, resumes from whatever it could *read* — nothing, when its prefix was cold — so prefer
+  it for short lanes, ideally with a low `priority`.
+
+Server-log receipts (each once per process): `[glm53-apc-no-store] first request resolved
+skip_writing_prefix_cache=1` (the flag reached the engine) and `[glm53-apc-no-store] suppressing
+prefix-cache store (full site)` / `(partial site)` (a store was actually cut; the partial site needs the
+runtime's fine-grained partial-tail producer, which the coordinator vetoes for this model's
+`KpoolTailManager` — see [Prefix caching](#prefix-caching-this-kit-2026-08-30) — so on this kit it is
+normally the full site that fires). If the first line never appears, the flag did not reach the
+engine — do not trust an A/B measured without it. Not covered:
+KV connectors / CPU offload (none on this kit), pooling requests. Kill switch: `GLM53_APC_NO_STORE=0`.
+Design + receipts protocol: `docs/DESIGN-apc-no-store.md`.
 
 ## What the KV cache boot line means
 
@@ -1024,7 +1069,9 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/patch_model_overrides.py` | `"exl3"` in ModelConfig overrides |
 | `tests/test_exl3_overlay.py` | registry, TP shard, `sm_121a` cubin, fused vs loop GEMM, `EXL3_FUSED_MOE=0`, E2 diag schema, E3 grouped tables/parity/graph-replay/fallback checks |
 | `tests/test_apc_per_group_retention.py` | host: overlay apply/idempotence, min-exemption derivation, routing, env validation, composition with `patch_hybrid_prefix_hit.py` in both orders, id-cost/capacity arithmetic (needs `GLM53_KV_COORDINATOR_PY_SRC` + `_PRISTINE` copies of the fork's coordinator) |
-| `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): retention validation, pre-stop artifact checks, ordered hybrid/per-group overlays (kv-capacity-log after the drafter-group patch it shares a file with, before xgrammar), and matching rank environments and mounts, including identical `GLM53_KV_CAPACITY_LOG` values |
+| `overlay/patch_apc_no_store.py` | per-request GPU prefix-cache no-store (`skip_writing_prefix_cache` / `vllm_xargs`): strict 0/1 validation in `SamplingParams.__post_init__`, never-raising resolver on `Request`, guards at the two `_insert_block_hash` sites in `BlockPool`; transactional, fail-closed; kill switch `GLM53_APC_NO_STORE` |
+| `tests/test_apc_no_store.py` | host: apply / idempotence / drift with nothing written / partial-application refusal; resolver accept-reject and kill-switch behavior; on CPU vLLM (`GLM53_VLLM_SRC_ROOT`, mandatory in the image): real `BlockPool` free-queue policy, chunked-prefill bookkeeping parity, hybrid partial-tail producer/reader/CoW, seven-group fork layout, env-driven retention and cache lookup, preemption, `skip_reading`+`skip_writing`, and log receipts |
+| `tests/test_launcher_rank_parity.py` | launcher (CPU-only, docker/ssh stubbed): retention and kill-switch validation, pre-stop artifact checks, ordered hybrid/per-group/no-store overlays (kv-capacity-log after its shared-file drafter-group patch and before xgrammar), and matching rank environments and mounts including no-store, KV-capacity-log, and cache-reset values |
 | `tests/bench_decode.py` | streaming decode + coherence; `--structured` is the count-1→200 median |
 | `tests/test_start_overrides.py` | CPU-only caller precedence: `.env` keys, empty exports, shell assignments, and child inheritance |
 | `tests/test_launcher_extra_env.py` | launcher (CPU-only, docker/ssh stubbed): non-owned `GLM53_EXTRA_ENV` diagnostics reach both ranks as `-e` pairs, launcher-owned names fail the launch before any container starts, values stay out of the log, and malformed entries are rejected by position without echoing any fragment |
@@ -1156,7 +1203,8 @@ then-unmerged overlay stack per-group retention + fine-grained hits + gate v2
 main carries per-KV-cache-group retention via merged #130, where an empty
 `GLM53_APC_RETENTION_INTERVAL_SWA` inherits the global retention interval instead of
 applying #83's automatic rule. #84's overlay patch and the #80 gate-v2 knobs are not
-in main, which still defaults `GLM53_MIXED_PREFILL_CHUNK=skip`.
+in main. Current TP=2 main defaults to `GLM53_MIXED_PREFILL_CHUNK=fair` (v5);
+the historical gate-v2 measurements below do not qualify that policy.
 
 | ctx 50K per lane (distinct prefixes, verified warm) | ×1 | ×2 | ×4 | ×8 | ×16 |
 |---|---:|---:|---:|---:|---:|

@@ -187,6 +187,7 @@ SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
 PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
+NOSTORE_PATCH_HOST="${NOSTORE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_no_store.py}"
 KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cache_reset.py}"
@@ -336,6 +337,12 @@ GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
+# 1 = honour the per-request GPU prefix-cache no-store flag
+# (vllm_xargs {"skip_writing_prefix_cache": 1}; overlay patch_apc_no_store.py);
+# 0 = ignore it (logged once). Requests never opt in by default, so 1 changes
+# nothing until a client asks. Default applies only when UNSET: an explicitly
+# empty value is an operator error and validate_numeric_config rejects it.
+GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
 # stock = max_model_len * 40 entries (5036.40 MB locked at 1M, measured);
 # rightsize = the legal per-step maximum, ~+26% KV (default since 2026-09-07:
@@ -482,13 +489,8 @@ _glm53_validate_retention_interval() {
     export "$name"
 }
 
-# Kill switches are exactly 0 or 1. Not "non-empty means on", not `[ "$v" = 0 ]`
-# with everything else treated as on: a typo'd knob must not silently pick a
-# serving mode. GLM53_KV_CAPACITY_LOG decides whether the boot-time KV
-# capacity breakdown is logged, and the overlay itself refuses at the log site
-# on anything but 0/1 (overlay/patch_kv_capacity_log.py,
-# _glm53_kv_capacity_log_enabled), so catching it here turns a container boot
-# failure into a launcher error.
+# Validate no-store and KV-capacity-log switches before restart stops anything;
+# both overlays reject values other than exactly 0 or 1 at runtime.
 _glm53_validate_bool_flag() {
     local name="$1" value="$2"
     if [ "$value" != 0 ] && [ "$value" != 1 ]; then
@@ -585,6 +587,7 @@ validate_numeric_config() {
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
+    _glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}" || return
     _glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}" || return
     # The template treats medium as max, so do not advertise it as a level.
     if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
@@ -648,6 +651,7 @@ validate_overlay_artifacts() {
         "$DRAFTER_PATCH_HOST|vllm/v1/core/kv_cache_utils.py|$main_guard"
         "$APC_PATCH_HOST|[glm53-hybrid-apc]|$main_guard"
         "$PERGROUP_PATCH_HOST|glm53-apc-per-group-contract:explicit-v1|$main_guard"
+        "$NOSTORE_PATCH_HOST|[glm53-apc-no-store]|$main_guard"
         "$KVCAP_PATCH_HOST|[glm53-kv-capacity-log]|$main_guard"
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
@@ -966,6 +970,7 @@ preflight() {
     [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
     [ -f "$APC_PATCH_HOST" ] || die "$APC_PATCH_HOST missing"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
+    [ -f "$NOSTORE_PATCH_HOST" ] || die "$NOSTORE_PATCH_HOST missing"
     [ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$CACHE_RESET_PATCH_HOST" ] || die "$CACHE_RESET_PATCH_HOST missing"
@@ -1432,10 +1437,11 @@ sync_weights() {
 
 # ------------------------ inner container scripts --------------------------
 # Both ranks apply the same checked overlays. Hybrid replay precedes retention
-# because they share the coordinator helper insertion point. The KV-capacity
-# log rides after retention: it edits kv_cache_utils.py only (log-only, no
-# coordinator anchors) and must follow patch_glm5_drafter_group.py, the other
-# overlay editing that file.
+# because they share the coordinator helper insertion point; patch_apc_no_store
+# follows retention (sampling_params / request / block_pool only, no shared
+# anchors with the coordinator overlays). The KV-capacity log edits only
+# kv_cache_utils.py and follows patch_glm5_drafter_group.py, the other overlay
+# editing that file.
 GLM53_OVERLAY_ORDER=(
     patch_glm_video_placeholders.py
     patch_suppress_stops_in_reasoning.py
@@ -1443,6 +1449,7 @@ GLM53_OVERLAY_ORDER=(
     patch_glm5_drafter_group.py
     patch_hybrid_prefix_hit.py
     patch_apc_per_group_retention.py
+    patch_apc_no_store.py
     patch_kv_capacity_log.py
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
@@ -1642,6 +1649,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_hybrid_prefix_hit.py"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "missing $PERGROUP_PATCH_HOST"
     scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_per_group_retention.py"
+    [ -f "$NOSTORE_PATCH_HOST" ] || die "missing $NOSTORE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$NOSTORE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_no_store.py"
     [ -f "$KVCAP_PATCH_HOST" ] || die "missing $KVCAP_PATCH_HOST"
     scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "missing $XGRAMMAR_PATCH_HOST"
@@ -1682,6 +1691,7 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"
         -e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"
         -e "GLM53_FAIR_PREFILL_CHUNK=$GLM53_FAIR_PREFILL_CHUNK"
         -e "GLM53_FAIR_PREFILL_SHARE=$GLM53_FAIR_PREFILL_SHARE"
@@ -1709,6 +1719,7 @@ launch_cluster() {
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    log "per-request prefix-cache no-store flag: GLM53_APC_NO_STORE=${GLM53_APC_NO_STORE} (both ranks)"
     log "boot KV-capacity breakdown log: GLM53_KV_CAPACITY_LOG=${GLM53_KV_CAPACITY_LOG} (both ranks)"
     # Global sparse retention is implemented by the pinned vLLM runtime.  Full
     # attention remains dense; Mamba managers use this value.  Keep this an
@@ -1830,6 +1841,7 @@ launch_cluster() {
         -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
         -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
         -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
+        -v '/tmp/patch_apc_no_store.py:/opt/glm53/patch_apc_no_store.py:ro' \
         -v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro' \
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
         -v '/tmp/patch_cache_reset.py:/opt/glm53/patch_cache_reset.py:ro' \
@@ -1869,6 +1881,7 @@ launch_cluster() {
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
         -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
+        -v "$NOSTORE_PATCH_HOST:/opt/glm53/patch_apc_no_store.py:ro" \
         -v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$CACHE_RESET_PATCH_HOST:/opt/glm53/patch_cache_reset.py:ro" \
