@@ -19,8 +19,11 @@ Part C  behaviour on a real vLLM (CPU is enough): patched COPIES of the three
         ``HybridKVCacheCoordinator`` / managers run on top of the patched code.
         Skipped with a loud line when ``import vllm`` fails; set
         ``GLM53_REQUIRE_VLLM=1`` to make that a failure (the Dockerfile does).
-Part D  launcher: the "GLM53 numeric config guard" block of start.sh accepts
-        GLM53_APC_NO_STORE only as exactly 0 or 1 (unset -> 1).
+Part D  launcher (host-only: the image copy carries no start.sh): the
+        "GLM53 numeric config guard" block accepts GLM53_APC_NO_STORE only as
+        exactly 0 or 1 (unset -> 1), the knob is forwarded to both ranks, and
+        the generic caller-override block (caller exports beat .env, explicit
+        empties included) decides what the guard then validates.
 
 Sources: ``GLM53_VLLM_SRC_ROOT`` = a vLLM package directory holding
 ``sampling_params.py``, ``v1/request.py``, ``v1/core/block_pool.py`` (default:
@@ -55,6 +58,10 @@ PATCH = next(
     None,
 )
 START = HERE.parent / "start.sh"
+# start.sh's generic caller-override block: exports win over .env, explicit
+# empties included (#161/#92). Lifted by its own sentinels.
+CALLER_BEGIN = "_caller_overrides=()"
+CALLER_END = "unset _k _kv _flags _caller_overrides"
 DEFAULT_SRC_ROOT = Path("/usr/local/lib/python3.12/dist-packages/vllm")
 MARK = "# [glm53-apc-no-store]"
 REL = {
@@ -875,17 +882,59 @@ def guard_source() -> str:
     return text[begin : text.index(end_marker, begin) + len(end_marker)]
 
 
+def caller_gate(export: str | None, dotenv: str) -> tuple[int, str, str]:
+    """Run start.sh's real caller-override block against a controlled ``.env``
+    and then the lifted numeric-config guard, and report the value the ranks
+    would receive. The launcher snapshots caller exports and re-exports them --
+    explicit empties included -- AFTER sourcing ``.env`` (generic precedence,
+    #161/#92); the guard is what then refuses an empty kill switch."""
+    src = START.read_text()
+    begin = src.index(CALLER_BEGIN)
+    end = src.index(CALLER_END, begin) + len(CALLER_END)
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        (tmp / ".env").write_text(dotenv)
+        script = (
+            "SCRIPT_DIR=$GLM53_ENV_DIR\n"
+            + src[begin:end]
+            + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; MAX_NUM_BATCHED_TOKENS=1024\n"
+            + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock; SPEC_METHOD=none\n"
+            + guard_source()
+            + '\nGLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"\n'
+            + "validate_numeric_config || exit $?\n"
+            + 'printf "%s\\n" "$GLM53_APC_NO_STORE"\n'
+        )
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "LC_ALL": "C",
+            "GLM53_ENV_DIR": str(tmp),
+        }
+        if export is not None:
+            env["GLM53_APC_NO_STORE"] = export
+        r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
 def part_d() -> None:
     print("Part D: launcher knob GLM53_APC_NO_STORE (numeric config guard)")
     if not START.is_file():
-        check(False, "D0 start.sh missing")
+        # The Dockerfile copies the test into the image WITHOUT start.sh, so
+        # the launcher legs are host-only; a checkout missing its launcher is
+        # still an error (PATCH sits next to the test only in the flat image).
+        check(PATCH.parent == HERE, "D0 no start.sh next to the test: launcher legs are host-only (in-image run)")
         return
     guard = guard_source()
     check('_glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}"' in guard, "D1 the guard validates GLM53_APC_NO_STORE with the 0/1 validator (unset -> 1)")
     src = START.read_text()
     check('-e "GLM53_APC_NO_STORE=$GLM53_APC_NO_STORE"' in src, "D1 the knob is forwarded to the containers (nccl_common, both ranks)")
-    check('_cli_no_store_set="${GLM53_APC_NO_STORE+1}"' in src and '_cli_no_store="${GLM53_APC_NO_STORE-}"' in src and '[ -n "${_cli_no_store_set}" ] && GLM53_APC_NO_STORE="$_cli_no_store"' in src, "D1 caller export wins over .env (set-ness aware: an explicitly empty export is captured and then rejected)")
     check('GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"' in src, "D1 default 1 applies only when UNSET")
+    for label, export, dotenv, want in (
+        ("caller unset: the .env value is what the ranks get", None, "GLM53_APC_NO_STORE=0\n", (0, "0")),
+        ("a caller export wins over .env", "1", "GLM53_APC_NO_STORE=0\n", (0, "1")),
+        ("an explicitly empty caller export wins, then the guard rejects it", "", "GLM53_APC_NO_STORE=0\n", (2, "")),
+    ):
+        rc, out, err = caller_gate(export, dotenv)
+        check((rc, out) == want, f"D1 {label} (rc={rc} out={out!r} {err[:80]!r})")
 
     def run(value: str | None) -> tuple[int, str, str]:
         script = guard + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n" + "validate_numeric_config || exit $?\n" + 'printf "%s\\n" "${GLM53_APC_NO_STORE-unset}"\n'

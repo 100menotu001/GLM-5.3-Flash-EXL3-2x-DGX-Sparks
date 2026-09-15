@@ -68,8 +68,9 @@ out of one shared pool (MLA + 4 mamba + drafter SWA here), which amplifies the e
   `[glm53-apc-no-store] first request resolved skip_writing_prefix_cache=1` at resolution — emitted even for
   a warm request that has nothing new to store — and `[glm53-apc-no-store] suppressing prefix-cache store
   (full site)` / `(partial site)` when a store is actually cut. Per-request ids go to `debug`. The partial
-  site is reached only where the fork's fine-grained partial-hit producer is enabled (#84,
-  `patch_apc_fine_grained_hits.py`; upstream's coordinator vetoes it for this model otherwise) and, for the
+  site is reached only where the runtime's fine-grained partial-hit producer is enabled -- the coordinator
+  vetoes it for this model (`Disabling fine-grained prefix-cache hits because these KV cache managers require
+  block-aligned lookups: KpoolTailManager`, see `docs/DESIGN-apc-per-group-retention.md` §2) -- and, for the
   mamba path, only when the prompt length is a `hash_block_size` (64) multiple that is not a 3584 multiple
   (`_cache_partial_tail_block:1866-1874`); the full-attention path fires for any prompt whose 64-token
   boundary is not a 3584 multiple.
@@ -101,7 +102,7 @@ those overrides.
 | site | inserts | caller |
 |---|---|---|
 | `cache_full_blocks` → `:293` | full-block hashes | `SingleTypeKVCacheManager.cache_blocks:469-477` |
-| `cache_partial_block` → `:508` | fine-grained partial-tail entry | `FullAttentionManager._cache_partial_tail_block:815`, `MambaManager._cache_partial_tail_block:1858` |
+| `cache_partial_block` → `:508` | partial-tail entry | `FullAttentionManager._cache_partial_tail_block:815`, `MambaManager._cache_partial_tail_block:1858` |
 
 The guards return early at the top of each. Downstream self-corrects because the fork's **sparse retention**
 (`reachable_block_mask` → `block_mask`, `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` live on this deployment)
