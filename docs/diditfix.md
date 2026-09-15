@@ -1,6 +1,7 @@
 # Did v5 fair mixed-prefill fix the reporter hang?
 
-**Independent retest:** 2026-09-15 ~12:26–12:36 local, this session.  
+**Independent retest (TP2):** 2026-09-15 ~12:26–12:36 local.  
+**TP3 follow-up:** 2026-09-15 ~14:26–14:35 local, same v5 overlay, live `glm53-exl3-tp3-head`.  
 **Serve already on v5** (`glm53-exl3-head`, EngineCore pid 2019); no extra restart. `/health` 200.  
 **Overlay:** `# [glm53-decode-floor:v5]`, `GLM53_MIXED_PREFILL_CHUNK=fair`, chunk 256, share 0.20, interval 2000 ms, max step 1000 ms, max chunks 1, `LONG_PREFILL_TOKEN_THRESHOLD=3584`.  
 **Harness:** `logs/fair-v5-20260915/overlap_arms.py`  
@@ -16,7 +17,7 @@ A ~30k unique newcomer on the same recipe also finished **during** the essay (**
 
 Incumbent decode did **not** collapse to the reporter’s 0.8–2.8 tok/s under `CHUNK=0`. On the essay, overlap rate stayed **~20.6–20.9 tok/s** vs ~24.7 solo (about **1.18–1.20×**). In-run, vs the 10 s of decode before B: **1.06×** (2k B) and **1.21×** (30k B).
 
-`start.sh` and `.env.example` default `GLM53_MIXED_PREFILL_CHUNK` to **`fair`**. TP=3 stays **`0`**; TP=4 stays **`skip`**. Opt in on those launchers with `fair`.
+`start.sh`, `start-tp3.sh`, `start-tp4.sh`, and the matching `.env*.example` files default `GLM53_MIXED_PREFILL_CHUNK` to **`fair`**. TP=3 overlap is measured below. TP=4 is unmeasured and inherits the same default; set `skip` to restore decode-only isolation.
 
 | Claim | `skip` | v4 `fair` (prior) | **v5 `fair` (this retest)** |
 |---|---|---|---|
@@ -69,11 +70,49 @@ Whole-window A on rep2k stayed **24.5 tok/s** (B left after 12 s of a 163 s deco
 
 Same process, new unique prefixes. Direction matches. This retest’s reporter 2k was **11.6 s** vs their **9.0 s**; reporter 30k **163.6 s** vs their **146.4 s**. Chunk ladder and “B during A” are the same. Single-run scatter of that size is expected.
 
+## TP3 live `fair` v5 (2026-09-15 ~14:26–14:35 local)
+
+**Serve:** `glm53-exl3-tp3-head`, EngineCore pid 2286, already on v5; no extra restart. `/health` 200 before and after. `GPU_MEM_UTIL=0.80`, `DFLASH_DRAFT_TP=1`. Same knobs as TP2 (`fair`, chunk 256, share 0.20, interval 2000 ms, max step 1000 ms, max chunks 1).  
+**Harness:** `logs/fair-v5-tp3-20260915/overlap_arms.py` (same arms, `HEAD=glm53-exl3-tp3-head`).  
+**Receipts:** `logs/fair-v5-tp3-20260915/` and `/tmp/mixed-prefill-fair-v5-tp3.json`. Wall ~8.7 min, all four arms `error: null`, engine still running afterward.
+
+### TP3 verdict
+
+**Same qualitative fix as TP2, and the overlap numbers are better.** A 2k unique newcomer 10 s into a thinking-on essay got its first token in **8.7 s, while the essay was still streaming**. A ~29.5k unique newcomer on that recipe finished **during** the essay (**110.0 s TTFT**, 27 s before A’s last token), with **all 29 479 prompt tokens** in mixed steps.
+
+Incumbent decode did not collapse. Essay overlap stayed **~24.7–25.8 tok/s** vs 29.7 solo (**1.15–1.20×**). Unique-800 overlap stayed **~60.0–63.9 tok/s** vs 77–82 solo (**1.21–1.37×**). Max inter-event gap on every arm was **0.84–0.95 s**, inside the 1.0 s step budget (TP2’s reporter max was 1.39–1.44 s).
+
+The engine did **not** die during these overlap arms. The earlier TP3 “crash on warmup” was a race with `post_ready_warmup` after `/health` 200, not this mixed-prefill recipe.
+
+### TP3 results
+
+| Arm | C1 tok/s | A overlap tok/s (vs C1; vs in-run before B) | A gaps p50 / p95 / max | B TTFT | B during A? | B mixed progress |
+|---|---:|---|---|---:|---|---|
+| **rep2k** | 29.7 | **24.7** (1.20×; **1.19×** vs 29.4 before; 30.9 after) | 0.075 / 0.150 / **0.93 s** | **8.7 s** | **Yes** (−113 s vs A last) | 4 mixed steps, **1881 / 1881**, chunks 89 / 256 / 768 |
+| **rep30k** | 29.7 | **25.8** (1.15×; **1.20×** vs 31.0 before; 31.4 after) | 0.076 / 0.154 / **0.92 s** | **110.0 s** | **Yes** (−27 s vs A last) | 31 mixed steps, **29 479 / 29 479**, chunks 103 / 192 / 768 / 1024 |
+| cold2k | 81.8 | **60.0** (1.37×); after B first, A recovered to 84.2 | 0.093 / 0.183 / 0.95 s | **6.5 s** | **Yes** (−4.9 s vs A last) | 3 mixed steps, **1870 / 1870**, chunks 78 / 768 / 1024 |
+| cold30k | 77.1 | **63.9** (1.21×) | 0.092 / 0.183 / 0.84 s | 34.0 s | **No** (A decode only 12.5 s) | 4 × **1024 = 4096** mixed, then 25 478 solo |
+
+Whole-window A on rep2k stayed **30.3 tok/s** (B left after ~9 s of a 132 s decode). Whole-window A on rep30k was **27.2 tok/s** over a stretched **147 s** decode because B occupied most of the essay.
+
+### vs TP2 `fair` v5 (independent retest above)
+
+| Arm | TP2 B TTFT | **TP3 B TTFT** | TP2 during A? | TP3 during A? | TP2 A overlap | TP3 A overlap |
+|---|---:|---:|---|---|---|---|
+| rep2k | 11.6 s | **8.7 s** | Yes | Yes | 20.9 (1.18×) | 24.7 (1.20×) |
+| rep30k | 163.6 s | **110.0 s** | Yes | Yes | 20.6 (1.20×) | 25.8 (1.15×) |
+| cold2k | 8.0 s | **6.5 s** | Yes | Yes | 41.7 until B first | 60.0 |
+| cold30k | 37.2 s | **34.0 s** | No | No | 50.3 (1.34×) | 63.9 (1.21×) |
+
+TP3 mixed prefill on the reporter 30k is about **268 tok/s** effective (29 479 / 110 s) vs TP2’s **~179 tok/s**. Chunk ladder still climbs to 768–1024; first mixed chunk is still clipped (78–103 tokens). Short unique-800 A still cannot absorb a 30k newcomer: TP3 moved **4096** mixed tokens in that window (TP2 moved 3840), then finished solo. Same 20 % share capacity story as [astra-fix.md](astra-fix.md).
+
+GitHub launchers now default TP=3 and TP=4 to `fair` as well. The overlap recipe is healthy on an already-ready TP=3. Boot/warmup races (hitting the API at `/health` 200 before `post_ready_warmup` finishes) are a separate issue; wait for the launcher ready line.
+
 ## Still open
 
 - Single runs only (no three-repeat matrix, no multi-newcomer).
-- TP3 `0` and TP4 `skip` not measured.
-- First mixed chunk is sometimes clipped (91–117 tokens); later rungs recover.
-- Host busy-time proxy; one mixed step ran ~1.4 s against a 1.0 s budget.
+- TP4 `skip` / `fair` not measured.
+- First mixed chunk is sometimes clipped (78–117 tokens); later rungs recover.
+- Host busy-time proxy; TP2 had one mixed step ~1.4 s against a 1.0 s budget. TP3 max accounted mixed step in this pass was 0.95 s.
 
 PR [186](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/186) at v2 contains neither v4 nor v5.

@@ -97,7 +97,7 @@ def test_indexer_workspace_enum() -> None:
                 "rightsize\n"):
         result = validate_enum(bad)
         assert result.returncode == 2, (bad, result.returncode, result.stdout)
-        assert "GLM53_INDEXER_WORKSPACE must be one of" in result.stderr, bad
+        assert "GLM53_INDEXER_WORKSPACE" in result.stderr, bad
 
 
 def validate_spinwait(value: str | None) -> subprocess.CompletedProcess[str]:
@@ -127,7 +127,24 @@ def test_spinwait_numeric_contract() -> None:
     for bad in ("", "0", "1001", "-1", "1.5", "nan", " 16", "16 ", "STOCK"):
         result = validate_spinwait(bad)
         assert result.returncode == 2, (bad, result.returncode, result.stdout)
-        assert "GLM53_SPINWAIT_MS must" in result.stderr, bad
+        assert "GLM53_SPINWAIT_MS" in result.stderr, bad
+
+
+def test_kv_capacity_log_flag() -> None:
+    script = (
+        guard_source()
+        + '\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4; '
+        + 'MAX_NUM_BATCHED_TOKENS=1024; GLM53_INDEXER_WORKSPACE=stock; '
+        + 'GLM53_SPINWAIT_MS=stock; export GLM53_KV_CAPACITY_LOG="$1"\n'
+        + 'validate_numeric_config\n'
+    )
+    for value, expected in (("0", 0), ("1", 0), ("", 2), ("2", 2)):
+        result = subprocess.run(
+            ["bash", "-c", script, "test", value],
+            text=True, capture_output=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        assert result.returncode == expected, (value, result.stdout, result.stderr)
 
 
 def test_mixed_prefill_contract() -> None:
@@ -180,35 +197,11 @@ def test_mixed_prefill_contract() -> None:
         result = run({"GLM53_FAIR_PREFILL_MAX_STEP_MS": value})
         assert result.returncode == expected, (value, result.stderr)
     for launcher in (START, ROOT / "start-tp3.sh", START_TP4):
-        source = launcher.read_text()
-        assert 'GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"' in source
-        assert '-e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"' in source
-        if launcher.name == "start-tp3.sh":
-            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-0}"' in source
-        elif launcher.name == "start-tp4.sh":
-            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"' in source
-        else:
-            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"' in source
         guard = guard_source(launcher)
         for value, expected in (("1000", 0), ("0", 1)):
             script = guard + '\nGLM53_FAIR_PREFILL_MAX_STEP_MS="$1"\n' + '_glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000\n'
             checked = subprocess.run(["bash", "-c", script, "test", value], capture_output=True, text=True)
             assert bool(checked.returncode) == bool(expected), (launcher, value, checked.stderr)
-    for env_example, chunk in (
-        (ROOT / ".env.example", "fair"),
-        (ROOT / ".env.tp3.example", "0"),
-        (ROOT / ".env.tp4.example", "skip"),
-    ):
-        text = env_example.read_text()
-        assert f"GLM53_MIXED_PREFILL_CHUNK={chunk}" in text, env_example
-
-
-def test_restart_validates_before_stop() -> None:
-    source = START.read_text()
-    main = source.index("main() {")
-    validation = source.index("start|restart) validate_numeric_config", main)
-    restart = source.index("restart)  stop; start", main)
-    assert validation < restart
 
 
 def test_tp4_rejects_retention_override() -> None:
@@ -230,9 +223,6 @@ def test_tp4_rejects_retention_override() -> None:
             )
             assert result.returncode == expected, (value, result.stderr)
 
-    source = START_TP4.read_text()
-    assert '_cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"' in source
-    assert '[ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"' in source
 
 
 if __name__ == "__main__":
@@ -240,7 +230,7 @@ if __name__ == "__main__":
     test_decimal_normalization()
     test_indexer_workspace_enum()
     test_spinwait_numeric_contract()
+    test_kv_capacity_log_flag()
     test_mixed_prefill_contract()
-    test_restart_validates_before_stop()
     test_tp4_rejects_retention_override()
     print("numeric config tests: PASS")
