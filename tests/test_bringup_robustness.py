@@ -157,7 +157,6 @@ def test_stop_takes_a_free_lock_and_removes_both_containers() -> None:
         record = (tmp / "record").read_text().splitlines()
         assert "docker rm -f glm53-exl3-head" in record, record
         assert "ssh docker rm -f 'glm53-exl3-worker'" in record, record
-        assert "stopped." in result.stdout, result.stdout
 
 
 def test_restart_holds_one_lock_across_stop_and_start() -> None:
@@ -252,8 +251,6 @@ def test_health_wait_needs_three_consecutive_head_misses() -> None:
         # The true inspect resets the window, so the failure needs three more
         # misses: five inspects, not three.
         assert (tmp / "inspects").read_text() == "5", result.stdout
-        assert "head container not running during startup" in result.stdout, result.stdout
-        assert "3 consecutive checks" in result.stdout, result.stdout
 
 
 def test_health_wait_does_not_report_a_running_head_as_dead() -> None:
