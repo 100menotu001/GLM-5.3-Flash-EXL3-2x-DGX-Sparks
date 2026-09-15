@@ -187,7 +187,9 @@ SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
 PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
+KVCAP_PATCH_HOST="${KVCAP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kv_capacity_log.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
+CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cache_reset.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
@@ -297,8 +299,30 @@ READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 # 1 = suppress client stop strings until </think> (DSpark #42 class).
 GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
-# skip = do not mix; N>0 = cap tokens; 0 = off.
-GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"
+# fair = time-share mixing (default since 2026-09-15, overlay v5);
+# skip = do not mix (starves waiting prefills until the decode ends);
+# N>0 = cap mixed prefill tokens; 0 / off = no isolation.
+# Fair knobs are forwarded on every rank even when CHUNK is not fair.
+# fair v5: fixed+per-token step-cost fit, largest chunk that fits MAX_STEP_MS,
+# prompt step-bounded newcomer probe, bounded contention credit, decode first.
+GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"
+GLM53_FAIR_PREFILL_CHUNK="${GLM53_FAIR_PREFILL_CHUNK:-256}"
+GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
+GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
+GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
+GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
+# Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
+GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
+# 1 = at boot, after vLLM's "GPU KV cache size: N tokens" line (which is
+# max_concurrency x max_model_len, not a pool size), log one line per KV-cache
+# group (spec, block_size, blocks per max_model_len request) and a summary with
+# the usable block ids, the ids one aligned cached segment costs across groups
+# and the resulting cached-conversation capacity (overlay
+# patch_kv_capacity_log.py). 0 = do not log (one line saying so). Log-only:
+# no serving behaviour changes either way. Default applies only when UNSET: an
+# explicitly empty value is an operator error and validate_numeric_config
+# rejects it.
+GLM53_KV_CAPACITY_LOG="${GLM53_KV_CAPACITY_LOG-1}"
 # Adaptive verification length (overlay/patch_adaptive_k.py). off = stock k=7 every step.
 GLM53_ADAPTIVE_K="${GLM53_ADAPTIVE_K:-off}"
 GLM53_ADAPTIVE_K_SET="${GLM53_ADAPTIVE_K_SET:-2,4,7}"
@@ -328,6 +352,14 @@ VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 # 1 = after /health, burn DFlash2 BLOCK / sampler / kpool shapes. Nonfatal.
 GLM53_BOOT_SHAPE_WARMUP="${GLM53_BOOT_SHAPE_WARMUP:-1}"
 GLM53_WARMUP_REQ_TIMEOUT="${GLM53_WARMUP_REQ_TIMEOUT:-240}"
+# 1 = mount ONLY the cache-reset dev routes (/reset_prefix_cache, /reset_mm_cache,
+# /reset_encoder_cache — issue #31) on the head API server, so cold bench runs
+# can reset the prefix cache without a restart. Opt-in (default 0) on purpose:
+# the caveat is auth, not stability — root-mounted routes sit outside the bearer
+# guard (GUARDED_PREFIX), so a shared kit must ask for this explicitly.
+# This flag does not enable other dev routes or override independent
+# VLLM_SERVER_DEV_MODE, which retains precedence. Restart applies the flag.
+GLM53_EXPOSE_CACHE_RESET="${GLM53_EXPOSE_CACHE_RESET:-0}"
 
 # OpenAI-compatible API bearer token. Read the native VLLM_API_KEY env var
 # (vLLM falls back to it when --api-key is absent on the CLI), so the key
@@ -450,6 +482,21 @@ _glm53_validate_retention_interval() {
     export "$name"
 }
 
+# Kill switches are exactly 0 or 1. Not "non-empty means on", not `[ "$v" = 0 ]`
+# with everything else treated as on: a typo'd knob must not silently pick a
+# serving mode. GLM53_KV_CAPACITY_LOG decides whether the boot-time KV
+# capacity breakdown is logged, and the overlay itself refuses at the log site
+# on anything but 0/1 (overlay/patch_kv_capacity_log.py,
+# _glm53_kv_capacity_log_enabled), so catching it here turns a container boot
+# failure into a launcher error.
+_glm53_validate_bool_flag() {
+    local name="$1" value="$2"
+    if [ "$value" != 0 ] && [ "$value" != 1 ]; then
+        echo "$name must be exactly 0 or 1 (got: $value)" >&2
+        return 2
+    fi
+}
+
 # Enum knobs are exactly one of a fixed set. Not "non-empty means on": a
 # typo'd knob must not silently pick a serving mode. GLM53_INDEXER_WORKSPACE
 # sizes the sparse-indexer prefill workspace, and the patched
@@ -477,6 +524,45 @@ _glm53_validate_spinwait_ms() {
         GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
 }
 
+# skip / -1 / 0 / off / no / fair / positive integer <= MNBT.
+# Companion fair knobs are validated when set so a typo cannot reach one rank.
+_glm53_validate_mixed_prefill() {
+    if [ -n "${GLM53_MIXED_PREFILL_CHUNK+x}" ]; then
+        case "$GLM53_MIXED_PREFILL_CHUNK" in
+            skip|-1|0|off|no|fair) ;;
+            *)
+                _glm53_canonical_positive_int GLM53_MIXED_PREFILL_CHUNK \
+                    "$GLM53_MIXED_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+                ;;
+        esac
+        export GLM53_MIXED_PREFILL_CHUNK
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_CHUNK:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_CHUNK \
+            "$GLM53_FAIR_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_INTERVAL_MS \
+            "$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_STEP_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS \
+            "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_CHUNKS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_CHUNKS \
+            "$GLM53_FAIR_PREFILL_MAX_CHUNKS" 16 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_SHARE:-}" ]; then
+        if ! [[ "$GLM53_FAIR_PREFILL_SHARE" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+           || ! awk -v u="$GLM53_FAIR_PREFILL_SHARE" 'BEGIN { exit !(u >= 0 && u <= 1) }'; then
+            echo "GLM53_FAIR_PREFILL_SHARE must be between 0 and 1 (got: $GLM53_FAIR_PREFILL_SHARE)" >&2
+            return 2
+        fi
+        export GLM53_FAIR_PREFILL_SHARE
+    fi
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -499,11 +585,13 @@ validate_numeric_config() {
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
+    _glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}" || return
     # The template treats medium as max, so do not advertise it as a level.
     if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
         _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
             "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
     fi
+    _glm53_validate_mixed_prefill || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
@@ -560,12 +648,14 @@ validate_overlay_artifacts() {
         "$DRAFTER_PATCH_HOST|vllm/v1/core/kv_cache_utils.py|$main_guard"
         "$APC_PATCH_HOST|[glm53-hybrid-apc]|$main_guard"
         "$PERGROUP_PATCH_HOST|glm53-apc-per-group-contract:explicit-v1|$main_guard"
+        "$KVCAP_PATCH_HOST|[glm53-kv-capacity-log]|$main_guard"
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
         "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
+        "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
@@ -748,6 +838,48 @@ check_port_free() {
     fi
 }
 
+# GLM53 preflight memory guard (begin)
+read_meminfo_kib() {
+    local source_file="${1:-/proc/meminfo}"
+    awk '
+      /^MemTotal:/ { total=$2 }
+      /^MemAvailable:/ { available=$2 }
+      END {
+        if (!total || !available) exit 1
+        print total, available
+      }
+    ' "$source_file"
+}
+
+preflight_memory() {
+    local label="$1" total_kib="$2" available_kib="$3" util="$4"
+    local headroom_kib="${GLM53_PREFLIGHT_MEMORY_HEADROOM_KIB:-2097152}"
+    local total_gib available_gib requested_gib headroom_gib
+
+    if ! [[ "$total_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ && "$headroom_kib" =~ ^[0-9]+$ ]]; then
+        echo "PREFLIGHT FAIL [$label]: invalid memory reading" >&2
+        return 2
+    fi
+    if ! [[ "$util" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+       || ! awk -v u="$util" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
+        echo "PREFLIGHT FAIL [$label]: GPU_MEM_UTIL must be greater than 0 and at most 1: $util" >&2
+        return 2
+    fi
+
+    total_gib=$(awk -v k="$total_kib" 'BEGIN { printf "%.2f", k/1048576 }')
+    available_gib=$(awk -v k="$available_kib" 'BEGIN { printf "%.2f", k/1048576 }')
+    requested_gib=$(awk -v t="$total_kib" -v u="$util" 'BEGIN { printf "%.2f", (t*u)/1048576 }')
+    headroom_gib=$(awk -v k="$headroom_kib" 'BEGIN { printf "%.2f", k/1048576 }')
+
+    if ! awk -v a="$available_kib" -v t="$total_kib" -v u="$util" -v h="$headroom_kib" \
+        'BEGIN { exit !(a >= (t*u)+h) }'; then
+        echo "PREFLIGHT FAIL [$label]: MemAvailable=${available_gib} GiB of ${total_gib} GiB; GPU_MEM_UTIL=${util} requests ${requested_gib} GiB plus ${headroom_gib} GiB headroom" >&2
+        return 1
+    fi
+    echo "PREFLIGHT OK [$label]: MemAvailable=${available_gib}/${total_gib} GiB; request=${requested_gib} GiB plus ${headroom_gib} GiB headroom"
+}
+# GLM53 preflight memory guard (end)
+
 trap 'warn "interrupted — containers keep running ('"'"'./start.sh logs'"'"' to watch, '"'"'./start.sh stop'"'"' to stop)"; exit 130' INT
 
 # ------------------------------ preflight ----------------------------------
@@ -819,12 +951,24 @@ preflight() {
     check_port_free "$PORT" PORT
     check_port_free "$MASTER_PORT" MASTER_PORT
 
+    local head_mem worker_mem head_total head_available worker_total worker_available
+    head_mem="$(read_meminfo_kib /proc/meminfo)" \
+        || die "cannot read MemTotal/MemAvailable on head"
+    worker_mem="$(worker_ssh "cat /proc/meminfo" | read_meminfo_kib /dev/stdin)" \
+        || die "cannot read MemTotal/MemAvailable on worker"
+    read -r head_total head_available <<< "$head_mem"
+    read -r worker_total worker_available <<< "$worker_mem"
+    preflight_memory head "$head_total" "$head_available" "$GPU_MEM_UTIL" || return
+    preflight_memory worker "$worker_total" "$worker_available" "$GPU_MEM_UTIL" || return
+
     [ -f "$STOP_PATCH_HOST" ] || die "$STOP_PATCH_HOST missing"
     [ -f "$SCHED_PATCH_HOST" ] || die "$SCHED_PATCH_HOST missing"
     [ -f "$DRAFTER_PATCH_HOST" ] || die "$DRAFTER_PATCH_HOST missing"
     [ -f "$APC_PATCH_HOST" ] || die "$APC_PATCH_HOST missing"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "$PERGROUP_PATCH_HOST missing"
+    [ -f "$KVCAP_PATCH_HOST" ] || die "$KVCAP_PATCH_HOST missing"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
+    [ -f "$CACHE_RESET_PATCH_HOST" ] || die "$CACHE_RESET_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
@@ -1288,7 +1432,10 @@ sync_weights() {
 
 # ------------------------ inner container scripts --------------------------
 # Both ranks apply the same checked overlays. Hybrid replay precedes retention
-# because they share the coordinator helper insertion point.
+# because they share the coordinator helper insertion point. The KV-capacity
+# log rides after retention: it edits kv_cache_utils.py only (log-only, no
+# coordinator anchors) and must follow patch_glm5_drafter_group.py, the other
+# overlay editing that file.
 GLM53_OVERLAY_ORDER=(
     patch_glm_video_placeholders.py
     patch_suppress_stops_in_reasoning.py
@@ -1296,6 +1443,7 @@ GLM53_OVERLAY_ORDER=(
     patch_glm5_drafter_group.py
     patch_hybrid_prefix_hit.py
     patch_apc_per_group_retention.py
+    patch_kv_capacity_log.py
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
     patch_spinwait.py
@@ -1303,6 +1451,7 @@ GLM53_OVERLAY_ORDER=(
     patch_dense_fp8.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
+    patch_cache_reset.py
     patch_ablit.py
 )
 
@@ -1493,8 +1642,12 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_hybrid_prefix_hit.py"
     [ -f "$PERGROUP_PATCH_HOST" ] || die "missing $PERGROUP_PATCH_HOST"
     scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_apc_per_group_retention.py"
+    [ -f "$KVCAP_PATCH_HOST" ] || die "missing $KVCAP_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KVCAP_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kv_capacity_log.py"
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "missing $XGRAMMAR_PATCH_HOST"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_xgrammar_termination.py"
+    [ -f "$CACHE_RESET_PATCH_HOST" ] || die "missing $CACHE_RESET_PATCH_HOST"
+    scp -q -o BatchMode=yes "$CACHE_RESET_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_cache_reset.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "missing $SPINWAIT_PATCH_HOST"
@@ -1529,6 +1682,14 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"
+        -e "GLM53_FAIR_PREFILL_CHUNK=$GLM53_FAIR_PREFILL_CHUNK"
+        -e "GLM53_FAIR_PREFILL_SHARE=$GLM53_FAIR_PREFILL_SHARE"
+        -e "GLM53_FAIR_PREFILL_MAX_INTERVAL_MS=$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_CHUNKS=$GLM53_FAIR_PREFILL_MAX_CHUNKS"
+        # Cache-only opt-in; independent VLLM_SERVER_DEV_MODE retains precedence.
+        -e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"
         -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
@@ -1548,6 +1709,7 @@ launch_cluster() {
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    log "boot KV-capacity breakdown log: GLM53_KV_CAPACITY_LOG=${GLM53_KV_CAPACITY_LOG} (both ranks)"
     # Global sparse retention is implemented by the pinned vLLM runtime.  Full
     # attention remains dense; Mamba managers use this value.  Keep this an
     # explicit deployer setting and forward it identically to both ranks.
@@ -1561,12 +1723,6 @@ launch_cluster() {
         nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
         log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
     fi
-    local worker_nccl="" e quoted_env
-    for e in "${nccl_common[@]}"; do
-        [ "$e" = "-e" ] && continue
-        printf -v quoted_env '%q' "$e"
-        worker_nccl+=" -e $quoted_env"
-    done
 
     local -a head_preload=() worker_preload=""
     if [ "$USE_HOST_NCCL" = "1" ]; then
@@ -1585,6 +1741,7 @@ launch_cluster() {
     fi
 
     local serve_env=""
+    local -a serve_env_names=()
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
@@ -1600,7 +1757,59 @@ launch_cluster() {
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
         serve_env+=" -e $v='${!v:-}'"
+        serve_env_names+=("$v")
     done
+
+    # Extra container env for diagnostics (space-separated NAME=VALUE list, e.g.
+    # GLM53_EXTRA_ENV="VLLM_DEBUG_WORKSPACE=1"). Forwarded to both ranks as -e pairs.
+    # A name this launch already forwards — every entry of nccl_common and
+    # serve_env, the per-rank NCCL_*/VLLM_HOST_IP block — is rejected, as are the
+    # launcher's namespaces and conditionally-forwarded knobs: docker takes the
+    # last duplicate -e, so a same-named entry would silently override the knob
+    # and skip its range check. Values: [A-Za-z0-9_./:@,+=-]* only (no spaces,
+    # quotes, globs or shell metacharacters — the worker command line is built as
+    # shell text). Only names are logged; values may carry credentials, so a
+    # rejected entry is reported by position only and is never echoed.
+    if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
+        local _kv _name _value _entry _names="" _owned=" " _idx=0
+        # Read the owned set off the arguments this launch builds, so a knob added
+        # to either list cannot be shadowed here without a second list to keep in sync.
+        for _entry in "${nccl_common[@]}" "${serve_env_names[@]}" \
+                      NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_IB_HCA \
+                      NCCL_IB_GID_INDEX VLLM_HOST_IP VLLM_API_KEY LD_PRELOAD; do
+            [ "$_entry" = "-e" ] && continue
+            _owned="$_owned ${_entry%%=*} "
+        done
+        set -f
+        for _kv in $GLM53_EXTRA_ENV; do
+            _idx=$((_idx + 1))
+            # The word split above delivers a whitespace-containing value as
+            # fragments, so the raw token and the unvalidated name can both carry
+            # part of a credential: neither is interpolated into a rejection.
+            case "$_kv" in *=*) ;; *) die "GLM53_EXTRA_ENV entry $_idx must be NAME=VALUE";; esac
+            _name="${_kv%%=*}"; _value="${_kv#*=}"
+            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV entry $_idx: name must match [A-Z_][A-Z0-9_]*"
+            [[ "$_value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]] || die "GLM53_EXTRA_ENV: unsafe value for $_name (allowed: A-Z a-z 0-9 _ . / : @ , + = -)"
+            case "$_name" in
+                NCCL_*|HF_*|GLM53_*|EXL3_*|FLASHINFER_*|PATH|PYTHONPATH|VLLM_PREFIX_CACHE_RETENTION_INTERVAL*)
+                    die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            case "$_owned" in
+                *" $_name "*) die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            nccl_common+=(-e "$_kv"); _names="$_names $_name"
+        done
+        set +f
+        log "extra container env (both ranks):${_names}"
+    fi
+
+    local worker_nccl="" e quoted_env
+    for e in "${nccl_common[@]}"; do
+        [ "$e" = "-e" ] && continue
+        printf -v quoted_env '%q' "$e"
+        worker_nccl+=" -e $quoted_env"
+    done
+
     # The worker is headless and serves no API, so do not propagate the API
     # credential into its remote docker command or container environment.
 
@@ -1621,7 +1830,9 @@ launch_cluster() {
         -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
         -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
         -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
+        -v '/tmp/patch_kv_capacity_log.py:/opt/glm53/patch_kv_capacity_log.py:ro' \
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
+        -v '/tmp/patch_cache_reset.py:/opt/glm53/patch_cache_reset.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
@@ -1658,7 +1869,9 @@ launch_cluster() {
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
         -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
+        -v "$KVCAP_PATCH_HOST:/opt/glm53/patch_kv_capacity_log.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
+        -v "$CACHE_RESET_PATCH_HOST:/opt/glm53/patch_cache_reset.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
@@ -1875,6 +2088,7 @@ start_unlocked() {
     log "model load path (in-container): ${MODEL_DIR}"
     log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
     log "exl3: fat_kernel=${EXL3_FAT_KERNEL} fat_grouped=${EXL3_FAT_GROUPED} temp_rows_fused=${EXL3_TEMP_ROWS_FUSED} mnbt=${MAX_NUM_BATCHED_TOKENS} max_num_seqs=${MAX_NUM_SEQS} draft_tp=${DFLASH_DRAFT_TP}"
+    log "mixed-prefill: policy=${GLM53_MIXED_PREFILL_CHUNK} fair_chunk=${GLM53_FAIR_PREFILL_CHUNK} share=${GLM53_FAIR_PREFILL_SHARE} interval_ms=${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS} max_step_ms=${GLM53_FAIR_PREFILL_MAX_STEP_MS} max_chunks=${GLM53_FAIR_PREFILL_MAX_CHUNKS} long_prefill=${LONG_PREFILL_TOKEN_THRESHOLD:-}"
 
     launch_cluster
     if wait_for_health; then

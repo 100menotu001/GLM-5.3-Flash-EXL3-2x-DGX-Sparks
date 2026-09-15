@@ -20,7 +20,7 @@ ADVISORY_PID = "424242"
 
 
 def _source() -> str:
-    return (ROOT / "start.sh").read_text()
+    return (ROOT / "start.sh").read_text(encoding="utf-8")
 
 
 def _function(name: str) -> str:
