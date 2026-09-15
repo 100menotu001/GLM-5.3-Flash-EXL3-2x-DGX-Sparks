@@ -19,6 +19,10 @@
 #   7. pinned pos0 -> rc 1 FAIL, healthy decay -> rc 0 PASS, <100 drafts ->
 #      rc 0 SKIP: the three verdicts stay distinct from the rc 2 diagnostics
 #   8. default endpoint is loopback; an explicit argument still wins
+#   9. a count that cannot be an exact integer for the bash compares (1e300)
+#      or that overflows to +Inf (1e999) is refused rc 2 instead of passing
+#      silently or FAILing on an infinite ratio, and a phantom
+#      `notposition="0"` label is not a position-0 series
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GATE="$HERE/../scripts/spec-accept-gate.sh"
@@ -92,6 +96,35 @@ run
 check "partly unlabelled per-position family" 2 "without a numeric position label"
 no_ratio "partly unlabelled per-position family"
 
+# `notposition="0"` ends in `position="0"`, so the bare substring match judged
+# its value as the position-0 series and reported FAIL for a curve that has no
+# position 0 in it at all.
+fixture 150.0 1:20.0
+printf '%s\n' 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="glm",notposition="0"} 150.0' >> "$GATE_FIXTURE"
+run
+check "notposition label is not a position" 2 "without a numeric position label"
+no_ratio "notposition label is not a position"
+
+# A genuine position-0 series next to that phantom: pre-fix the bare substring
+# count saw two position-0 series and reported the misleading rc 2 "ambiguous
+# label sets"; the phantom series is unattributable, not a second curve.
+fixture 100.0 0:80.0
+printf '%s\n' 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="glm",notposition="0"} 200.0' >> "$GATE_FIXTURE"
+run
+check "genuine pos0 beside notposition" 2 "without a numeric position label"
+no_ratio "genuine pos0 beside notposition"
+
+# The same phantom on a series that does carry a genuine label: pre-fix
+# `notposition="4"` was collected as position 4 and judged as `pos4`.
+fixture 100.0 0:80.0
+printf '%s\n' 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="glm",position="3",notposition="4"} 7.0' >> "$GATE_FIXTURE"
+run
+check "phantom position beside a genuine label" 0 "PASS: pos0 acceptance"
+case "$out" in
+    *"pos4:"*) echo "FAIL notposition=\"4\" was judged as a position: $out"; fail=1 ;;
+    *) echo "ok   notposition=\"4\" was not judged as a position" ;;
+esac
+
 fixture 150.0 1:90.0 2:60.0
 run
 check "position 0 missing" 2 'position="0" is missing'
@@ -123,6 +156,24 @@ check "unreadable drafts value" 2 "unreadable spec_decode_num_drafts_total value
 fixture 150.0 0:NaN
 run
 check "unreadable position value" 2 "unreadable accepted_tokens_per_pos_total value"
+
+# 1e300 is a finite double but not an exact integer: the printed 300-digit
+# count silently compared false against the <100-drafts test, so the run went
+# on and PASSed a curve it never measured. 1e999 overflows to +Inf, which made
+# the position ratio infinite and reported FAIL instead of refusing the input.
+fixture 1e300 0:80.0
+run
+check "out-of-range drafts value" 2 "unreadable spec_decode_num_drafts_total value"
+
+fixture 150.0 0:1e999
+run
+check "position value overflowing to infinity" 2 "unreadable accepted_tokens_per_pos_total value"
+no_ratio "position value overflowing to infinity"
+
+fixture 150.0 0:1e300
+run
+check "out-of-range position value" 2 "unreadable accepted_tokens_per_pos_total value"
+no_ratio "out-of-range position value"
 
 # --- scientific counts are counts, not leading digits ---------------------
 # 1.5e+03 drafts is 1500: a healthy run, not a <100-drafts SKIP. The samples

@@ -20,14 +20,20 @@ die() { echo "ERROR: $*" >&2; exit 2; }
 # fractional or scientific (1.5e+03). ${v%%.*} read the exponent form as its
 # leading digit, so a live counter looked almost empty and a healthy start was
 # reported as SKIP. Prints the count as a whole number, and exits non-zero when
-# the sample carries no finite non-negative decimal or scientific value.
+# the sample carries no finite non-negative decimal or scientific value, when an
+# overflowing exponent reaches +Inf (1e999), or when the count exceeds 2^53:
+# awk holds doubles, so past that the printed integer is no longer exact for the
+# bash compares below, and 1e300 (300 digits) compared false against the
+# <100-drafts test — a silent PASS for a curve that was never measured.
 sample() {
   awk -v line="$1" 'BEGIN{
     sub(/^.*\}/, "", line)                # drop the metric name and labels
     if (!match(line, /[^[:space:]]+/)) exit 1
     v = substr(line, RSTART, RLENGTH)     # value token, timestamp ignored
     if (v !~ /^\+?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) exit 1
-    printf "%.0f", int(v)
+    n = v + 0                             # +Inf from an overflow fails it too
+    if (n > 2^53) exit 1
+    printf "%.0f", int(n)
   }'
 }
 
@@ -60,19 +66,22 @@ pos_series=$(printf '%s\n' "$metrics" | grep -F 'accepted_tokens_per_pos_total{'
   die "no accepted_tokens_per_pos_total series in /metrics — model is not spec-decoding, or the metric name drifted; cannot judge acceptance"
 # A matched series without a numeric position label is not judgeable evidence:
 # it used to fail the position list under pipefail and take the whole run down
-# rc 1 with no diagnostic, or silently judge only the labelled subset.
-unlabeled=$(printf '%s\n' "$pos_series" | grep -vcE 'position="[0-9]+"' || true)
+# rc 1 with no diagnostic, or silently judge only the labelled subset. The label
+# list boundary is part of the pattern: a bare `position="0"` also matched
+# inside `notposition="0"`, whose value was then judged as position 0.
+POS_LABEL='[{,]position="'
+unlabeled=$(printf '%s\n' "$pos_series" | grep -vcE "${POS_LABEL}[0-9]+\"" || true)
 [ "$unlabeled" -eq 0 ] ||
   die "${unlabeled} accepted_tokens_per_pos_total series without a numeric position label — cannot judge acceptance"
-positions=$(printf '%s\n' "$pos_series" | grep -oE 'position="[0-9]+"' | grep -oE '[0-9]+' | sort -n | uniq)
+positions=$(printf '%s\n' "$pos_series" | grep -oE "${POS_LABEL}[0-9]+\"" | grep -oE '[0-9]+' | sort -n | uniq)
 printf '%s\n' "$positions" | grep -qx '0' ||
   die 'per-position series present but position="0" is missing — cannot judge the pinned-1.00 signature'
 
 for pos in $positions; do
-  n=$(printf '%s\n' "$pos_series" | grep -cF "position=\"${pos}\"" || true)
+  n=$(printf '%s\n' "$pos_series" | grep -cE "${POS_LABEL}${pos}\"" || true)
   [ "$n" -eq 1 ] ||
     die "${n} series for position=\"${pos}\" — ambiguous label sets, refusing to aggregate them into one ratio"
-  line=$(printf '%s\n' "$pos_series" | grep -F "position=\"${pos}\"" || true)
+  line=$(printf '%s\n' "$pos_series" | grep -E "${POS_LABEL}${pos}\"" || true)
   val=$(sample "$line") ||
     die "unreadable accepted_tokens_per_pos_total value at position=\"${pos}\" (${line}) — cannot judge acceptance"
   ratio=$(awk -v a="$val" -v d="$drafts" 'BEGIN{printf "%.4f", a/d}')
