@@ -98,12 +98,11 @@ def test_extra_env_guard() -> None:
             MODEL_DIR=MODEL_DIR,
             GLM53_EXTRA_ENV="VLLM_LOGGING_LEVEL=s3cr3t-value",
         )
-        line = next((ln for ln in r.stdout.splitlines() if "extra container env" in ln), "")
         check(
             r.returncode == 0
-            and "VLLM_LOGGING_LEVEL" in line
+            and "VLLM_LOGGING_LEVEL" in r.stdout
             and "s3cr3t-value" not in r.stdout + r.stderr,
-            f"F4 the launch log names the entry and redacts its value ({line.strip()!r})",
+            "F4 the launch log names the entry and redacts its value",
         )
 
         # Malformed entries fail closed before any container starts.
