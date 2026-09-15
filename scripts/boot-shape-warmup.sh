@@ -144,10 +144,13 @@ verify_sampler_cache() {
   return 1
 }
 
+# n copies of "hello", single-space separated, no trailing space. One printf
+# with the format reused per argument — appending to a growing string made the
+# 65536 rung quadratic (~2 GiB of copies, ~2 min).
 mk_ladder_prompt() {
-  local n=$1 out="hello" i
-  for ((i = 1; i < n; i++)); do out="$out hello"; done
-  printf '%s' "$out"
+  local n=$1 out
+  out=$(printf 'hello %.0s' $(seq 1 "$n"))
+  printf '%s' "${out% }"
 }
 
 verify_ladder_rung() {
