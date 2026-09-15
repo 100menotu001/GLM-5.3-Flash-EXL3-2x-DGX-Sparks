@@ -924,6 +924,7 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_ablit.py` | recipe integrity, orthogonalization math, TP-shard equivalence, transplant byte-copy + TP slice, hook gating |
 | `tests/test_default_reasoning_effort.sh` | `GLM53_DEFAULT_REASONING_EFFORT` enum guard (`""`/`low`/`high`/`max`; `medium` rejected) and the `--default-chat-template-kwargs` flag at both rank sites, sliced out of `start.sh` and evaluated |
 | `scripts/boot-shape-warmup.sh` | post-`/health` DFlash2 k=7 BLOCK ladder + sampler/kpool arms |
+| `tests/test_boot_shape_warmup.py` | the shipped warmup script end-to-end with `WARMUP_CURL` stubbed: all 9 ladder/prefill prompts (65536 rung included) arrive byte-exact, the 24-request tally holds, and the tokenize-mismatch / smaller-context runs exit 1 while still warming the rest |
 
 Image-build runs `EXL3_SELFCHECK_GPU=0`. `./start.sh` runs the GPU self-check
 (`docker run --gpus all`) before shipping unless `SKIP_OVERLAY_VERIFY=1`.
