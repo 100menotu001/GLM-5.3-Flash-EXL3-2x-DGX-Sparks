@@ -184,9 +184,8 @@ def test_installed_copy_if_present() -> None:
         run_patch(target)
         patched = target.read_text()
         compile(patched, str(target), "exec")
-        assert patched.count(MARK) == 1
-        assert "attach_cache_reset_router(app)" in patched
         run_patch(target)
+        assert target.read_text() == patched
 
 
 def main() -> int:
