@@ -69,6 +69,7 @@ def test_preset_is_pinned_and_preserves_regular_serve_settings() -> None:
     probe = r'''
 printf '%s\n' "$MODEL" "$MODEL_FALLBACK" "$MODEL_REVISION" "$MODEL_SNAPSHOT"
 printf '%s\n' "$MODEL_CACHE_NAME" "$MODEL_FALLBACK_CACHE_NAME" "$ABLIT" "$PORT"
+printf '%s\n' "$EXPECTED_SHARDS"
 '''
     with tempfile.TemporaryDirectory() as raw_tmp:
         tmp = Path(raw_tmp)
@@ -83,8 +84,11 @@ printf '%s\n' "$MODEL_CACHE_NAME" "$MODEL_FALLBACK_CACHE_NAME" "$ABLIT" "$PORT"
             "MODEL_REVISION=wrong\nMODEL_CACHE_NAME=wrong-cache\n"
             "MODEL_FALLBACK_CACHE_NAME=wrong-fallback-cache\nABLIT=1\nPORT=9123\n"
         )
-        selected = _run(script, {"GLM53_MODEL_PRESET": "abliterated"})
-        regular = _run(script, {"GLM53_MODEL_PRESET": ""})
+        # A caller EXPECTED_SHARDS must not lower the pinned preset inventory.
+        selected = _run(
+            script, {"GLM53_MODEL_PRESET": "abliterated", "EXPECTED_SHARDS": "1"}
+        )
+        regular = _run(script, {"GLM53_MODEL_PRESET": "", "EXPECTED_SHARDS": "1"})
 
     assert selected.returncode == 0, selected.stderr
     assert selected.stdout.splitlines() == [
@@ -96,6 +100,7 @@ printf '%s\n' "$MODEL_CACHE_NAME" "$MODEL_FALLBACK_CACHE_NAME" "$ABLIT" "$PORT"
         CACHE,
         "0",
         "9123",
+        "120",
     ]
     assert regular.returncode == 0, regular.stderr
     assert regular.stdout.splitlines()[:3] == [
@@ -103,16 +108,27 @@ printf '%s\n' "$MODEL_CACHE_NAME" "$MODEL_FALLBACK_CACHE_NAME" "$ABLIT" "$PORT"
         "wrong/fallback",
         "wrong",
     ]
-    assert regular.stdout.splitlines()[-2:] == ["1", "9123"]
+    assert regular.stdout.splitlines()[-3:] == ["1", "9123", "1"]
 
 
 def _make_snapshot(repo: Path, revision: str, shards: int = 120) -> None:
+    """Snapshot with hub-style shard links into repo/blobs.
+
+    Every link resolves to a real blob file, so a complete snapshot here also
+    exercises the launcher's link-following shard count.
+    """
     snapshot = repo / "snapshots" / revision
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text("{}\n")
     (snapshot / "model.safetensors.index.json").write_text("{}\n")
+    blobs = repo / "blobs"
+    blobs.mkdir(exist_ok=True)
     for index in range(1, shards + 1):
-        (snapshot / f"model-{index:05d}-of-00120.safetensors").touch()
+        blob = blobs / f"{revision}-{index:05d}"
+        blob.touch()
+        (snapshot / f"model-{index:05d}-of-00120.safetensors").symlink_to(
+            os.path.relpath(blob, snapshot)
+        )
 
 
 def test_exact_snapshot_wins_over_refs_and_is_required_on_both_nodes() -> None:
@@ -162,14 +178,14 @@ printf '%s\n' "$resolved" "$marker_rev"
         skipped = _run(script, {**env, "SKIP_SYNC": "1"})
         assert skipped.returncode == 0, skipped.stderr
 
-        worker_shard = (
-            worker_repo / "snapshots" / REVISION / "model-00120-of-00120.safetensors"
-        )
-        worker_shard.unlink()
+        # A shard link whose blob is gone must not count on the worker either:
+        # the pinned gate follows links to real files on both nodes.
+        worker_blob = worker_repo / "blobs" / f"{REVISION}-00120"
+        worker_blob.unlink()
         failed_worker = _run(script, env)
         assert failed_worker.returncode != 0
         assert "incomplete on worker" in failed_worker.stderr
-        worker_shard.touch()
+        worker_blob.touch()
 
         head_shard = head_repo / "snapshots" / REVISION / "model-00120-of-00120.safetensors"
         head_shard.unlink()
@@ -181,7 +197,7 @@ printf '%s\n' "$resolved" "$marker_rev"
 def test_failed_download_cannot_adopt_another_cached_revision() -> None:
     probe = r'''
 resolve_hf_bin() { return 0; }
-hf_download_repo() { return 1; }
+hf_download_repo() { printf '%s\n' "$*" >>"$DOWNLOAD_LOG"; return 1; }
 download_weights
 '''
     with tempfile.TemporaryDirectory() as raw_tmp:
@@ -199,16 +215,22 @@ download_weights
         )
         script.chmod(0o755)
         (tmp / ".env").write_text(f"HF_HOME={hf_home}\n")
+        download_log = tmp / "download-args.txt"
         result = _run(
             script,
             {
                 "GLM53_MODEL_PRESET": "abliterated",
                 "SKIP_DOWNLOAD": "0",
                 "SPEC_METHOD": "none",
+                # A caller value must not lower the pinned 120-shard gate.
+                "EXPECTED_SHARDS": "1",
+                "DOWNLOAD_LOG": str(download_log),
             },
         )
+        downloaded = download_log.read_text() if download_log.exists() else ""
     assert result.returncode != 0
     assert "119 / 120 shards in the selected snapshot" in result.stderr
+    assert f"--revision {REVISION}" in downloaded
 
 
 if __name__ == "__main__":
