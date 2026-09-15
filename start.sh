@@ -290,9 +290,18 @@ READY_TIMEOUT="${READY_TIMEOUT:-3600}"
 # 1 = suppress client stop strings until </think> (DSpark #42 class).
 GLM53_SUPPRESS_STOPS_IN_REASONING="${GLM53_SUPPRESS_STOPS_IN_REASONING:-1}"
 # Mixed-step prefill policy when a peer is already decoding (issue #6).
-# 0 = off (default since 2026-09-09: skip starved every new request behind running decodes,
-# which serialises coding agents' tool round-trips); skip = do not mix; N>0 = cap tokens.
-GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-0}"
+# fair = time-share mixing (default since 2026-09-15, overlay v5);
+# skip = do not mix (starves waiting prefills until the decode ends);
+# N>0 = cap mixed prefill tokens; 0 / off = no isolation.
+# Fair knobs are forwarded on every rank even when CHUNK is not fair.
+# fair v5: fixed+per-token step-cost fit, largest chunk that fits MAX_STEP_MS,
+# prompt step-bounded newcomer probe, bounded contention credit, decode first.
+GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"
+GLM53_FAIR_PREFILL_CHUNK="${GLM53_FAIR_PREFILL_CHUNK:-256}"
+GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
+GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
+GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
+GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
 # Adaptive verification length (overlay/patch_adaptive_k.py). off = stock k=7 every step.
 GLM53_ADAPTIVE_K="${GLM53_ADAPTIVE_K:-off}"
 GLM53_ADAPTIVE_K_SET="${GLM53_ADAPTIVE_K_SET:-2,4,7}"
@@ -302,10 +311,8 @@ GLM53_ADAPTIVE_K_MIN_STEPS="${GLM53_ADAPTIVE_K_MIN_STEPS:-4}"
 GLM53_ADAPTIVE_K_SATURATE="${GLM53_ADAPTIVE_K_SATURATE:-max}"
 GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 # Dense projections FP8 weight-only via Marlin (overlay/patch_dense_fp8.py). off = BF16 as shipped.
-# Default dense,kda since 2026-09-09: KL panel vs BF16 0.005-0.017 nats/token on 57k tokens of code/prose
-# (flat across 0-32k depth, argmax agreement 95-98 %, ~2x the run-to-run floor), tool-calling eval unchanged.
-# Groups: shared,dense,kda,mla; off = BF16.
-GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-dense,kda}"
+# PROVISIONAL (changes target numerics; needs a KLD panel). Groups: shared,dense,kda,mla.
+GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # Sparse-indexer prefill gather workspace (overlay/patch_indexer_workspace.py).
@@ -468,6 +475,45 @@ _glm53_validate_spinwait_ms() {
         GLM53_SPINWAIT_MS "$GLM53_SPINWAIT_MS" 1000
 }
 
+# skip / -1 / 0 / off / no / fair / positive integer <= MNBT.
+# Companion fair knobs are validated when set so a typo cannot reach one rank.
+_glm53_validate_mixed_prefill() {
+    if [ -n "${GLM53_MIXED_PREFILL_CHUNK+x}" ]; then
+        case "$GLM53_MIXED_PREFILL_CHUNK" in
+            skip|-1|0|off|no|fair) ;;
+            *)
+                _glm53_canonical_positive_int GLM53_MIXED_PREFILL_CHUNK \
+                    "$GLM53_MIXED_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+                ;;
+        esac
+        export GLM53_MIXED_PREFILL_CHUNK
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_CHUNK:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_CHUNK \
+            "$GLM53_FAIR_PREFILL_CHUNK" "$MAX_NUM_BATCHED_TOKENS" || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_INTERVAL_MS \
+            "$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_STEP_MS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS \
+            "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_MAX_CHUNKS:-}" ]; then
+        _glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_CHUNKS \
+            "$GLM53_FAIR_PREFILL_MAX_CHUNKS" 16 || return
+    fi
+    if [ -n "${GLM53_FAIR_PREFILL_SHARE:-}" ]; then
+        if ! [[ "$GLM53_FAIR_PREFILL_SHARE" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
+           || ! awk -v u="$GLM53_FAIR_PREFILL_SHARE" 'BEGIN { exit !(u >= 0 && u <= 1) }'; then
+            echo "GLM53_FAIR_PREFILL_SHARE must be between 0 and 1 (got: $GLM53_FAIR_PREFILL_SHARE)" >&2
+            return 2
+        fi
+        export GLM53_FAIR_PREFILL_SHARE
+    fi
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -477,6 +523,8 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    # Unset derives from the validated budget; a caller/.env value (including
+    # explicitly empty, which keeps the stock scheduler) is never overwritten.
     if [ "${LONG_PREFILL_TOKEN_THRESHOLD+x}" != x ]; then
         LONG_PREFILL_TOKEN_THRESHOLD=$((MAX_NUM_BATCHED_TOKENS / 2))
         if [ "$LONG_PREFILL_TOKEN_THRESHOLD" -lt 1 ]; then
@@ -503,6 +551,7 @@ validate_numeric_config() {
         _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
             "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
     fi
+    _glm53_validate_mixed_prefill || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL "${GLM53_APC_RETENTION_INTERVAL-}" || return
     _glm53_validate_retention_interval GLM53_APC_RETENTION_INTERVAL_SWA "${GLM53_APC_RETENTION_INTERVAL_SWA-}" || return
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
@@ -1496,6 +1545,11 @@ launch_cluster() {
         -e VLLM_CACHE_ROOT=/root/.cache/vllm
         -e "GLM53_SUPPRESS_STOPS_IN_REASONING=$GLM53_SUPPRESS_STOPS_IN_REASONING"
         -e "GLM53_MIXED_PREFILL_CHUNK=$GLM53_MIXED_PREFILL_CHUNK"
+        -e "GLM53_FAIR_PREFILL_CHUNK=$GLM53_FAIR_PREFILL_CHUNK"
+        -e "GLM53_FAIR_PREFILL_SHARE=$GLM53_FAIR_PREFILL_SHARE"
+        -e "GLM53_FAIR_PREFILL_MAX_INTERVAL_MS=$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"
+        -e "GLM53_FAIR_PREFILL_MAX_CHUNKS=$GLM53_FAIR_PREFILL_MAX_CHUNKS"
         -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
@@ -1826,6 +1880,7 @@ start() {
     log "model load path (in-container): ${MODEL_DIR}"
     log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
     log "exl3: fat_kernel=${EXL3_FAT_KERNEL} fat_grouped=${EXL3_FAT_GROUPED} temp_rows_fused=${EXL3_TEMP_ROWS_FUSED} mnbt=${MAX_NUM_BATCHED_TOKENS} max_num_seqs=${MAX_NUM_SEQS} draft_tp=${DFLASH_DRAFT_TP}"
+    log "mixed-prefill: policy=${GLM53_MIXED_PREFILL_CHUNK} fair_chunk=${GLM53_FAIR_PREFILL_CHUNK} share=${GLM53_FAIR_PREFILL_SHARE} interval_ms=${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS} max_step_ms=${GLM53_FAIR_PREFILL_MAX_STEP_MS} max_chunks=${GLM53_FAIR_PREFILL_MAX_CHUNKS} long_prefill=${LONG_PREFILL_TOKEN_THRESHOLD:-}"
 
     launch_cluster
     if wait_for_health; then

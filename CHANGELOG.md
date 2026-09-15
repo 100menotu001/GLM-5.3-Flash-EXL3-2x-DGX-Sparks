@@ -1,23 +1,27 @@
 # Changelog
 
-## Unreleased — scheduling defaults and projection screening
-
-PR149 changes mixed-prefill policy to `0` and dense/KDA projections to FP8 by
-default; `GLM53_DENSE_FP8=off` retains BF16 projections. Historical projection
-measurements are conditional shared-top-K screening results, not full-distribution
-numerical qualification.
+## Unreleased — long-prefill threshold derivation and projection screening
 
 The unset long-prefill threshold is derived after token-budget validation:
 half MNBT, rounded down, capped at 3584 and floored at 1. The shipped MNBT 7168
-still gives 3584; MNBT 2048 gives 1024. Explicit empty disables the flag, while
-invalid explicit values are rejected before lifecycle actions. Both launchers
-preserve caller override precedence.
+gives 3584; MNBT 2048 gives 1024. Explicit empty disables the flag (stock
+scheduler), while invalid explicit values are rejected before lifecycle actions.
+Both launchers preserve caller override precedence, and TP=4 now forwards the
+threshold on both ranks.
+
+Scheduler and projection defaults are **unchanged**: mixed-prefill stays `fair`
+on TP=2 / `0` on TP=3 / `skip` on TP=4, and `GLM53_DENSE_FP8` stays `off`. The
+proposed `CHUNK=0` TP=2 default and the FP8 default-on are held: the first needs
+#180's contention qualification to land, and the second needs the maintainer's
+exact-head server-side prefill-cost admission. Historical projection
+measurements (0.005-0.017 nats shared-top-K conditional KL on 57k code/prose
+tokens) are screening results, not full-distribution numerical qualification.
 
 Projection comparisons reject incomplete/misaligned captures and disclose shared
 support coverage. Comparison drivers propagate refusal; acquisition runners
 require an explicit dataset directory and stop on child failure. Boot-arm runs
 restore the original adaptive-k configuration. These CPU checks do not establish
-runtime quality or performance for the FP8 default.
+runtime quality or performance for FP8 mode.
 
 ## Unreleased — omitted-only output-token defaults
 

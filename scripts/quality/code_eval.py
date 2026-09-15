@@ -98,8 +98,8 @@ def main():
     a = ap.parse_args()
     tasks = load_tasks(a.data, a.n_he, a.n_mbpp, a.seed)
     t0 = time.time()
-    # Submit in synchronized rounds of `workers`: this kit's GLM53_MIXED_PREFILL_CHUNK=skip policy
-    # defers a new request's prefill while any peer is decoding, so a rolling pool serializes.
+    # Submit in synchronized rounds of `workers`: this kit's mixed-prefill policy can defer a
+    # new request's prefill while any peer is decoding, so a rolling pool serializes.
     # Every finished task is appended to OUT.partial.jsonl so a killed run keeps its results.
     partial = a.out + ".partial.jsonl"
     done = {}
