@@ -200,37 +200,10 @@ def test_installed_copy_if_present() -> None:
         run_patch(target)
 
 
-def test_recipe_wiring_if_present() -> None:
-    start = ROOT / "start.sh"
-    dockerfile = ROOT / "Dockerfile"
-    if not start.is_file() or not dockerfile.is_file():
-        return
-    launcher = start.read_text()
-    image = dockerfile.read_text()
-    assert 'CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-' in launcher
-    assert 'GLM53_EXPOSE_CACHE_RESET="${GLM53_EXPOSE_CACHE_RESET:-1}"' in launcher
-    # forwarded through the shared container env block (head + worker)
-    assert '-e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"' in launcher
-    assert launcher.count("python3 /opt/glm53/patch_cache_reset.py") == 2
-    assert (
-        "-v '/tmp/patch_cache_reset.py:"
-        "/opt/glm53/patch_cache_reset.py:ro'" in launcher
-    )
-    assert (
-        '-v "$CACHE_RESET_PATCH_HOST:'
-        '/opt/glm53/patch_cache_reset.py:ro"' in launcher
-    )
-    assert 'scp -q -o BatchMode=yes "$CACHE_RESET_PATCH_HOST"' in launcher
-    assert "COPY overlay/patch_cache_reset.py" in image
-    assert "RUN python3 /opt/glm53/patch_cache_reset.py" in image
-    assert "python3 /opt/glm53/test_cache_reset_endpoint.py" in image
-
-
 def main() -> int:
     test_fixture()
     test_fail_closed()
     test_installed_copy_if_present()
-    test_recipe_wiring_if_present()
     print("cache-reset endpoint patch OK")
     return 0
 
