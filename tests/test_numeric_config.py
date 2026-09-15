@@ -176,6 +176,19 @@ def test_mixed_prefill_contract() -> None:
     })
     assert result.returncode == 2
 
+    for value, expected in (("1000", 0), ("1", 0), ("0", 2), ("-1", 2), ("1.5", 2), ("600001", 2)):
+        result = run({"GLM53_FAIR_PREFILL_MAX_STEP_MS": value})
+        assert result.returncode == expected, (value, result.stderr)
+    for launcher in (START, ROOT / "start-tp3.sh", START_TP4):
+        source = launcher.read_text()
+        assert 'GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"' in source
+        assert '-e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"' in source
+        guard = guard_source(launcher)
+        for value, expected in (("1000", 0), ("0", 1)):
+            script = guard + '\nGLM53_FAIR_PREFILL_MAX_STEP_MS="$1"\n' + '_glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000\n'
+            checked = subprocess.run(["bash", "-c", script, "test", value], capture_output=True, text=True)
+            assert bool(checked.returncode) == bool(expected), (launcher, value, checked.stderr)
+
 
 def test_restart_validates_before_stop() -> None:
     source = START.read_text()
