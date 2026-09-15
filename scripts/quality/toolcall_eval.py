@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Tool-calling and verbatim-recall probe through the served chat endpoint at the served
 sampling defaults (thinking on, temperature 1.0 / top_p 0.95). Every case has a checker:
-right tool, object-shaped arguments (a null/array/number payload is recorded as a failed
-sample, see decode_args), no leaked <tool_call>/<arg_key> text, and — for the long-context
-cases — the requested file_path, old_string copied EXACTLY from a 20k-token file and the
-required new_string (what an Edit tool needs), plus verbatim recall of a numbered line at
-2k / 9k / 18k tokens depth. Scoring is pure (score_completion), so fixture tests can drive
-it without the endpoint.
+right tool, object-shaped arguments (an absent, empty or non-object — null/array/number —
+payload is recorded as a failed sample, see decode_args), no leaked <tool_call>/<arg_key>
+text, and — for the two long-context Edit cases — the requested relative file_path and a
+deterministic reference outcome: the candidate's old_string -> new_string is applied literally
+to the file content the case supplied and the RESULT must match the expected edit (see
+applied_edit; candidate code is never executed). The long cases also require verbatim recall
+of a numbered line at 2k / 9k / 18k tokens depth. Scoring is pure (score_completion), so
+fixture tests can drive it without the endpoint.
 
 usage: toolcall_eval.py OUT.json [--samples 3] [--workers 3] [--url URL] [--no-think] [--temperature T]
 """
@@ -36,10 +38,41 @@ TOOLS = [
 SYS = "You are a coding agent working in a git repository. Use the provided tools whenever they are needed; call a tool directly instead of describing what you would do."
 
 BUGGY = "def last_n(items, n):\n    \"\"\"Return the last n items of the list.\"\"\"\n    return items[-n+1:]\n\n\ndef total(xs):\n    return sum(xs)\n"
+# the corrected reference the fix_after_read edit must produce when applied to BUGGY
+FIXED = BUGGY.replace("items[-n+1:]", "items[-n:]")
 
 
 def call(name, args, cid="call_1"):
     return {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+def same_rel_path(path, target):
+    """True when file_path names exactly the intended relative target; a leading ./ is harmless.
+
+    The two Edit cases are a deterministic reference rubric against the file the prompt named, so a
+    sibling basename (notutils.py), another directory or an unknown absolute root does not qualify.
+    """
+    if not isinstance(path, str):
+        return False
+    p = path.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p == target
+
+
+def applied_edit(content, old, new):
+    """Result of applying the candidate's old_string -> new_string literally to the reference content.
+
+    None when the call is unusable: old_string and new_string must be real strings, and old_string must
+    be non-empty and occur exactly once in the reference content, so the edit is unambiguous. Only the
+    RESULT of the replacement is scored; candidate code is never executed, and an Edit call that merely
+    mentions the expected tokens proves nothing.
+    """
+    if not (isinstance(old, str) and isinstance(new, str)):
+        return None
+    if not old.strip() or content.count(old) != 1:
+        return None
+    return content.replace(old, new, 1)
 
 
 def cases():
@@ -71,12 +104,13 @@ def cases():
     add("weather", u("What's the weather like in Paris right now, in celsius?"), want("get_weather", lambda a: "paris" in str(a.get("city", "")).lower() and str(a.get("unit", "celsius")).lower() == "celsius"))
     add("calc", u("Use the calculator to compute 17*23+5."), want("calculate", lambda a: "17" in str(a.get("expression", "")) and "23" in str(a.get("expression", ""))))
     add("no_tool", u("Just say hello in one short sentence. Do not use any tools."), no_tool(), expect_tool=False)
-    # multi-turn: tool result fed back, then the fix via Edit: the requested file, an old_string copied
-    # from that content, and the actual off-by-one correction — not any Edit call
+    # multi-turn: tool result fed back, then the fix via Edit: the requested utils.py and a replacement
+    # whose application to that content yields the corrected reference — not a call that merely mentions
+    # the buggy and fixed tokens, and not any other file
     def fixes_last_n(a):
-        old, new = str(a.get("old_string", "")), str(a.get("new_string", ""))
-        return (str(a.get("file_path", "")).endswith("utils.py") and old.strip() != "" and old in BUGGY
-                and "items[-n+1:]" in old and "items[-n:]" in new and "items[-n+1:]" not in new)
+        if not same_rel_path(a.get("file_path"), "utils.py"):
+            return False
+        return applied_edit(BUGGY, a.get("old_string"), a.get("new_string")) == FIXED
 
     mt = u("Read utils.py and fix the bug in last_n.")
     mt += [{"role": "assistant", "content": "", "tool_calls": [call("Read", {"file_path": "utils.py"})]},
@@ -95,13 +129,19 @@ def cases():
             (lambda t: (lambda tc, content, reasoning: (LEAKSTRIP(content) == t.strip(), f"want {t.strip()[:60]!r}")))(target), tools=[], expect_tool=False, tags=("long",))
     ln = 1500
     target = src_lines[ln - 1]
-    # the requested edit: the file whose contents were dumped, old_string copied from it, and '# reviewed'
-    # appended to THAT line of the new content
+    # the requested edit: applying the replacement to the dumped content must leave every other line
+    # untouched and end THAT line with '# reviewed' — a comment placed elsewhere, a changed neighbouring
+    # line or a shortened file does not score
     def appends_reviewed(a):
-        old, new = str(a.get("old_string", "")), str(a.get("new_string", ""))
-        return (str(a.get("file_path", "")).endswith("exl3.py") and old.strip() != "" and old in file_text
-                and target.rstrip() in old and new != old
-                and re.search(re.escape(target.rstrip()) + r"[ \t]*# reviewed[ \t]*$", new, re.M) is not None)
+        if not same_rel_path(a.get("file_path"), "overlay/exl3.py"):
+            return False
+        got = applied_edit(file_text, a.get("old_string"), a.get("new_string"))
+        if got is None:
+            return False
+        want = re.compile(re.escape(target.rstrip()) + r"[ \t]*# reviewed[ \t]*$")
+        lines = got.split("\n")
+        return (len(lines) == len(src_lines) and lines[:ln - 1] == src_lines[:ln - 1]
+                and want.match(lines[ln - 1]) is not None and lines[ln:] == src_lines[ln:])
 
     add("edit_deep_18k", [{"role": "system", "content": SYS}, {"role": "user", "content": dump + f"Use the Edit tool to append the comment '# reviewed' to the end of line {ln}. Copy old_string exactly from the file."}],
         want("Edit", appends_reviewed), tags=("long",))
@@ -126,26 +166,30 @@ def post(url, body, timeout=1800):
 def decode_args(raw):
     """Decode a tool-call arguments payload; every checker reads named fields off an object.
 
-    JSON null/arrays/numbers/strings are syntactically valid and used to reach the predicates as-is
-    and raise there. Returns (args, invalid): args is {} when the payload is unusable, and invalid
-    marks the sample as a recorded invalid-argument failure.
+    The payload must be present and decode to a JSON object: an absent, empty or non-object payload is a
+    recorded invalid-argument failure, while an explicit object string (including "{}") is valid — a
+    payload is never replaced by an empty object. Returns (args, invalid): args is {} when the payload
+    is unusable, and invalid marks the recorded failure.
     """
+    if not isinstance(raw, str) or not raw.strip():
+        return {}, True
     try:
-        args = json.loads(raw or "{}")
+        args = json.loads(raw)
     except Exception:  # noqa: BLE001
         return {}, True
     return (args, False) if isinstance(args, dict) else ({}, True)
 
 
 def stored_tool_call(r):
-    """Rebuild a recorded tool call for --rescore; invalid marks a non-object stored arguments payload.
+    """Rebuild a recorded tool call for --rescore; invalid marks a stored payload that is missing or no longer decodes to an object.
 
-    Records keep at most 600 characters of the payload, so one that no longer decodes to an object is
-    reported as an invalid-argument failure instead of raising out of a checker.
+    A record with no tool is a legitimate no-tool sample; a tool recorded with a missing, empty or
+    non-object payload is an invalid-argument failure rather than a silent no-tool. Records keep at most
+    600 characters of the payload, so one truncated mid-object is reported as invalid as well.
     """
-    if not (r.get("tool") and r.get("args")):
+    if not r.get("tool"):
         return None, False
-    args, invalid = decode_args(r["args"])
+    args, invalid = decode_args(r.get("args"))
     return {"name": r["tool"], "args": args}, invalid
 
 
