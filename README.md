@@ -706,9 +706,16 @@ TP=4 vs the 2-node baseline on the same production-mix bench (temperature 0,
 prefill). One caveat found by a 150-minute soak on 2026-09-03: with the DFlash2
 draft on, a 96k chunked prefill sharing steps with 6-7 speculative decode
 streams hangs all four ranks (3/3 runs, 31-78 min; independent of the E2
-fat-expert kernel), while the same soak with the draft off passed clean, so the
-4-node production config runs without speculation until that is fixed (details
-and receipts in the linked repo). The defaults above are tuned for 2 nodes; on 4 nodes an autoresearch
+fat-expert kernel). The draft was not the cause: the draft-off soak that first
+passed clean stalled an hour later on a lone 282k cold prefill, and the
+packet-loss-only explanation that followed was withdrawn as well (later stalls
+reproduced with the RoCE loss counters flat). On that kit the failure was still
+reproducing in September 2026, where an H16 sparse-attention progress failure
+was localized at the same step (the internal race is not identified); the
+mitigation in use there is a bounded final sparse-attention call (at most 64
+query rows), not the knobs below. Kit-scoped attribution, updated 2026-09-09:
+<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/115#issuecomment-5599489540>
+(details and receipts in the linked repo). The defaults above are tuned for 2 nodes; on 4 nodes an autoresearch
 loop (one knob per relaunch, hard reliability gates) settled on the values now
 in `.env.tp4.example`: `GPU_MEM_UTIL=0.75` (0.85 left <2 GiB host memory per
 rank and preceded two engine deaths), `MAX_NUM_SEQS=8` (135 vs 84 tok/s
