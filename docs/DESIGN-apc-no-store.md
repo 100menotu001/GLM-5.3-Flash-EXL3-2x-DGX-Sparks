@@ -132,6 +132,16 @@ Tests C3a (running no-store producer: no registration, no CoW copy sourced from 
 steps) and C3b (no-store reader: source keeps its hash, private CoW block unhashed) are the executable form of
 this argument.
 
+**In-image gate composition** (`Dockerfile`). The hybrid and per-group retention overlays are applied
+*before* `tests/test_apc_no_store.py` runs, and the no-store patch is applied *after* it. Part A therefore
+still stages the pre-no-store `sampling_params.py` / `v1/request.py` / `v1/core/block_pool.py` and applies the
+no-store patch to copies of them (the retention overlay leaves those anchors and their patch mechanics
+untouched), while Part C composes the real hybrid + per-group + no-store stack on the pinned runtime. Its
+live-shape legs run once with `VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA` unset (inherit the global policy) and
+once with `"0"` (boundary-only retention for the EAGLE-exempt drafter group), asserting the resolved per-group
+retention vector, the drafter-priority free queue wiring, and unchanged suppression / `num_cached_block` /
+recycling. `GLM53_REQUIRE_VLLM=1 GLM53_REQUIRE_COMPOSITION=1` make the composed Part C mandatory in-image.
+
 ### 2.3 Deliberately unchanged
 
 - **Lookups stay enabled.** A no-store lane sharing the system prompt gets the free prefix and pays nothing
@@ -159,8 +169,10 @@ this argument.
   owner conversation's own `usage.prompt_tokens_details.cached_tokens` (per response, straight from
   `prefill_stats.num_cached_tokens`), never the aggregates, and not `kv_cache_usage_perc` (live-referenced
   blocks only).
-- **R3 silent no-op.** Mis-typed key, JSON `true`, kill switch at `0`: the system behaves exactly as today. Hence the
-  resolution receipt line; do not trust an A/B without it in `docker logs`.
+- **R3 silent no-op.** A mis-typed key, or the kill switch at `0`: the system behaves exactly as today. (A JSON
+  `true`/`false` in `vllm_xargs` is *not* one of these: pydantic coerces it to int `1`/`0` before the strict
+  parser, so it is accepted with the intended meaning — §2.1.) Hence the resolution receipt line; do not trust
+  an A/B without it in `docker logs`.
 - **R4 structured output.** No interaction: grammar state lives on `StructuredOutputRequest` and the per-step
   bitmask, never in a KV block. Structured-output batch lanes are exactly the lanes to mark no-store.
 - **R5 cascade attention.** `get_num_common_prefix_blocks` counts `ref_cnt == len(req_to_blocks)`; a no-store
@@ -182,10 +194,11 @@ Identical owner turn in every arm (Codex: A0 turn 3 vs A1/A2 turn 4 was not a cl
 own `cached_tokens` in A2 (must stay > 0 on a second flagged lane that shares a prefix: reads still work).
 **Pass criterion fixed in advance: A2 ≥ 0.9 × A0 and A2 − A1 ≥ 0.3 × A0.** If A1 ≈ A0 the premise fails on
 this pool and the PR is closed as a negative result. Also: both-rank `GLM53_APC_NO_STORE` in `docker exec …
-env`; the resolution + suppression receipt lines after the first flagged request; `"skip_writing_prefix_cache":
-"yes"` → HTTP 400 naming the field; JSON `true` → pydantic 400; `tests/probe_prefix_equivalence.py` PASS with
-the flag on the warm runs (reads unaffected) and a no-store→cold pair (same prompt re-sent after a flagged run
-reports `cached_tokens` 0 with an identical position-0 token / ≤ 3× floor).
+`env`; the resolution + suppression receipt lines after the first flagged request; `"skip_writing_prefix_cache":
+"yes"` → HTTP 400 naming the field; JSON `true` → accepted as int `1` (pydantic v2 coerces it in `vllm_xargs`,
+§2.1); `tests/probe_prefix_equivalence.py` PASS with the flag on the warm runs (reads unaffected) and a
+no-store→cold pair (same prompt re-sent after a flagged run reports `cached_tokens` 0 with an identical
+position-0 token / ≤ 3× floor).
 
 ## 5. Upstream
 
