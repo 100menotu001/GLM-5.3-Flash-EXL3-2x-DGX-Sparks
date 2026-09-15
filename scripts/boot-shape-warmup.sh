@@ -146,7 +146,7 @@ verify_sampler_cache() {
 
 # n copies of "hello", single-space separated, no trailing space. One printf
 # with the format reused per argument — appending to a growing string made the
-# 65536 rung quadratic (~2 GiB of copies, ~2 min).
+# 65536 rung quadratic in prompt length.
 mk_ladder_prompt() {
   local n=$1 out
   out=$(printf 'hello %.0s' $(seq 1 "$n"))
