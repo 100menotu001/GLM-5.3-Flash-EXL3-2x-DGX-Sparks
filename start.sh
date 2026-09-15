@@ -304,6 +304,8 @@ GLM53_FAIR_PREFILL_SHARE="${GLM53_FAIR_PREFILL_SHARE:-0.20}"
 GLM53_FAIR_PREFILL_MAX_INTERVAL_MS="${GLM53_FAIR_PREFILL_MAX_INTERVAL_MS:-2000}"
 GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"
 GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
+# Space-separated NAME=VALUE list of extra env for both container ranks (diagnostics, e.g. VLLM_DEBUG_WORKSPACE=1).
+GLM53_EXTRA_ENV="${GLM53_EXTRA_ENV:-}"
 # 1 = at boot, after vLLM's "GPU KV cache size: N tokens" line (which is
 # max_concurrency x max_model_len, not a pool size), log one line per KV-cache
 # group (spec, block_size, blocks per max_model_len request) and a summary with
@@ -1677,12 +1679,6 @@ launch_cluster() {
         nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
         log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
     fi
-    local worker_nccl="" e quoted_env
-    for e in "${nccl_common[@]}"; do
-        [ "$e" = "-e" ] && continue
-        printf -v quoted_env '%q' "$e"
-        worker_nccl+=" -e $quoted_env"
-    done
 
     local -a head_preload=() worker_preload=""
     if [ "$USE_HOST_NCCL" = "1" ]; then
@@ -1701,6 +1697,7 @@ launch_cluster() {
     fi
 
     local serve_env=""
+    local -a serve_env_names=()
     local v
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
@@ -1716,7 +1713,59 @@ launch_cluster() {
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
         serve_env+=" -e $v='${!v:-}'"
+        serve_env_names+=("$v")
     done
+
+    # Extra container env for diagnostics (space-separated NAME=VALUE list, e.g.
+    # GLM53_EXTRA_ENV="VLLM_DEBUG_WORKSPACE=1"). Forwarded to both ranks as -e pairs.
+    # A name this launch already forwards — every entry of nccl_common and
+    # serve_env, the per-rank NCCL_*/VLLM_HOST_IP block — is rejected, as are the
+    # launcher's namespaces and conditionally-forwarded knobs: docker takes the
+    # last duplicate -e, so a same-named entry would silently override the knob
+    # and skip its range check. Values: [A-Za-z0-9_./:@,+=-]* only (no spaces,
+    # quotes, globs or shell metacharacters — the worker command line is built as
+    # shell text). Only names are logged; values may carry credentials, so a
+    # rejected entry is reported by position only and is never echoed.
+    if [ -n "${GLM53_EXTRA_ENV:-}" ]; then
+        local _kv _name _value _entry _names="" _owned=" " _idx=0
+        # Read the owned set off the arguments this launch builds, so a knob added
+        # to either list cannot be shadowed here without a second list to keep in sync.
+        for _entry in "${nccl_common[@]}" "${serve_env_names[@]}" \
+                      NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_IB_HCA \
+                      NCCL_IB_GID_INDEX VLLM_HOST_IP VLLM_API_KEY LD_PRELOAD; do
+            [ "$_entry" = "-e" ] && continue
+            _owned="$_owned ${_entry%%=*} "
+        done
+        set -f
+        for _kv in $GLM53_EXTRA_ENV; do
+            _idx=$((_idx + 1))
+            # The word split above delivers a whitespace-containing value as
+            # fragments, so the raw token and the unvalidated name can both carry
+            # part of a credential: neither is interpolated into a rejection.
+            case "$_kv" in *=*) ;; *) die "GLM53_EXTRA_ENV entry $_idx must be NAME=VALUE";; esac
+            _name="${_kv%%=*}"; _value="${_kv#*=}"
+            [[ "$_name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "GLM53_EXTRA_ENV entry $_idx: name must match [A-Z_][A-Z0-9_]*"
+            [[ "$_value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]] || die "GLM53_EXTRA_ENV: unsafe value for $_name (allowed: A-Z a-z 0-9 _ . / : @ , + = -)"
+            case "$_name" in
+                NCCL_*|HF_*|GLM53_*|EXL3_*|FLASHINFER_*|PATH|PYTHONPATH|VLLM_PREFIX_CACHE_RETENTION_INTERVAL*)
+                    die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            case "$_owned" in
+                *" $_name "*) die "GLM53_EXTRA_ENV: $_name is launcher-owned; set it through its own knob";;
+            esac
+            nccl_common+=(-e "$_kv"); _names="$_names $_name"
+        done
+        set +f
+        log "extra container env (both ranks):${_names}"
+    fi
+
+    local worker_nccl="" e quoted_env
+    for e in "${nccl_common[@]}"; do
+        [ "$e" = "-e" ] && continue
+        printf -v quoted_env '%q' "$e"
+        worker_nccl+=" -e $quoted_env"
+    done
+
     # The worker is headless and serves no API, so do not propagate the API
     # credential into its remote docker command or container environment.
 
