@@ -183,24 +183,15 @@ def test_mixed_prefill_contract() -> None:
         source = launcher.read_text()
         assert 'GLM53_FAIR_PREFILL_MAX_STEP_MS="${GLM53_FAIR_PREFILL_MAX_STEP_MS:-1000}"' in source
         assert '-e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"' in source
-        if launcher.name == "start-tp3.sh":
-            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-0}"' in source
-        elif launcher.name == "start-tp4.sh":
-            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-skip}"' in source
-        else:
-            assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"' in source
+        assert 'GLM53_MIXED_PREFILL_CHUNK="${GLM53_MIXED_PREFILL_CHUNK:-fair}"' in source
         guard = guard_source(launcher)
         for value, expected in (("1000", 0), ("0", 1)):
             script = guard + '\nGLM53_FAIR_PREFILL_MAX_STEP_MS="$1"\n' + '_glm53_canonical_positive_int GLM53_FAIR_PREFILL_MAX_STEP_MS "$GLM53_FAIR_PREFILL_MAX_STEP_MS" 600000\n'
             checked = subprocess.run(["bash", "-c", script, "test", value], capture_output=True, text=True)
             assert bool(checked.returncode) == bool(expected), (launcher, value, checked.stderr)
-    for env_example, chunk in (
-        (ROOT / ".env.example", "fair"),
-        (ROOT / ".env.tp3.example", "0"),
-        (ROOT / ".env.tp4.example", "skip"),
-    ):
+    for env_example in (ROOT / ".env.example", ROOT / ".env.tp3.example", ROOT / ".env.tp4.example"):
         text = env_example.read_text()
-        assert f"GLM53_MIXED_PREFILL_CHUNK={chunk}" in text, env_example
+        assert "GLM53_MIXED_PREFILL_CHUNK=fair" in text, env_example
 
 
 def test_restart_validates_before_stop() -> None:
