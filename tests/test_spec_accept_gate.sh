@@ -6,11 +6,19 @@
 # callers depend on being distinguishable:
 #   1. >100 drafts and no per-position series  -> rc 2, named diagnostic
 #      (before this, the run died rc 1 printing only drafts_total)
-#   2. position="0" absent while others exist  -> rc 2, named diagnostic
-#   3. two label sets for one series           -> rc 2, no ratio emitted
-#   4. pinned pos0 -> rc 1 FAIL, healthy decay -> rc 0 PASS, <100 drafts ->
+#   2. a matched per-position series with no numeric position label -> rc 2,
+#      named diagnostic (before this, the run died rc 1 with no output, or
+#      judged only the labelled part of the curve)
+#   3. a missing or unreadable drafts denominator -> rc 2 (the missing family
+#      used to fall through `|| echo 0` into the <100-drafts SKIP, reporting
+#      "cannot judge" as "not enough traffic")
+#   4. scientific counts (1.5e+03, with the optional sample timestamp) are
+#      read as 1500, not truncated to their leading digit 1
+#   5. position="0" absent while others exist  -> rc 2, named diagnostic
+#   6. two label sets for one series           -> rc 2, no ratio emitted
+#   7. pinned pos0 -> rc 1 FAIL, healthy decay -> rc 0 PASS, <100 drafts ->
 #      rc 0 SKIP: the three verdicts stay distinct from the rc 2 diagnostics
-#   5. default endpoint is loopback; an explicit argument still wins
+#   8. default endpoint is loopback; an explicit argument still wins
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GATE="$HERE/../scripts/spec-accept-gate.sh"
@@ -30,14 +38,16 @@ SHIM
 chmod +x "$WORK/bin/curl"
 export PATH="$WORK/bin:$PATH"
 
-# fixture <drafts_total> [<position>:<accepted_tokens> ...] -> $GATE_FIXTURE
+# fixture <drafts_value> [<position>:<accepted_value> ...] -> $GATE_FIXTURE
+# Values are written verbatim, so a fixture can carry the fractional,
+# scientific and timestamped shapes a scrape target emits.
 fixture() {
     { echo "# TYPE vllm:spec_decode_num_drafts_total counter"
-      echo "vllm:spec_decode_num_drafts_total{model_name=\"glm\"} ${1}.0"
+      echo "vllm:spec_decode_num_drafts_total{model_name=\"glm\"} ${1}"
       echo "# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter"
       shift
       for pair in "$@"; do
-          echo "vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"glm\",position=\"${pair%%:*}\"} ${pair##*:}.0"
+          echo "vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"glm\",position=\"${pair%%:*}\"} ${pair##*:}"
       done
     } > "$GATE_FIXTURE"
 }
@@ -54,45 +64,96 @@ check() { # $1 description, $2 expected rc, $3 required output substring
         *) echo "FAIL $1: rc $rc but output lacks [$3]: $out"; fail=1 ;;
     esac
 }
+no_ratio() { # $1 description: the run must not have judged any position
+    case "$out" in
+        *"ratio="*) echo "FAIL $1: emitted a ratio anyway: $out"; fail=1 ;;
+        *) echo "ok   $1: no ratio emitted" ;;
+    esac
+}
 
-# --- missing and mismatched series ----------------------------------------
-fixture 150
+# --- missing, unlabelled and mismatched series ----------------------------
+fixture 150.0
 run
 check "150 drafts, no per-position series" 2 "no accepted_tokens_per_pos_total series"
 
-fixture 150 1:90 2:60
+# Every matched series carrying no position label: the position list used to
+# fail under pipefail and take the whole run down rc 1, printing nothing.
+fixture 150.0
+printf '%s\n' 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="glm"} 7.75' >> "$GATE_FIXTURE"
+run
+check "unlabelled per-position series" 2 "without a numeric position label"
+no_ratio "unlabelled per-position series"
+
+# Labelled and unlabelled series mixed: judging the labelled subset alone would
+# report a verdict for a curve that was never fully read.
+fixture 150.0 0:150.0 1:20.0
+printf '%s\n' 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="glm"} 7.75' >> "$GATE_FIXTURE"
+run
+check "partly unlabelled per-position family" 2 "without a numeric position label"
+no_ratio "partly unlabelled per-position family"
+
+fixture 150.0 1:90.0 2:60.0
 run
 check "position 0 missing" 2 'position="0" is missing'
 
-fixture 150 0:150 1:20
+fixture 150.0 0:150.0 1:20.0
 printf '%s\n' 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="other",position="0"} 3.0' >> "$GATE_FIXTURE"
 run
 check "two label sets for position 0" 2 "ambiguous label sets"
-case "$out" in
-    *"ratio="*) echo "FAIL two label sets: emitted a ratio anyway: $out"; fail=1 ;;
-    *) echo "ok   two label sets: no ratio emitted" ;;
-esac
+no_ratio "two label sets for position 0"
 
-fixture 150 0:120 1:90
+fixture 150.0 0:120.0 1:90.0
 printf '%s\n' 'vllm:spec_decode_num_drafts_total{model_name="other"} 7.0' >> "$GATE_FIXTURE"
 run
 check "two label sets for the denominator" 2 "ambiguous label sets"
 
+# --- the drafts denominator is required, and must be readable -------------
+# No drafts family at all: `|| echo 0` used to make this SKIP rc 0, i.e. the
+# "cannot judge" case reported as "not enough traffic".
+{ echo "# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter"
+  echo 'vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name="glm",position="0"} 150.0'
+} > "$GATE_FIXTURE"
+run
+check "no drafts family" 2 "no spec_decode_num_drafts_total series"
+
+fixture NaN 0:80.0
+run
+check "unreadable drafts value" 2 "unreadable spec_decode_num_drafts_total value"
+
+fixture 150.0 0:NaN
+run
+check "unreadable position value" 2 "unreadable accepted_tokens_per_pos_total value"
+
+# --- scientific counts are counts, not leading digits ---------------------
+# 1.5e+03 drafts is 1500: a healthy run, not a <100-drafts SKIP. The samples
+# carry the optional trailing timestamp a scrape target may append.
+fixture "1.5e+03 1757900000000" "0:1.2e+03 1757900000000" "1:9e+02 1757900000000"
+run
+check "scientific counts" 0 "PASS: pos0 acceptance"
+case "$out" in
+    *"drafts_total=1500"*) echo "ok   1.5e+03 drafts read as 1500" ;;
+    *) echo "FAIL scientific drafts misread: $out"; fail=1 ;;
+esac
+case "$out" in
+    *"ratio=0.8000"*) echo "ok   1.2e+03/1.5e+03 accepted ratio is 0.8000" ;;
+    *) echo "FAIL scientific accepted misread: $out"; fail=1 ;;
+esac
+
 # --- the PASS / FAIL / SKIP verdicts stay distinct ------------------------
-fixture 150 0:150 1:150
+fixture 150.0 0:150.0 1:150.0
 run
 check "pinned pos0" 1 "FAIL: pos0 acceptance"
 
-fixture 100 0:80 1:60 2:40
+fixture 100.0 0:80.0 1:60.0 2:40.0
 run
 check "healthy decay at exactly 100 drafts" 0 "PASS: pos0 acceptance"
 
-fixture 99 0:70
+fixture 99.0 0:70.0
 run
 check "99 drafts" 0 "SKIP: only 99 drafts"
 
 # --- endpoint -------------------------------------------------------------
-fixture 100 0:80 1:60
+fixture 100.0 0:80.0 1:60.0
 run
 check "loopback default verdict" 0 "PASS"
 case "$(cat "$GATE_ARGV")" in
