@@ -305,13 +305,17 @@ blob file, plus `config.json` and the tensor index — and never falls back to
 checks the worker's copy. With `NFS_SHARE=1` the ranks read the head's
 verified tree instead of a local copy.
 
-A matched TP=2 deployment passed all 10 functional checks. These included a
+The author reported that a staged-checkpoint TP=2 deployment at runtime commit
+`6599585` passed all 10 functional checks. These included a
 synthetic-image request, 9,128-token retrieval, three concurrent requests,
 streaming, tools, and active DFlash drafting. The donor's Refusal32 script
 reported 32/32 bypass, 0 refuse, and 0 garble in one greedy thinking-off run.
 The model card records the method, integrity checks, and measured quality
 tradeoffs. Teacher KLD was higher than the original model, so this is an
 alternative checkpoint, not a quality-equivalent replacement.
+Those historical observations do not qualify this integrated launcher or
+checkpoint quality/boot behavior. The preset's local file-count and sidecar
+checks do not verify shard hashes, tensor contents, or checkpoint integrity.
 
 Caveats: the KLD quality panel above was measured **without** ablit; expect
 behavioral drift and re-run `tests/bench_decode.py` after enabling (DFlash2

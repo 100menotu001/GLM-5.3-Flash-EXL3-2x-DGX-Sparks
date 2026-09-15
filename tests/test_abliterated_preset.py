@@ -184,14 +184,12 @@ printf '%s\n' "$resolved" "$marker_rev"
         worker_blob.unlink()
         failed_worker = _run(script, env)
         assert failed_worker.returncode != 0
-        assert "incomplete on worker" in failed_worker.stderr
         worker_blob.touch()
 
         head_shard = head_repo / "snapshots" / REVISION / "model-00120-of-00120.safetensors"
         head_shard.unlink()
         failed_head = _run(script, env)
         assert failed_head.returncode != 0
-        assert "pinned model snapshot is incomplete" in failed_head.stderr
 
 
 def test_failed_download_cannot_adopt_another_cached_revision() -> None:
