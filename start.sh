@@ -336,9 +336,9 @@ GLM53_WARMUP_REQ_TIMEOUT="${GLM53_WARMUP_REQ_TIMEOUT:-240}"
 # /reset_encoder_cache — issue #31) on the head API server, so cold bench runs
 # can reset the prefix cache without a restart. Opt-in (default 0) on purpose:
 # the caveat is auth, not stability — root-mounted routes sit outside the bearer
-# guard (GUARDED_PREFIX), so a shared kit must ask for this explicitly. The rest
-# of the dev surface (sleep / rlhf / rpc / server_info) stays off either way.
-# Restart applies it; the patch itself is inert when 0 (stock image behavior).
+# guard (GUARDED_PREFIX), so a shared kit must ask for this explicitly.
+# This flag does not enable other dev routes or override independent
+# VLLM_SERVER_DEV_MODE, which retains precedence. Restart applies the flag.
 GLM53_EXPOSE_CACHE_RESET="${GLM53_EXPOSE_CACHE_RESET:-0}"
 
 # OpenAI-compatible API bearer token. Read the native VLLM_API_KEY env var
@@ -1554,8 +1554,7 @@ launch_cluster() {
         -e "GLM53_FAIR_PREFILL_MAX_INTERVAL_MS=$GLM53_FAIR_PREFILL_MAX_INTERVAL_MS"
         -e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"
         -e "GLM53_FAIR_PREFILL_MAX_CHUNKS=$GLM53_FAIR_PREFILL_MAX_CHUNKS"
-        # Read by the patched build_app (issue #31): mount only the cache-reset
-        # dev routes when 1. Patched file is inert when 0/unset.
+        # Cache-only opt-in; independent VLLM_SERVER_DEV_MODE retains precedence.
         -e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"
         -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"

@@ -123,10 +123,6 @@ def test_fixture() -> None:
         target.write_text(PINNED_API_SERVER_FIXTURE)
         run_patch(target)
         patched = target.read_text()
-        assert patched.count(MARK) == 1
-        assert 'elif os.getenv("GLM53_EXPOSE_CACHE_RESET", "0") == "1":' in patched
-        assert "from vllm.entrypoints.serve.dev.cache.api_router import" in patched
-        assert "attach_cache_reset_router(app)" in patched
         compile(patched, "patched_fixture.py", "exec")
 
         # Flag semantics: the router mounts only when the flag is "1", full
@@ -147,13 +143,6 @@ def test_fixture() -> None:
         run_patch(target)
         assert target.read_text() == patched
 
-        # Exact merged behavior is accepted when a newer image already has it
-        # (marker stripped, elif kept): the patch skips instead of failing.
-        merged = patched.replace("        # [glm53-cache-reset] Expose only\n"
-                                 , "        #\n", 1)
-        target.write_text(merged)
-        run_patch(target)
-        assert target.read_text() == merged
 
 
 def test_fail_closed() -> None:

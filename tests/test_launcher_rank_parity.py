@@ -67,7 +67,6 @@ FG_FORWARD = '-e "GLM53_FINEGRAINED_APC=$GLM53_FINEGRAINED_APC"'
 # guard, so this one is opt-in (launcher default 0). Both ranks must see the
 # same gate value -- the overlay applies from the same list on both.
 CR = "GLM53_EXPOSE_CACHE_RESET"
-CR_FORWARD = '-e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"'
 
 # Launcher knobs the tester asked to see reach both ranks identically, and the
 # container-side names the launcher maps them to.
@@ -156,8 +155,6 @@ def wires_fg() -> bool:
     return FG_FORWARD in source()
 
 
-def wires_cr() -> bool:
-    return CR_FORWARD in source()
 
 
 # ------------------------------------------------------------------ part A --
@@ -595,10 +592,9 @@ def part_d(h: Harness) -> None:
         scenarios += [("FINEGRAINED=0", {FG: "0"}), ("FINEGRAINED=1", {FG: "1"})]
     if wires_swa() and wires_fg():
         scenarios.append(("SWA=14336 + FINEGRAINED=0", {SWA: "14336", FG: "0"}))
-    if wires_cr():
-        # The opt-in gate has to reach both ranks with the launcher's own value
-        # (0 when unset, the caller's value when exported).
-        scenarios.append((f"{CR}=1", {CR: "1"}))
+    # Cache-reset forwarding is part of this launcher; exercise both ranks even if
+    # a regression removes its forwarding entirely.
+    scenarios.append((f"{CR}=1", {CR: "1"}))
 
     first = None
     for label, env in scenarios:
@@ -613,8 +609,7 @@ def part_d(h: Harness) -> None:
             required["VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA"] = env[SWA]
         if wires_fg():
             required[FG] = env.get(FG, "1")
-        if wires_cr():
-            required[CR] = env.get(CR, "0")
+        required[CR] = env.get(CR, "0")
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:
