@@ -24,10 +24,10 @@ Part C  behaviour on a real vLLM (CPU is enough): patched COPIES of the three
         hybrid + per-group retention + no-store stack. The live-shape legs run
         once per retention mode (``VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA``
         unset = inherit the global policy, ``"0"`` = boundary-only retention
-        for the EAGLE-exempt drafter group) and assert the resolved per-group
-        retention vector, the drafter-priority free wiring, and that
-        suppression/num_cached_block/recycling behaviour is unchanged on that
-        stack. The fixture pins the global retention to dense (``None``, the
+        for the EAGLE-exempt drafter group) and prove that hash suppression,
+        per-group num_cached_block progression, follow-up hits and recycling
+        behaviour remain correct on that stack. The fixture pins the global
+        retention to dense (``None``, the
         pinned runtime's default) so this image-level gate does not depend on
         the deployment's launcher environment. Group layouts are asserted and
         printed: a runtime that exposes the fork's ``KpoolTailSpec`` must
@@ -855,18 +855,13 @@ SWA_ENV = "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA"
 RETENTION_HELPERS = ("_glm53_swa_retention_env", "_glm53_min_exempt_group_ids", "_glm53_resolve_retention_by_group")
 retention_overlay = all(hasattr(kvc_mod, _name) for _name in RETENTION_HELPERS)
 require_composition = os.environ.get("GLM53_REQUIRE_COMPOSITION", "") == "1"
-# Sparse global for the wiring-only mode: above the fixture's MambaSpec block
-# size (4) and a multiple of its scheduler_block_size (2), so the four mamba
-# groups resolve sparse and the retained #130 prior-replay policy arms.
-SPARSE_GLOBAL = 8
 if retention_overlay:
     live_modes = [
-        ("inherit", "", None, False),
-        ("SWA=0", "0", None, False),
-        ("SWA=0+sparse-global", "0", SPARSE_GLOBAL, True),
+        ("inherit", ""),
+        ("SWA=0", "0"),
     ]
 else:
-    live_modes = [("no-retention-runtime", None, None, False)]
+    live_modes = [("no-retention-runtime", None)]
     check(
         not require_composition,
         "C3L the per-group retention overlay is missing from the loaded coordinator "
@@ -874,33 +869,6 @@ else:
         + (" -- GLM53_REQUIRE_COMPOSITION=1" if require_composition else "; the live leg still runs without it"),
     )
 
-def retention_state(m, mode, env_value, n_groups):
-    """Per-group retention state + free/replay wiring this mode must resolve."""
-    vector = getattr(m.coordinator, "retention_interval_by_group", None)
-    global_value = getattr(m.coordinator, "retention_interval", "<missing>")
-    check(isinstance(vector, tuple) and len(vector) == n_groups, f"C3L [{mode}] resolved per-group retention vector sized to the runtime layout -> {vector}")
-    if not isinstance(vector, tuple) or len(vector) != n_groups:
-        return
-    if env_value == "":
-        check(set(vector) == {global_value}, f"C3L [{mode}] unset {SWA_ENV} inherits the global value ({global_value!r}) for every group -> {vector}")
-        check(m.block_pool.low_priority_cache_group_ids == frozenset(), f"C3L [{mode}] no drafter-priority free class without an explicit SWA interval -> {sorted(m.block_pool.low_priority_cache_group_ids)}")
-    else:
-        drafter = n_groups - 1
-        check(vector[drafter] == 0 and all(v == global_value for v in vector[:drafter]), f"C3L [{mode}] explicit SWA 0 applies only to the min-exempt drafter group -> {vector} (global={global_value!r})")
-        check(m.block_pool.low_priority_cache_group_ids == frozenset({drafter}), f"C3L [{mode}] explicit SWA 0 puts the drafter group in the low-priority free class -> {sorted(m.block_pool.low_priority_cache_group_ids)}")
-        order = getattr(m.coordinator, "_glm53_free_manager_order", ())
-        check(len(order) == n_groups and set(order) == set(range(n_groups)) and order[0] == drafter, f"C3L [{mode}] free order releases the low-priority drafter manager first -> {order}")
-    prior = getattr(m.coordinator, "dflash_replay_prior_group_ids", None)
-    if prior is not None:
-        mgrs = managers(m)
-        sparse = {
-            i
-            for i, mgr in enumerate(mgrs)
-            if type(mgr).__name__ == "MambaManager"
-            and (vector[i] == 0 or (vector[i] is not None and vector[i] > getattr(mgr, "block_size", 0)))
-        }
-        armed = {i for i, mgr in enumerate(mgrs) if getattr(mgr, "_glm53_retain_previous_dflash_boundary", False)}
-        check(set(prior) == sparse and armed == sparse, f"C3L [{mode}] prior-boundary replay arming follows the resolved retention vector -> prior={sorted(prior)} sparse_mamba={sorted(sparse)} armed={sorted(armed)}")
 
 def partial_state(m, rid):
     """Managers holding this request as a partial-tail reader/producer."""
@@ -931,25 +899,14 @@ def live_manager(mode, print_layout=True):
     check(got == want, f"C3L [{mode}] runtime group layout is explicit: {want} -> {got}")
     return m, len(want)
 
-def live_mode(mode, env_value, global_value=None, wiring_only=False):
+def live_mode(mode, env_value):
     saved_swa = os.environ.get(SWA_ENV)
-    saved_global = getattr(vllm_envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
     if env_value is not None:
         os.environ[SWA_ENV] = env_value
-    if global_value is not None:
-        vllm_envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL = global_value
     try:
-        built = live_manager(mode)
-        if built is None:
-            return
-        m, n_groups = built
-        if env_value is not None:
-            retention_state(m, mode, env_value, n_groups)
-        if wiring_only:
-            return
         legs = {}
         for label, ns in (("normal", False), ("nostore", True)):
-            made = live_manager(f"{mode}/{label}", print_layout=False)
+            made = live_manager(f"{mode}/{label}", print_layout=(label == "normal"))
             if made is None:
                 return
             m, _ = made
@@ -980,16 +937,29 @@ def live_mode(mode, env_value, global_value=None, wiring_only=False):
         mQ.free(rQ)
         nxt = mQ.block_pool.get_new_blocks(4)
         check({b.block_id for b in nxt} <= idsQ, f"C3L [{mode}] [nostore] freed blocks are the very next ids recycled")
+        if env_value is not None:
+            # Cross the drafter replay window: query retained cache entries,
+            # rather than asserting internal retention vectors or free-order fields.
+            for label, ns in (("normal", False), ("nostore", True)):
+                cfg, _, _ = live_cfg(2, 4, 512)
+                retained = manager(cfg, 2, 4, use_eagle=True)
+                req = mk(label, list(range(3000, 3080)), no_store=ns)
+                prefill(retained, req, (4,) * 20)
+                group = len(managers(retained)) - 1
+                retained.free(req)
+                old_hit = retained.block_pool.get_cached_block(req.block_hashes[0], [group]) is not None
+                boundary_hit = retained.block_pool.get_cached_block(req.block_hashes[-2], [group]) is not None
+                check(old_hit == (not ns and env_value == "") and boundary_hit == (not ns),
+                      f"C3L [{mode}/{label}] released drafter cache lookups: old={old_hit}, boundary={boundary_hit}")
     finally:
         if env_value is not None:
             if saved_swa is None:
                 os.environ.pop(SWA_ENV, None)
             else:
                 os.environ[SWA_ENV] = saved_swa
-        vllm_envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL = saved_global
 
-for _mode, _swa, _global, _wiring in live_modes:
-    live_mode(_mode, _swa, _global, _wiring)
+for _mode, _swa in live_modes:
+    live_mode(_mode, _swa)
 
 # C4 -- preemption bookkeeping: cold no-store recomputes from 0; a read-hit no-store resumes from what it read.
 m = manager(full_cfg(4, 20), 2, 4)

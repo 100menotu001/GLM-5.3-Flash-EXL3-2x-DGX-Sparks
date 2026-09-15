@@ -138,10 +138,11 @@ still stages the pre-no-store `sampling_params.py` / `v1/request.py` / `v1/core/
 no-store patch to copies of them (the retention overlay leaves those anchors and their patch mechanics
 untouched), while Part C composes the real hybrid + per-group + no-store stack on the pinned runtime. Its
 live-shape legs run once with `VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA` unset (inherit the global policy), once
-with `"0"` (boundary-only retention for the EAGLE-exempt drafter group), and once more with `"0"` over a sparse
-global interval — a wiring-only leg in which the resolved vector arms the retained #130 prior-replay policy
-(which stays unarmed while the mamba groups are dense) — asserting the resolved per-group retention vector, the
-drafter-priority free queue wiring, and unchanged suppression / `num_cached_block` / recycling.
+with `"0"` (boundary-only retention for the EAGLE-exempt drafter group), proving hash suppression,
+unchanged per-group `num_cached_block` progression, normal-request follow-up hits and no-store recycling.
+An 80-token case crosses the drafter replay window and queries the released cache entries: the normal
+inherit leg retains old and boundary entries; explicit `"0"` retains only the boundary entry; no-store
+retains neither. These are cache-lookup checks, not assertions about internal retention vectors or free-order fields.
 `GLM53_REQUIRE_VLLM=1 GLM53_REQUIRE_COMPOSITION=1` make the composed Part C mandatory in-image.
 
 ### 2.3 Deliberately unchanged
