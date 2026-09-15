@@ -39,9 +39,9 @@ GLM53_MIXED_PREFILL_CHUNK:
 
 Fair knobs (read at runtime; identical on every rank):
   GLM53_FAIR_PREFILL_CHUNK            default 256 (probe size until timing samples exist)
-  GLM53_FAIR_PREFILL_SHARE            default 0.20 (credit accrual fraction)
+  GLM53_FAIR_PREFILL_SHARE            default 0.30 (credit accrual fraction)
   GLM53_FAIR_PREFILL_MAX_INTERVAL_MS  default 2000
-  GLM53_FAIR_PREFILL_MAX_STEP_MS      default 1000 (estimated mixed-step limit)
+  GLM53_FAIR_PREFILL_MAX_STEP_MS      default 2000 (estimated mixed-step limit)
   GLM53_FAIR_PREFILL_MAX_CHUNKS       default 1
 
 Versioned installer: `# [glm53-decode-floor:v5]`. v1 (no version), v2, v3
@@ -320,9 +320,9 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
         if self.chunk <= 0:
             self.chunk = 256
         try:
-            self.share = float(self._e("GLM53_FAIR_PREFILL_SHARE", "0.20"))
+            self.share = float(self._e("GLM53_FAIR_PREFILL_SHARE", "0.30"))
         except ValueError:
-            self.share = 0.20
+            self.share = 0.30
         self.share = min(1.0, max(0.0, self.share))
         try:
             self.interval_s = int(self._e("GLM53_FAIR_PREFILL_MAX_INTERVAL_MS", "2000")) / 1000.0
@@ -336,9 +336,9 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
             self.max_chunks = 1
         self.max_chunks = max(1, min(self.max_chunks, 16))
         try:
-            self.max_step_s = max(0.001, int(self._e("GLM53_FAIR_PREFILL_MAX_STEP_MS", "1000")) / 1000.0)
+            self.max_step_s = max(0.001, int(self._e("GLM53_FAIR_PREFILL_MAX_STEP_MS", "2000")) / 1000.0)
         except ValueError:
-            self.max_step_s = 1.0
+            self.max_step_s = 2.0
         if self.mode == "fair" and not self.logged_boot:
             print(
                 f"[glm53-decode-floor] fair v5 probe_chunk={self.chunk} "
