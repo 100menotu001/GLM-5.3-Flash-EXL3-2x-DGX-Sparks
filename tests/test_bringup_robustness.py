@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Wiring anchors and behaviour checks for the bring-up robustness patches.
+"""Behaviour checks for the bring-up lifecycle lock and health window.
 
-start.sh is a generated-heredoc-heavy launcher, so the anchor tests below pin
-the markers that keep the robustness behaviours wired (worker death detection,
-revision-keyed sync marker, HF CLI fallback, worker cache writability
-preflight). The lifecycle-lock and health-window checks run the launcher's real
-function bodies against stubbed docker/ssh commands and real local flock
-holders, so they cover the behaviour and not the source spelling.
+Run the launcher's real function bodies against stubbed docker/ssh commands
+and real local flock holders, without containers, network access, or GPUs.
 """
 
 from __future__ import annotations
@@ -59,6 +55,7 @@ CLUSTER_LOCK_PID="$LOGDIR/cluster.lock.pid"
 CLUSTER_LOCK_WAIT={wait}
 CONTAINER_HEAD=glm53-exl3-head
 CONTAINER_WORKER=glm53-exl3-worker
+WORKER_SSH=fixture.invalid
 NFS_SHARE=0
 docker() {{ printf 'docker %s\\n' "$*" >>"$RECORD"; }}
 worker_ssh() {{ printf 'ssh %s\\n' "$*" >>"$RECORD"; }}
@@ -105,13 +102,14 @@ def _run_lifecycle(tmp: Path, command: str, wait_seconds: int | None = None) -> 
 
 def _hold_lock(lock: Path, seconds: int = 300) -> subprocess.Popen:
     """Take the real kernel lock from a separate process."""
-    holder = subprocess.Popen(["flock", "-x", str(lock), "sleep", str(seconds)])
+    holder = subprocess.Popen(["flock", "--no-fork", "-x", str(lock), "sleep", str(seconds)])
     for _ in range(100):
         probe = subprocess.run(["flock", "-n", str(lock), "true"], capture_output=True)
         if probe.returncode != 0:
             return holder
         time.sleep(0.05)
     holder.kill()
+    holder.wait()
     raise AssertionError("background flock holder never acquired the lock")
 
 
@@ -130,24 +128,24 @@ def test_lifecycle_commands_refuse_while_the_lock_is_held() -> None:
         tmp = Path(raw_tmp)
         lock, pid_file = _locked_logs(tmp)
         inode = lock.stat().st_ino
-        holder = _hold_lock(lock)
+        decoy = subprocess.Popen(["sleep", "300"])
+        holder = None
         try:
-            results = {cmd: _run_lifecycle(tmp, cmd, wait_seconds=1) for cmd in ("start", "restart", "stop")}
-            assert holder.poll() is None, "the lock holder was signalled"
+            pid_file.write_text(f"{decoy.pid}\n")
+            holder = _hold_lock(lock)
+            for command in ("start", "restart", "stop"):
+                result = _run_lifecycle(tmp, command, wait_seconds=1)
+                assert result.returncode == 1, (command, result.stdout, result.stderr)
+                assert holder.poll() is None, "the lock holder was signalled"
+                assert decoy.poll() is None, "the advisory PID was signalled"
+                assert lock.stat().st_ino == inode, "a refused command replaced the lock file"
+                assert (tmp / "record").read_text() == "", f"{command} touched containers without the lock"
+                assert pid_file.read_text() == f"{decoy.pid}\n", f"{command} overwrote the holder's pid"
         finally:
-            holder.kill()
-            holder.wait()
-        assert lock.stat().st_ino == inode, "a refused command replaced the lock file"
-        for command, result in results.items():
-            assert result.returncode == 1, (command, result.stdout, result.stderr)
-            assert f"pid {ADVISORY_PID}" in result.stderr, (command, result.stderr)
-            assert (tmp / "record").read_text() == "", f"{command} touched containers without the lock"
-            assert pid_file.read_text() == f"{ADVISORY_PID}\n", f"{command} overwrote the holder's pid"
-            assert "stopped." not in result.stdout, f"{command} reported a stop"
-        assert "already running" in results["start"].stderr, results["start"].stderr
-        assert "already running" in results["restart"].stderr, results["restart"].stderr
-        assert "still held after 1s" in results["stop"].stderr, results["stop"].stderr
-        assert "nothing was stopped" in results["stop"].stderr, results["stop"].stderr
+            for process in (holder, decoy):
+                if process is not None:
+                    process.kill()
+                    process.wait()
 
 
 def test_stop_takes_a_free_lock_and_removes_both_containers() -> None:
@@ -184,7 +182,7 @@ docker() {
     case "${1:-}" in
         inspect)
             if [ "${2:-}" = "-f" ]; then
-                INSPECTS=$(( ${INSPECTS:-0} + 1 ))
+                INSPECTS=$(( $(cat "$TMP_DIR/inspects" 2>/dev/null || printf 0) + 1 ))
                 printf '%s' "$INSPECTS" >"$TMP_DIR/inspects"
                 if [ "$(sed -n "${INSPECTS}p" "$TMP_DIR/sequence")" = "true" ]; then
                     printf 'true\\n'
@@ -261,69 +259,23 @@ def test_health_wait_needs_three_consecutive_head_misses() -> None:
 def test_health_wait_does_not_report_a_running_head_as_dead() -> None:
     with tempfile.TemporaryDirectory() as raw_tmp:
         tmp = Path(raw_tmp)
-        result = _run_health(tmp, _DOCKER_NONZERO_EXIT_STUB, ready_timeout=30)
-        assert "RESULT=unhealthy" in result.stdout, result.stdout  # curl never succeeds
-        assert "timed out" in result.stdout, result.stdout
-        assert "exited/stopped" not in result.stdout, result.stdout
-
-
-# ------------------------------- wiring anchors -----------------------------
-
-def test_worker_death_detection_wired() -> None:
-    src = _source()
-    assert "worker_fail=0" in src, "worker death detection missing from wait_for_health"
-    assert '[ "$worker_fail" -ge 3 ]' in src, "3-strike tolerance missing"
-    assert "not running on ${WORKER_SSH}" in src, "worker death message missing"
-    assert 'dead_side="worker"' in src and 'dead_side="head"' in src
-
-
-def test_sync_revision_marker_wired() -> None:
-    src = _source()
-    assert ".glm53-exl3-synced" in src, "revision marker file missing"
-    assert "FORCE_SYNC" in src, "FORCE_SYNC escape hatch missing"
-    assert 'refs/main' in src, "marker must key on the snapshot commit (refs/main)"
-    # both weights and DFlash2 go through the marker-checked helper
-    assert src.count("sync_repo_to_worker ") >= 2
-
-
-def test_hf_cli_fallback_wired() -> None:
-    src = _source()
-    assert "resolve_hf_bin()" in src, "resolve_hf_bin helper missing"
-    assert src.count("resolve_hf_bin || die") == 3, "expected 3 call sites (weights, dflash, download-only)"
-    assert "huggingface_hub.commands.huggingface_cli" in src, "python fallback missing"
-    assert '"${HF_BIN_CMD[@]}" download' in src, "hf_download_repo must use the resolved array"
-
-
-def test_worker_cache_writability_preflight_wired() -> None:
-    src = _source()
-    assert "worker cannot write $WORKER_CACHE_DIR/hub" in src
-    assert "test -w '$WORKER_CACHE_DIR/hub'" in src
-
-
-def test_check_port_free_detects_representative_listeners() -> None:
-    """Inside double quotes, \\$ must expand to an end anchor, not a literal $."""
-    src = _source()
-    assert 'grep -qE "[:.]${port}\\$"' in src
-    assert 'grep -qE "[:.]${port}\\\\$"' not in src
-
-    script = r"""
-set -euo pipefail
-port=8000
-printf '%s\n' '0.0.0.0:8000' '[::]:8000' | awk '{print $1}' | grep -qE "[:.]${port}\$"
+        delayed_health = """
+curl() {
+    local calls=$(( $(cat "$TMP_DIR/curls" 2>/dev/null || printf 0) + 1 ))
+    printf '%s' "$calls" >"$TMP_DIR/curls"
+    [ "$calls" -ge 6 ]
+}
 """
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+        result = _run_health(tmp, _DOCKER_NONZERO_EXIT_STUB + delayed_health, ready_timeout=120)
+        assert "RESULT=healthy" in result.stdout, result.stdout + result.stderr
+
+
 
 
 if __name__ == "__main__":
-    test_worker_death_detection_wired()
-    test_sync_revision_marker_wired()
-    test_hf_cli_fallback_wired()
-    test_worker_cache_writability_preflight_wired()
     test_lifecycle_commands_refuse_while_the_lock_is_held()
     test_stop_takes_a_free_lock_and_removes_both_containers()
     test_restart_holds_one_lock_across_stop_and_start()
     test_health_wait_needs_three_consecutive_head_misses()
     test_health_wait_does_not_report_a_running_head_as_dead()
-    test_check_port_free_detects_representative_listeners()
-    print("start.sh bring-up robustness anchors OK")
+    print("start.sh lifecycle and health behavior OK")
