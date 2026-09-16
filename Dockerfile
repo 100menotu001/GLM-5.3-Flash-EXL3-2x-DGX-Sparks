@@ -522,6 +522,11 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_ablit.py \
     && python3 /opt/glm53/test_cache_reset_endpoint.py
 
+# Direct-I/O safetensors loader. --no-deps: a normal pip install pulls
+# nvidia-nccl-cu13==2.29.7 over this image's NCCL 2.30.7.
+RUN pip install --no-deps --no-cache-dir instanttensor==0.2.0 \
+    && python3 -c "import instanttensor; print('instanttensor', instanttensor.__file__)"
+
 # Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
 # misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.
 ARG GLM53_RECIPE_STAMP=unknown
