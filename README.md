@@ -585,6 +585,52 @@ a separate configuration; the all-zero results do not qualify it. See the
 [protocol, raw measurements, and limitations](docs/apc-retention-qualification.md)
 before selecting a policy or a cache budget for another kit.
 
+## Existing installs: pull the InstantTensor image
+
+`main` now defaults to
+`ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor`.
+**`git pull` does not switch the running containers or a leftover `.env`.**
+If `IMAGE` is still `:exl3`, or `.env` has `SKIP_PULL=1`, you stay on the
+wheel-less image and InstantTensor will not load.
+
+1. Update the kit:
+
+```bash
+git pull
+```
+
+2. Set these lines in `.env` (already the default in `.env.example`; do
+   the same in `.env.tp3` / `.env.tp4` if you use those):
+
+```
+IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
+LOAD_FORMAT=instanttensor
+```
+
+3. Pull that tag on the head and restart. `SKIP_BUILD=1` keeps the published
+   GHCR image (do not let a recipe-stamp mismatch rebuild from this
+   Dockerfile). `./start.sh` then pulls on the worker when GHCR is reachable,
+   otherwise it ships the digest over SSH:
+
+```bash
+SKIP_BUILD=1 ./start.sh restart
+```
+
+If `.env` has `SKIP_PULL=1`, override it for this restart:
+
+```bash
+SKIP_PULL=0 SKIP_BUILD=1 ./start.sh restart
+```
+
+Manual pull, then the same restart:
+
+```bash
+docker pull ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
+```
+
+Keep the wheel-less tag only if you also clear the loader:
+`IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` and `LOAD_FORMAT=`.
+
 ## Quick start (2× Spark)
 
 ```bash
@@ -622,7 +668,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies.
+2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies. Existing kits: see [Existing installs: pull the InstantTensor image](#existing-installs-pull-the-instanttensor-image) — `git pull` alone does not replace `:exl3`.
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. Put the cache on the worker: **`NFS_SHARE=1`** (this kit) mounts the head's
    HF cache read-only over NFSv4 on ConnectX; otherwise `rsync` a full copy to
@@ -932,7 +978,7 @@ that are now documented/enforced:
 | `MODEL` | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | Hub repo into the HF cache (mirror) |
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
-| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3` |
+| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Existing kits must pull this tag — `git pull` does not replace a leftover `:exl3` or `SKIP_PULL=1` ([Existing installs](#existing-installs-pull-the-instanttensor-image)). Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3` |
 | `LOAD_FORMAT` | `instanttensor` when `IMAGE` contains `instanttensor`; else empty | `--load-format`. Direct-I/O safetensors. Explicit empty (`LOAD_FORMAT=`) restores vLLM auto. Required empty on the wheel-less `:exl3` tag |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
@@ -1099,7 +1145,7 @@ docker build -t glm53-flash-sm121:local .
 # or: BUILD=1 ./start.sh
 ```
 
-`./start.sh` **rebuilds** from this Dockerfile when the image label `glm53.recipe.stamp` does not match the current overlay/Dockerfile hash — that is what makes a `git pull` pick up `exl3_fat_gemm` instead of staying on the public GHCR tag (which predates E2). `SKIP_BUILD=1` keeps GHCR. `BUILD=1` forces a rebuild. `SKIP_PULL=1` skips `docker pull` only.
+`./start.sh` **rebuilds** from this Dockerfile when the image label `glm53.recipe.stamp` does not match the current overlay/Dockerfile hash — that is what makes a `git pull` pick up `exl3_fat_gemm` instead of staying on the public GHCR tag (which predates E2). `SKIP_BUILD=1` keeps GHCR. `BUILD=1` forces a rebuild. `SKIP_PULL=1` skips `docker pull` only. To take the InstantTensor default without a local rebuild, set `IMAGE` to `:exl3-instanttensor` and restart with `SKIP_BUILD=1` ([Existing installs](#existing-installs-pull-the-instanttensor-image)).
 
 After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild `exllamav3_ext`.
 
