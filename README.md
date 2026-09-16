@@ -97,6 +97,23 @@ as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the l
 | **×1** | **268 ms** | **32.1** | **32.1** |
 | **×2** | 399 ms | 22.1 | 41.2 |
 
+### Opt-in cooperative decode MoE
+
+An optional decode-only cooperative EXL3 MoE overlay lives in
+[`extensions/cooperative_moe/`](extensions/cooperative_moe/). It specializes
+Turboderp's two-stage kernel for this recipe (H=4096, TP2 local I=1024, top-k 8,
+K4 MCG, 1–32 rows) and does **not** replace E3 prefill. Default image, launcher,
+and `overlay/exl3.py` stay stock until you select a generated overlay with
+`EXL3_OVERLAY_HOST`.
+
+Do not load the DS4.1 cooperative `.so` here. Serving measurements vs the
+tables above (prose ×1/×2 32.1 / 41.2 agg, structured ×1 62.9) are recorded
+after the GPU gate in [`docs/cooperative-moe.md`](docs/cooperative-moe.md).
+Live operator handoff (geometry 1, rollback, pins):
+[`docs/cooperative-moe-handoff.md`](docs/cooperative-moe-handoff.md).
+The two-node opt-in and rollback sequence is
+[`docs/cooperative-moe-quickstart.md`](docs/cooperative-moe-quickstart.md).
+
 ### Faster prose decode (opt-in, 2026-09-08)
 
 Two decode speed-ups ship in the overlay, both **off by default** (matched A/B/A at 131k and 850k, 8 runs per prompt, bootstrap 95 % CI; receipts in `logs/overnight-decode-20260907T224521Z/`):
