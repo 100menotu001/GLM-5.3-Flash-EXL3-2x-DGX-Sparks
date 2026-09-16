@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — opt-in cooperative decode MoE (geometry 1)
+
+Decode-only cooperative EXL3 MoE overlay (`extensions/cooperative_moe/`) for
+this TP2 recipe (H=4096, local I=1024, top-k 8, K4 MCG, 1–32 rows). Default
+image, launcher, and `overlay/exl3.py` stay stock until a generated overlay
+is selected with `EXL3_OVERLAY_HOST`. E3 grouped prefill is unchanged.
+
+On this 2× Spark kit, matched A/B/A serving (850k context, 14 GiB / 883,552-token
+FP8 KV): structured ×1 **72.03 → 77.29 tok/s** (+7.3%), structured ×2 aggregate
+**113.91 → 124.46 tok/s**. Isolated 32-row kernel: 1.183 → 0.997 ms. Further
+geometries did not beat geometry 1. Operator docs: `docs/astra-results.md`,
+`docs/cooperative-moe-handoff.md`.
+
 ## Unreleased — decode-floor installer restart idempotence
 
 `patch_scheduler_decode_floor.py` no longer rejects a healthy patched

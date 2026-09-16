@@ -380,6 +380,10 @@ GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 # Dense projections FP8 weight-only via Marlin (overlay/patch_dense_fp8.py). off = BF16 as shipped.
 # PROVISIONAL (changes target numerics; needs a KLD panel). Groups: shared,dense,kda,mla.
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
+# Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
+# Empty uses the adapter default (1). Must be identical on both ranks and set
+# before native prepare / CUDA-graph capture; it is not a live graph switch.
+GLM53_COOP_GEOMETRY="${GLM53_COOP_GEOMETRY:-}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # 1 = honour the per-request GPU prefix-cache no-store flag
@@ -649,6 +653,9 @@ validate_numeric_config() {
         echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
+    if [ -n "${GLM53_COOP_GEOMETRY:-}" ]; then
+        _glm53_validate_enum GLM53_COOP_GEOMETRY "$GLM53_COOP_GEOMETRY" 0 1 2 || return
+    fi
 }
 # GLM53 numeric config guard (end)
 
@@ -711,7 +718,7 @@ validate_overlay_artifacts() {
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
-    local entry path rest tag tail last
+    local entry path rest tag tail last stock_last
     if [ "${#artifacts[@]}" -eq 0 ]; then
         echo "overlay artifact list is empty - refusing to launch" >&2
         return 2
@@ -737,8 +744,24 @@ validate_overlay_artifacts() {
         # which must surface as the rc=2 diagnostic below, not a bare exit 1.
         last="$(grep -v '^[[:space:]]*$' "$path" | tail -n 1 || true)"
         if [ "$last" != "$tail" ]; then
-            echo "overlay artifact $path does not end with '$tail' (truncated copy? last line: '$last')" >&2
-            return 2
+            # Generated cooperative overlay appends an install footer after stock
+            # Exl3Config. Still require the stock closer in the body so a truncated
+            # copy cannot hide behind the footer.
+            if [ "$path" = "$EXL3_OVERLAY_HOST" ] && [[ "$last" == _coop_setup\[\"install\"\]* ]]; then
+                stock_last="$(python3 -c 'import sys
+p=[ln.rstrip("\n") for ln in open(sys.argv[1], encoding="utf-8")]
+while p and (not p[-1].strip() or p[-1].startswith("_coop_") or p[-1].startswith("import runpy as _coop") or p[-1].startswith("import sys as _coop") or p[-1].startswith("# Explicit fixed cooperative")):
+    p.pop()
+print(p[-1] if p else "")
+' "$path")"
+                if [ "$stock_last" != "$tail" ]; then
+                    echo "overlay artifact $path cooperative footer is present but stock closer is '$stock_last' (truncated copy?)" >&2
+                    return 2
+                fi
+            else
+                echo "overlay artifact $path does not end with '$tail' (truncated copy? last line: '$last')" >&2
+                return 2
+            fi
         fi
         # Parse-only: proves the file is importable Python without executing it
         # or leaving __pycache__ litter in the checkout.
@@ -1881,7 +1904,8 @@ launch_cluster() {
              DEFAULT_MAX_NEW_TOKENS MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
-             GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
+             GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
+             GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2062,6 +2086,7 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_SATURATE="$GLM53_ADAPTIVE_K_SATURATE" \
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
+        -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
         -e MODEL_DIR="$MODEL_DIR" \
         -e VLLM_API_KEY \
         -e EXTRA_ARGS="${EXTRA_ARGS:-}" \
