@@ -6,6 +6,9 @@ Decode-only cooperative EXL3 MoE overlay (`extensions/cooperative_moe/`) for
 this TP2 recipe (H=4096, local I=1024, top-k 8, K4 MCG, 1–32 rows). Default
 image, launcher, and `overlay/exl3.py` stay stock until a generated overlay
 is selected with `EXL3_OVERLAY_HOST`. E3 grouped prefill is unchanged.
+`start-tp3.sh` forwards `GLM53_COOP_GEOMETRY` and, with `start.sh`, copies
+`runtime.py` / `cooperative_moe.so` into every rank's vLLM cache so a generated
+overlay does not die on `FileNotFoundError` for `/root/.cache/vllm/cooperative_moe/runtime.py`.
 
 On this 2× Spark kit, matched A/B/A serving (850k context, 14 GiB / 883,552-token
 FP8 KV): structured ×1 **72.03 → 77.29 tok/s** (+7.3%), structured ×2 aggregate

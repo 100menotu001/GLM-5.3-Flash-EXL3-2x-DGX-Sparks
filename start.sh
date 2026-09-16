@@ -1757,6 +1757,45 @@ EOF
     chmod +x "$HEAD_SCRIPT" "$WORKER_SCRIPT"
 }
 
+_glm53_coop_overlay_selected() {
+    local last
+    [ -f "$EXL3_OVERLAY_HOST" ] || return 1
+    last="$(grep -v '^[[:space:]]*$' "$EXL3_OVERLAY_HOST" | tail -n 1 || true)"
+    [[ "$last" == _coop_setup\[\"install\"\]* ]]
+}
+
+_glm53_coop_src_dir() {
+    local dir
+    dir="$(dirname -- "$EXL3_OVERLAY_HOST")"
+    if [ -f "$dir/runtime.py" ] && [ -f "$dir/cooperative_moe.so" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    dir="$CACHE_ROOT/cooperative_moe"
+    if [ -f "$dir/runtime.py" ] && [ -f "$dir/cooperative_moe.so" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    return 1
+}
+
+# Generated overlay run_path's /root/.cache/vllm/cooperative_moe/runtime.py.
+# Copy adapter + .so into the worker host cache that is bind-mounted there.
+_glm53_stage_coop_runtime_worker() {
+    local src dest
+    _glm53_coop_overlay_selected || return 0
+    src="$(_glm53_coop_src_dir)" || die "cooperative overlay $EXL3_OVERLAY_HOST needs runtime.py and cooperative_moe.so beside it or in $CACHE_ROOT/cooperative_moe"
+    mkdir -p "$CACHE_ROOT/cooperative_moe"
+    if [ "$src" != "$CACHE_ROOT/cooperative_moe" ]; then
+        install -m 644 "$src/runtime.py" "$src/cooperative_moe.so" "$CACHE_ROOT/cooperative_moe/"
+        src="$CACHE_ROOT/cooperative_moe"
+    fi
+    dest="$WORKER_VLLM_CACHE/cooperative_moe"
+    worker_ssh "mkdir -p '$dest'"
+    scp -q -o BatchMode=yes "$src/runtime.py" "$src/cooperative_moe.so" "${WORKER_SSH}:${dest}/"
+    log "cooperative MoE runtime staged on worker (${dest})"
+}
+
 # ------------------------------- launch ------------------------------------
 launch_cluster() {
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || true
@@ -1798,6 +1837,7 @@ launch_cluster() {
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
+    _glm53_stage_coop_runtime_worker
 
     worker_ssh "rm -rf /tmp/glm53-ablit"
     scp -q -r -o BatchMode=yes "$SCRIPT_DIR/ablit" "${WORKER_SSH}:/tmp/glm53-ablit"
