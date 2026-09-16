@@ -1087,9 +1087,21 @@ def main() -> int:
     original = text
     if MARK_V5 in text:
         # Validate existing anchors/helper instead of trusting the marker alone.
-        clean = unpatch_v5(text)
-        if apply_v5(clean) != text:
+        # unpatch_v5 checks every v5 insertion occurs exactly once, strips the
+        # helper, and rejects leftover markers. The result is discarded: a
+        # later overlay may legitimately sit between the helper and the
+        # cuda_graph import anchor, so re-applying at that fixed anchor would
+        # relocate the helper and fail a byte-compare on a healthy file.
+        unpatch_v5(text)
+        # The import edit is part of the applied state; the byte-compare used
+        # to cover it implicitly.
+        if "import os\n" not in text.split("import time\n", 1)[0]:
+            raise SystemExit(f"{P}: v5 import drifted")
+        # The helper body must appear verbatim exactly once, wherever a
+        # subsequent overlay left it.
+        if text.count(_helper_text().strip()) != 1:
             raise SystemExit(f"{P}: v5 helper drifted")
+        compile(text, str(P), "exec")
         print(f"{P.name}: {MARK_V5} already present — verified")
         return 0
     if MARK_V4 in text:
