@@ -108,12 +108,26 @@ _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
+_cli_overlay="${EXL3_OVERLAY_HOST-}"
+_cli_dense_fp8="${GLM53_DENSE_FP8-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
+# TP=3 does not inherit ABLIT=1 from the 2-node .env. Opt in from .env.tp3
+# or ABLIT=1 on the command line.
+ABLIT=0
+# TP=3 does not inherit the 2-node EXL3 overlay. That path is the TP2 coop
+# adapter (wrong ABI). Set EXL3_OVERLAY_HOST in .env.tp3 (or on the command
+# line) to opt in to a TP3-generated overlay.
+unset EXL3_OVERLAY_HOST
+# FAST/FAT (#182) stay on start.sh (TP=2) only.
+unset GLM53_EXL3_MOE_FAST
+unset GLM53_KDA_FP8_FAT
 # TP=3 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp3"
+unset GLM53_EXL3_MOE_FAST
+unset GLM53_KDA_FP8_FAT
 set +a
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
@@ -140,6 +154,8 @@ set +a
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
+[ -n "${_cli_overlay}" ] && EXL3_OVERLAY_HOST="$_cli_overlay"
+[ -n "${_cli_dense_fp8}" ] && GLM53_DENSE_FP8="$_cli_dense_fp8"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"
@@ -948,6 +964,8 @@ preflight() {
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
+    [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
+    [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
     [ -f "$SCRIPT_DIR/ablit/LAYER_MAP.json" ] || die "$SCRIPT_DIR/ablit/LAYER_MAP.json missing"
@@ -2269,7 +2287,7 @@ start() {
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} adaptive-k=${GLM53_ADAPTIVE_K} set=${GLM53_ADAPTIVE_K_SET} alpha=${GLM53_ADAPTIVE_K_ALPHA} dense_fp8=${GLM53_DENSE_FP8} coop_geometry=${GLM53_COOP_GEOMETRY:-} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} adaptive-k=${GLM53_ADAPTIVE_K} set=${GLM53_ADAPTIVE_K_SET} alpha=${GLM53_ADAPTIVE_K_ALPHA} dense_fp8=${GLM53_DENSE_FP8} overlay=${EXL3_OVERLAY_HOST} coop_geometry=${GLM53_COOP_GEOMETRY:-} flashkda=${HAREM_KDA_FLASHKDA} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED}"
 
     launch_cluster
     if wait_for_health; then

@@ -99,6 +99,24 @@ class BundleTests(unittest.TestCase):
         self.assertIn('stage_bundle.py',source)
         subprocess.run(['bash','-n',str(ROOT/'start-tp3.sh')],check=True)
 
+    def test_tp3_keeps_208_without_182_and_ablit_off(self):
+        source = (ROOT / 'start-tp3.sh').read_text()
+        self.assertIn('\nABLIT=0\n', source)
+        self.assertIn('unset EXL3_OVERLAY_HOST', source)
+        self.assertIn('unset GLM53_EXL3_MOE_FAST', source)
+        self.assertIn('unset GLM53_KDA_FP8_FAT', source)
+        self.assertNotIn('GLM53_EXL3_MOE_FAST="${GLM53_EXL3_MOE_FAST-0}"', source)
+        self.assertNotIn('-e GLM53_KDA_FP8_FAT=', source)
+        self.assertIn('HAREM_KDA_FLASHKDA="${HAREM_KDA_FLASHKDA:-0}"', source)
+        example = (ROOT / '.env.tp3.example').read_text()
+        self.assertIn('ABLIT=0', example.splitlines())
+        self.assertIn('GLM53_APC_RETENTION_INTERVAL_SWA=0', example.splitlines())
+        self.assertNotIn('GLM53_KDA_FP8_FAT', example)
+        start = (ROOT / 'start.sh').read_text()
+        self.assertIn('\nABLIT=0\n', start)
+        self.assertNotIn('HAREM_KDA_FLASHKDA', start)
+        self.assertNotIn('patch_flashkda_tp3.py', start)
+
     def test_profile_covers_adaptive_rows(self):
         text=(ROOT/'examples/tp3-throughput.env').read_text()
         graph_line=next(x for x in text.splitlines() if x.startswith('EXTRA_ARGS='))
