@@ -6,6 +6,27 @@ Versions **1.0.0–1.5.0** are retrospective SemVer labels over merged `main` hi
 There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a release.
 Dates are merge dates on `MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`.
 
+## [Unreleased]
+
+TP3 cooperative ABI2 plus opt-in FlashKDA. ABLIT stays off.
+
+### Added
+
+- Opt-in TP3 expert-parallel cooperative kernel (ABI2, 32/64-row) and
+  FlashKDA prefill adaptation (`HAREM_KDA_FLASHKDA`, default 0) on
+  `start-tp3.sh` only. Incomplete ABI2 bundles are refused before restart
+  teardown. (#208)
+- Staging of verified TP3 bundles on all ranks; optional
+  `examples/tp3-throughput.env` profile.
+
+### Changed
+
+- `start-tp3.sh` forces `ABLIT=0` after sourcing `.env` (opt in with
+  `ABLIT=1 ./start-tp3.sh` or `ABLIT=1` in `.env.tp3`). It does not inherit
+  the TP2 `EXL3_OVERLAY_HOST` or FAST/FAT flags. #207 SWA retention stays.
+- `start.sh` also forces `ABLIT=0` after `.env`; `ABLIT=1 ./start.sh` still
+  opts in.
+
 ## [1.5.0] — 2026-09-17
 
 Cooperative decode MoE (geometry 1) plus DFlash prefix-cache retention on TP3/TP4.
