@@ -16,6 +16,13 @@ FP8 KV): structured ×1 **72.03 → 77.29 tok/s** (+7.3%), structured ×2 aggreg
 geometries did not beat geometry 1. Operator docs: `docs/astra-results.md`,
 `docs/cooperative-moe-handoff.md`.
 
+## Unreleased — TP3/TP4 DFlash prefix-cache retention
+
+`start-tp3.sh` and `start-tp4.sh` apply `patch_apc_per_group_retention.py` and
+forward `GLM53_APC_RETENTION_INTERVAL_SWA`. Explicit `0` keeps only the drafter
+window boundary so a finished long chat is not evicted by hashed skipped DFlash
+blocks. MLA/mamba stay dense. Examples set `GLM53_APC_RETENTION_INTERVAL_SWA=0`.
+
 ## Unreleased — decode-floor installer restart idempotence
 
 `patch_scheduler_decode_floor.py` no longer rejects a healthy patched
