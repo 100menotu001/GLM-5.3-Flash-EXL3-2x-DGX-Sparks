@@ -29,6 +29,25 @@ def create(root):
     (root / "manifest.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def verify_artifacts(root):
+    root = root.resolve()
+    data = json.loads((root / "manifest.json").read_text())
+    if data.get("schema") != 1 or data.get("contract", {}).get("abi") != 2:
+        raise RuntimeError("expected TP3 ABI2 manifest")
+    files = data["files"]
+    if not {"runtime.py", "cooperative_moe.so", "dispatch_policy.json"} <= files.keys():
+        raise RuntimeError("incomplete manifest")
+    for relative, expected in files.items():
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root) or digest(path) != expected:
+            raise RuntimeError(f"artifact missing, changed or outside bundle: {relative}")
+    policy = json.loads((root / "dispatch_policy.json").read_text())
+    if policy.get("native_sha256") != files["cooperative_moe.so"]:
+        raise RuntimeError("reprofile this native binary before preparing a serving overlay")
+    return data
+
+
 if __name__ == "__main__":
     action, directory = sys.argv[1:]
-    {"verify-sources": verify_sources, "create": create}[action](Path(directory))
+    {"verify-sources": verify_sources, "create": create,
+     "verify-artifacts": verify_artifacts}[action](Path(directory))
