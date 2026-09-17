@@ -27,6 +27,9 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
 
+Release notes from the initial 1.0.0 recipe through **1.5.0** are in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
 
 `EXL3_FAT_GROUPED=1` (launcher default since 2026-09-07) replaces the E2 per-expert host loop for "fat" experts with three
