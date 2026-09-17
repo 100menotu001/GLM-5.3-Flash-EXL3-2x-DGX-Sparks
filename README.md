@@ -32,7 +32,7 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
 
-Release notes from the initial 1.0.0 recipe through **1.5.0** are in
+Release notes from the initial 1.0.0 recipe through **1.6.0** are in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
@@ -96,14 +96,20 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 
 That 2026-08-28 decode serve used `--max-model-len 1000000` with a **1,754,237-token** KV pool. These runs are warm / empty KV — they do not need a filled 1M cache.
 
-**Prose** (sparkDash Decode bench, prose prompt type, 2026-09-08) on the adaptive-verification + FP8-dense serve
-(`GLM53_ADAPTIVE_K=ema`, `GLM53_DENSE_FP8=dense,kda`, 850k context, KV pool capped at 14 GiB — turned on
-as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the lab prose prompts):
+**Prose** (sparkDash Decode bench, prose prompt type, 2026-09-17, thinking
+**off**) on this 2× kit (`GLM53_ADAPTIVE_K=ema`, `GLM53_DENSE_FP8=dense,kda`,
+cooperative MoE overlay, 850k context, KV pool capped at 14 GiB). Stream is
+per request; aggregate is all streams.
 
 | Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
 |---|---:|---:|---:|
-| **×1** | **268 ms** | **32.1** | **32.1** |
-| **×2** | 399 ms | 22.1 | 41.2 |
+| **×1** | **333 ms** | **36.1** | **37.1** |
+| **×2** | 365 ms | 25.0 | 51.1 |
+| **×3** | 405 ms | 22.3 | 65.8 |
+| **×4** | 401 ms | 19.4 | 75.3 |
+
+The 2026-09-08 adaptive-k + dense-FP8 table (no coop overlay in that write-up)
+was ×1 **32.1** / ×2 **22.1** stream (**41.2** agg), TTFT 268 / 399 ms.
 
 ### Opt-in cooperative decode MoE
 
@@ -115,7 +121,7 @@ and `overlay/exl3.py` stay stock until you select a generated overlay with
 `EXL3_OVERLAY_HOST`.
 
 Do not load the DS4.1 cooperative `.so` here. Serving measurements vs the
-tables above (prose ×1/×2 32.1 / 41.2 agg, structured ×1 62.9) are recorded
+tables above (prose ×1 **37.1** / ×2 **51.1** agg, structured ×1 62.9) are recorded
 after the GPU gate in [`docs/cooperative-moe.md`](docs/cooperative-moe.md).
 Live operator handoff (geometry 1, rollback, pins):
 [`docs/cooperative-moe-handoff.md`](docs/cooperative-moe-handoff.md).
@@ -829,11 +835,21 @@ reordering `NCCL_IB_HCA` does not help (NCCL enumerates devices in system
 order). Put the control plane on the management LAN (`SOCKET_IFNAME`); keep
 data on RoCE via `NCCL_IB_HCA`.
 
-Decode on this kit (2026-09-14, temp 0, thinking off, 400 tok, median of 3;
-count / hashmap / LRU-code): structured **87.8**, code **54.9**, prose **39.6**,
-TTFT **0.25 s**. Same prompts, TP=2: 73.4 / 45.0 / 32.9 / 0.33 s. jspark3's
-3× stack is still ahead on structured (~95 tok/s) — `DFLASH_DRAFT_TP=1` is the
-divisibility tax.
+**Prose** (sparkDash Decode bench, 2026-09-17, thinking **off**, 512 tok,
+1–4 concurrent) on this 3× kit:
+
+| Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
+|---|---:|---:|---:|
+| **×1** | **255 ms** | **40.1** | **40.1** |
+| **×2** | 411 ms | 28.7 | 56.6 |
+| **×3** | 323 ms | 25.5 | 75.5 |
+| **×4** | 351 ms | 22.8 | 88.4 |
+
+Earlier lab medians on this kit (2026-09-14, temp 0, thinking off, 400 tok,
+median of 3; count / hashmap / LRU-code): structured **87.8**, code **54.9**,
+prose **39.6**, TTFT **0.25 s**. Same prompts, TP=2: 73.4 / 45.0 / 32.9 / 0.33 s.
+jspark3's 3× stack is still ahead on structured (~95 tok/s) —
+`DFLASH_DRAFT_TP=1` is the divisibility tax.
 
 Shape overlays and the two EP loader traps: [`overlay/tp3/README.md`](overlay/tp3/README.md).
 The flags and overlays come from
