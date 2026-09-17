@@ -19,7 +19,8 @@ isolated cooperative-kernel gains. This branch starts at upstream `6961fa0`.
   rows for adaptive DFlash 2/4/7, shared/MLA FP8, InstantTensor and fair-prefill
   settings. Requires a separately prepared, qualified cooperative bundle.
 - The launcher stages the complete ABI2 manifest bundle on every rank. The
-  existing two-file TP2 adapter path is retained. Latest upstream SWA retention
+  existing two-file TP2 adapter path is retained. Missing ABI2 manifests are
+  rejected during preflight, before a restart can stop an existing engine. Latest upstream SWA retention
   support is preserved; selecting a different retention policy is a separate
   behavioral change.
 

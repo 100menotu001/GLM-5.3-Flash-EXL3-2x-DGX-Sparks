@@ -64,6 +64,31 @@ class BundleTests(unittest.TestCase):
             stock=Path(tmp)/'stock.py';stock.write_text('pass')
             with self.assertRaisesRegex(ValueError,'source changed'):prepare_profile.prepare(stock,Path(tmp))
 
+    def test_abi2_missing_manifest_refused_before_cache_fallback(self):
+        source = (ROOT / 'start-tp3.sh').read_text()
+        helpers = source.split('_glm53_coop_src_dir() {', 1)[1].split('_tp3_stage_coop_runtime() {', 1)[0]
+        script = '_glm53_coop_src_dir() {' + helpers + '\n_glm53_coop_src_dir\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle, cache = root/'bundle', root/'cache'
+            bundle.mkdir(); (cache/'cooperative_moe').mkdir(parents=True)
+            self.bundle(bundle)
+            overlay = prepare_profile.prepare(ROOT/'overlay/exl3.py', bundle)
+            self.bundle(cache/'cooperative_moe')
+            env = dict(os.environ, EXL3_OVERLAY_HOST=str(overlay), CACHE_ROOT=str(cache))
+            def resolve():
+                return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
+            self.assertEqual(resolve().stdout.strip(), str(bundle))
+            (bundle/'manifest.json').unlink()
+            result = resolve()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('complete manifest bundle', result.stderr)
+            self.assertEqual(result.stdout, '')
+            (bundle/'runtime.py').unlink()
+            self.assertNotEqual(resolve().returncode, 0)
+            overlay.write_text('# legacy adapter\n_coop_setup["install"]()\n')
+            self.assertEqual(resolve().stdout.strip(), str(cache/'cooperative_moe'))
+
     def test_rank_wiring(self):
         source=(ROOT/'start-tp3.sh').read_text()
         self.assertEqual(source.count('python3 /opt/glm53/patch_flashkda_tp3.py --root'),2)

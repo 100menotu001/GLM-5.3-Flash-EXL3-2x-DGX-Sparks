@@ -1754,6 +1754,16 @@ _glm53_coop_overlay_selected() {
 _glm53_coop_src_dir() {
     local dir
     dir="$(dirname -- "$EXL3_OVERLAY_HOST")"
+    if grep -Fq '# Explicit TP3 ABI2 cooperative adapter; complete manifest required on all ranks.' "$EXL3_OVERLAY_HOST"; then
+        # ABI2 is an explicit bundle: never substitute a stale cache or silently
+        # downgrade to the legacy two-file path when its manifest is missing.
+        if [ ! -f "$dir/manifest.json" ] || [ ! -f "$dir/runtime.py" ] || [ ! -f "$dir/cooperative_moe.so" ]; then
+            echo "TP3 ABI2 overlay requires a complete manifest bundle beside it" >&2
+            return 1
+        fi
+        printf '%s\n' "$dir"
+        return 0
+    fi
     if [ -f "$dir/runtime.py" ] && [ -f "$dir/cooperative_moe.so" ]; then
         printf '%s\n' "$dir"
         return 0

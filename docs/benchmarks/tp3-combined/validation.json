@@ -2,7 +2,7 @@
   "scope": "CPU checks on upstream-based contribution; historical GPU evidence is separate",
   "passed": {
     "focused_pytest": {
-      "tests": 29,
+      "tests": 30,
       "subtests": 8
     },
     "tp3_dispatch_stub_checks": 90,
