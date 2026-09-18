@@ -26,10 +26,12 @@ def row(gap, swap=False):
             "a" if swap else "b": {"logprob": -gap-z}}
 
 
-def receipt(rows):
-    return {"model": "synthetic-model", "texts": {"probe": {
-        "mode": "prompt_logprobs", "prompt_sha256": "a"*64,
-        "positions": [None] + rows}}}
+def receipt(rows, top_k=2):
+    rec = {"mode": "prompt_logprobs", "prompt_sha256": "a"*64,
+           "positions": [None] + rows}
+    if top_k is not None:
+        rec["prompt_logprobs_k"] = top_k
+    return {"model": "synthetic-model", "texts": {"probe": rec}}
 
 
 class NumericalPanelTests(unittest.TestCase):
@@ -196,6 +198,65 @@ class NumericalPanelTests(unittest.TestCase):
                 "b": {"logprob": math.log(.8)}, "c": {"logprob": math.log(.1)}}
         self.assertEqual(self.compare(self.save("near.json", near)).returncode, 0)
         self.assertEqual(self.compare(self.save("far.json", far)).returncode, 1)
+
+    def test_top20_plus_observed_does_not_invent_separation(self):
+        # Each mapping is top-20 plus (optionally) the observed prompt token.
+        # Omitted mass can be spread over 100 tail tokens below the boundary.
+        stock = {"observed": .001*.23/.35, "a": .032, "b": .023,
+                 **{f"x{i}": .022 for i in range(18)}}
+        candidate = {"observed": .001, "b": .035, "c": .034,
+                     **{f"x{i}": .022*.35/.23 for i in range(18)}}
+        for present in (False, True):
+            s, c = dict(stock), dict(candidate)
+            if present:
+                # The observed token is now a itself: inside stock top-k, but
+                # outside candidate top-k. Its actual shift is only .06454 nats.
+                del s["observed"]
+                del c["observed"]
+                c["a"] = .030
+            for top_k in (20, None):  # recorded k and recoverable legacy capture
+                with self.subTest(reference_present=present, top_k=top_k):
+                    sr = {k: {"logprob": math.log(v)} for k, v in s.items()}
+                    cr = {k: {"logprob": math.log(v)} for k, v in c.items()}
+                    sp = self.save("top20-stock.json", receipt([sr, sr], top_k))
+                    cp = self.save("top20-candidate.json", receipt([cr, cr], top_k))
+                    cal = str(self.root/"top20-cal.json")
+                    self.assertEqual(self.cli("calibrate", "--out", cal, sp, sp, sp, sp).returncode, 0)
+                    result = self.compare(cp, cal, stock=[sp])
+                    # Present a adds real shared-support KL, so that case
+                    # legitimately flags KL. Neither layout justifies separation.
+                    self.assertEqual(result.returncode, int(present), result.stdout + result.stderr)
+                    report = next(line.split() for line in result.stdout.splitlines()
+                                  if line.startswith("probe "))
+                    self.assertEqual(int(report[6]), 0)  # observable separation count
+
+    def test_censored_consensus_tie_does_not_impute_observed_floor(self):
+        def distribution(values):
+            return {k: {"logprob": math.log(v)} for k, v in values.items()}
+        # One vote each. Neither tied token is present in the other's capture.
+        # Moving the extra observed token cannot choose the winner of that tie.
+        for observed in (.001, .02):
+            a = receipt([distribution({"a": .4, "x": .3, "observed": .01})])
+            b = receipt([distribution({"b": .5, "x": .3, "observed": observed})])
+            parsed = [panel.parsed_texts(r)["probe"] for r in (a, b)]
+            self.assertEqual(panel._candidate_argmax(parsed, 0), "a")
+            self.assertEqual(panel._candidate_argmax(list(reversed(parsed)), 0), "a")
+        # When both tied tokens are observed everywhere, their actual mean
+        # logprobs (rather than lexicographic order) choose b.
+        a = receipt([distribution({"a": .4, "b": .3})])
+        b = receipt([distribution({"b": .5, "a": .1})])
+        self.assertEqual(panel._candidate_argmax(
+            [panel.parsed_texts(r)["probe"] for r in (a, b)], 0), "b")
+
+    def test_invalid_boundary_and_provenance_are_unqualified(self):
+        bad = copy.deepcopy(self.base)
+        bad["texts"]["probe"]["prompt_logprobs_k"] = 20  # only two entries
+        self.assertEqual(self.compare(self.save("bad-width.json", bad)).returncode, 2)
+        cal = json.loads(Path(self.cal).read_text())
+        for count, hashes in ((0, []), (4, []), (4, ["not-a-hash"]*4)):
+            with self.subTest(count=count, hashes=hashes):
+                cal["stock_captures"], cal["inputs_sha256"] = count, hashes
+                self.assertEqual(self.compare(calibration=self.save("bad-provenance.json", cal)).returncode, 2)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,12 @@ with 2. Separation flags at two positions (one if only one is eligible).
 Standardizing BEFORE averaging prevents noisy positions inflating a global
 KL allowance. The 1e-12 floor is numerical slack, not a quality tolerance.
 These are screening heuristics, not significance tests or evidence of equivalence.
+Missing-token bounds respect vLLM's top-k PLUS at most one observed-token
+mapping. New captures record k. Without k, the second-smallest logprob is a
+conservative upper bound (the smallest may be the extra observed token).
+Consensus vote ties use mean logprob only with complete evidence; otherwise
+they break lexicographically, without imputing a censored value as an observation.
+
 In particular the selected CONF population has zero observed flips by
 construction: its rule-of-three-style count allowance has no claimed coverage.
 The fuller PR #182 study was formally INCONCLUSIVE for both candidate arms.
@@ -124,6 +130,24 @@ def parse_position(pos) -> tuple[dict, dict, str, float]:
     return probs, logs, argmax, margin
 
 
+def _missing_logprob_bound(logs: dict, top_k: int | None) -> float:
+    """Upper bound, not an imputed logprob, for an omitted token.
+
+    vLLM append_logprobs_for_next_position inserts the observed token and then
+    all top-k tokens, deduplicating overlap. At most ONE entry is outside top-k.
+    Thus without recorded k, dropping the lowest entry gives a safe (possibly
+    loose) bound for either layout. Never infer k from the mapping's width.
+    """
+    ordered = sorted(logs.values(), reverse=True)
+    if top_k is None:
+        if len(ordered) < 2:
+            raise ValueError("no justified missing-token boundary")
+        return ordered[-2]
+    if type(top_k) is not int or top_k < 1 or len(ordered) not in (top_k, top_k + 1):
+        raise ValueError("position width does not establish the declared top-k boundary")
+    return ordered[top_k - 1]
+
+
 def kl_shared(ax: dict, by: dict) -> float:
     keys = sorted(ax.keys() & by.keys())
     if not keys or any(ax[k] <= 0 or by[k] <= 0 for k in keys):
@@ -176,12 +200,13 @@ def _validate_texts(receipt: dict) -> dict:
     return texts
 
 
-def _validate_positions(positions) -> None:
+def _validate_positions(positions, top_k: int | None = None) -> None:
     if (not isinstance(positions, list) or len(positions) < 2
             or positions[0] is not None):
         raise ValueError("positions require a leading null and scored tokens")
     for position in positions[1:]:
-        parse_position(position)
+        _, logs, _, _ = parse_position(position)
+        _missing_logprob_bound(logs, top_k)
 
 
 def load_receipt(path: str) -> dict:
@@ -189,7 +214,7 @@ def load_receipt(path: str) -> dict:
     for name, rec in _validate_texts(receipt).items():
         if rec.get("mode") != "prompt_logprobs":
             raise ValueError(f"{path}/{name}: unqualified capture mode")
-        _validate_positions(rec.get("positions"))
+        _validate_positions(rec.get("positions"), rec.get("prompt_logprobs_k"))
     return receipt
 
 
@@ -197,6 +222,13 @@ def load_calibration(path: str) -> dict:
     cal = _load_object(path)
     if cal.get("schema") != SCHEMA:
         raise ValueError("calibration schema differs; recalibrate with this version")
+    count, hashes = cal.get("stock_captures"), cal.get("inputs_sha256")
+    if (type(count) is not int or count < MIN_STOCK_CAPTURES
+            or not isinstance(hashes, list) or len(hashes) != count
+            or any(not isinstance(h, str) or len(h) != 64
+                   or any(c not in "0123456789abcdef" for c in h) for h in hashes)):
+        raise ValueError("invalid calibration input provenance")
+    # This validates metadata consistency, not independence or source authenticity.
     for name, rec in _validate_texts(cal).items():
         n = rec.get("positions")
         classes = rec.get("classes")
@@ -236,7 +268,8 @@ def parsed_texts(receipt: dict) -> dict:
         rows = []
         for pos in rec["positions"][1:]:
             probs, logs, argmax, margin = parse_position(pos)
-            rows.append((probs, logs, argmax, margin))
+            bound = _missing_logprob_bound(logs, rec.get("prompt_logprobs_k"))
+            rows.append((probs, logs, argmax, margin, bound))
         out[name] = rows
     return out
 
@@ -246,11 +279,12 @@ def parsed_texts(receipt: dict) -> dict:
 def capture(out: str) -> int:
     res = {"base": BASE, "model": MODEL, "texts": {}}
     for name, text in TEXTS.items():
-        rec = {"prompt_chars": len(text), "prompt_sha256": hashlib.sha256(text.encode()).hexdigest()}
+        rec = {"prompt_chars": len(text), "prompt_sha256": hashlib.sha256(text.encode()).hexdigest(),
+               "prompt_logprobs_k": 20}
         try:
             status, d = _post("/v1/completions", {
                 "model": MODEL, "prompt": text, "max_tokens": 1, "temperature": 0,
-                "echo": True, "logprobs": 1, "prompt_logprobs": 20,
+                "echo": True, "logprobs": 1, "prompt_logprobs": rec["prompt_logprobs_k"],
             })
             if status != 200 or not isinstance(d, dict):
                 raise ValueError("invalid completion response")
@@ -259,7 +293,7 @@ def capture(out: str) -> int:
                     or not isinstance(choices[0], dict)):
                 raise ValueError("missing completion choice")
             pl = choices[0].get("prompt_logprobs")
-            _validate_positions(pl)
+            _validate_positions(pl, rec["prompt_logprobs_k"])
         except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
             print(f"{name}: capture request failed ({exc}); capture is unqualified",
                   file=sys.stderr)
@@ -377,8 +411,8 @@ def calibrate(out: str, inputs: list[str]) -> int:
 def _candidate_argmax(rows: list, i: int) -> str:
     """Deterministic candidate-consensus argmax at position i.
 
-    Counts ties break on the highest mean logprob and then lexicographically, so
-    the verdict never depends on set iteration order or Python's hash seed.
+    Vote ties use mean logprob only when ALL tied tokens occur in ALL captures.
+    Otherwise use lexicographic order: censored bounds are not observations.
     """
     counts: dict[str, int] = {}
     # Rank tied tokens by their mean over ALL captures, not only winning votes.
@@ -389,8 +423,9 @@ def _candidate_argmax(rows: list, i: int) -> str:
     tied = sorted(tok for tok, count in counts.items() if count == best)
     if len(tied) == 1:
         return tied[0]
-    means = {tok: math.fsum(r[i][1].get(tok, min(r[i][1].values())) for r in rows) / len(rows)
-             for tok in tied}
+    if any(tok not in r[i][1] for tok in tied for r in rows):
+        return tied[0]
+    means = {tok: math.fsum(r[i][1][tok] for r in rows) / len(rows) for tok in tied}
     return max(tied, key=means.get)
 
 
@@ -468,9 +503,9 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             svals = [r[i][1].get(cons[i]) for r in rows_a]
             if any(v is None for v in svals):
                 return _unqualified(ValueError(f"{name}/{i}: incomplete stock reference"))
-            # Absence from top-k is censored: logprob <= this capture's minimum,
-            # not -infinity. Use bounds in each direction, never drop captures.
-            c_hi = [r[i][1].get(cons[i], min(r[i][1].values())) for r in rows_b]
+            # The kth boundary excludes any extra low-probability observed
+            # prompt token. All candidate captures, including absences, contribute.
+            c_hi = [r[i][1].get(cons[i], r[i][4]) for r in rows_b]
             c_lo = [r[i][1].get(cons[i], -math.inf) for r in rows_b]
             tau_gate = max(MARGIN_FLOOR, tc["stock_spread_by_position"][i])
             if (min(svals) - max(c_hi) > tau_gate
@@ -565,7 +600,8 @@ def _synthetic(seed: int, flips: dict[str, int], kl_boost: float,
             for value in row.values():
                 value["logprob"] -= normalizer
         texts[name] = {"prompt_sha256": hashlib.sha256(TEXTS[name].encode()).hexdigest(),
-                       "mode": "prompt_logprobs", "positions": [None] + rows}
+                       "mode": "prompt_logprobs", "prompt_logprobs_k": 3,
+                       "positions": [None] + rows}
     return {"model": MODEL, "texts": texts}
 
 
