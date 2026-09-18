@@ -9,6 +9,43 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in SM121 **thin-decode** kernels for the EXL3 routed experts
+  (`GLM53_EXL3_MOE_FAST`, default `0`): `overlay/patch_exl3_decode_pipeline.py`
+  adds two K4/N256 fast kernels (shared / independent gate-up input transform)
+  and a `glm53_fast_moe_version` symbol to `exllamav3_ext` at image build time,
+  and the patched native host dispatch selects them only for K == 4,
+  N256-compatible dimensions and SM121 when the flag is literally `1`.
+  `overlay/exl3.py` adds the load-time gate and, in fast mode only, the gate/up
+  SUH pointer alias that carries the transform-reuse proof; the alias needs the
+  all-expert `torch.equal` comparison of the packed SUH scales. With the flag
+  off the module builds the same pointer tables and runs the same stock kernels
+  as before. `FAST=1` fails closed at model load when the image has no native
+  kernels or the fused `exl3_moe` path is unavailable, and the launcher rejects
+  anything but `0`/`1` before `restart` stops the pair. TP=2 `start.sh` only;
+  `start-tp3.sh` keeps unsetting it. Split out of #182 and rebased onto the
+  current `main`.
+  Kernel evidence (exact head, author-reported under #182): 119/119 parity
+  cases at rel RMSE ~1e-8, 0 `compute-sanitizer` errors, 0 local-memory reloads
+  in the fast kernel vs 39 in stock, +8–17% layer latency. Serving speed
+  (+4.8–8.4% decode A/B, A2 within ±2.4%) is historical at the pre-rebase head;
+  a comparison against current `main` is pending. The hash-frozen numerical
+  study is formally **inconclusive** — both predeclared control self-tests (the
+  absolute-KL gate and the tau-transfer bound) fail on unchanged stock repeats —
+  so this stays opt-in; see `docs/sm121-perf-paths.md`.
+
+### Changed
+
+- Repinned the cooperative-MoE profile generators' `overlay/exl3.py` digest
+  (`extensions/cooperative_moe/prepare_profile.py` and
+  `extensions/cooperative_moe/tp3/prepare_profile.py`) after reviewing the
+  thin-decode additions above. With `GLM53_EXL3_MOE_FAST` unset — the launcher
+  default, and what `start-tp3.sh` enforces by unsetting it — the module builds
+  the same pointer tables and takes the same paths it did before, so a generated
+  TP2/TP3 adapter is unchanged, and both generators still refuse any other
+  content. `docs/cooperative-moe-handoff.md` records the new pin.
+
 ## [1.6.0] — 2026-09-17
 
 TP3 ABI2 cooperative MoE and opt-in FlashKDA, ABLIT off, and new sparkDash
