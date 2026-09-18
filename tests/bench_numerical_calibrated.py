@@ -278,8 +278,14 @@ def calibrate(out: str, inputs: list[str]) -> int:
         if n_conf == 0:
             print(f"UNQUALIFIED: {name} has no confident positions at m*={m_star}")
             return 2
-        f = sum(disagree[i] for i in conf)  # 0 by construction, kept explicit
-        r_up = 3.0 / n_conf if f == 0 else min(1.0, (f + 2 * math.sqrt(f) + 2) / n_conf)
+        # CONF excludes every position stock disagreed on (those are TIE or
+        # UNSTABLE), so the confident disagreement count is zero by construction
+        # and r_up is the rule-of-three bound 3/n_conf, clamped at 1 for very
+        # short texts. The flip bar is therefore the fixed critical count for
+        # this null -- lam = n_conf * 2 * r_up = 6, i.e. 11 at alpha=0.05, for
+        # any text with n_conf >= 3 -- and it is printed per text.
+        f = sum(disagree[i] for i in conf)  # 0 by construction; kept in the receipt
+        r_up = min(1.0, 3.0 / n_conf)
         # consensus token per position (majority; tie -> higher mean logprob)
         def consensus(captures):
             cons = []
@@ -338,6 +344,26 @@ def calibrate(out: str, inputs: list[str]) -> int:
 
 # --------------------------------------------------------------- compare
 
+def _candidate_argmax(rows: list, i: int) -> str:
+    """Deterministic candidate-consensus argmax at position i.
+
+    Counts ties break on the highest mean logprob and then lexicographically, so
+    the verdict never depends on set iteration order or Python's hash seed.
+    """
+    counts: dict[str, int] = {}
+    means: dict[str, list[float]] = {}
+    for r in rows:
+        tok = r[i][2]
+        counts[tok] = counts.get(tok, 0) + 1
+        lp = r[i][1].get(tok)
+        means.setdefault(tok, []).append(lp if lp is not None else float("-inf"))
+    best = max(counts.values())
+    tied = sorted(tok for tok, count in counts.items() if count == best)
+    if len(tied) == 1:
+        return tied[0]
+    return max(tied, key=lambda tok: sum(means[tok]) / len(means[tok]))
+
+
 def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
     """Consensus compare: stock (A) and candidate (B) receipts, explicit sides.
 
@@ -354,16 +380,19 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
     if cal.get("schema") != SCHEMA:
         print("UNQUALIFIED: not a calibration receipt (schema " + str(cal.get("schema")) + ")")
         return 2
+    if not cal.get("texts"):
+        print("UNQUALIFIED: calibration carries no texts")
+        return 2
     try:
         ra = [load_receipt(p) for p in a_paths]
         rb = [load_receipt(p) for p in b_paths]
+        pa = [parsed_texts(r) for r in ra]
+        pb = [parsed_texts(r) for r in rb]
     except (ValueError, OSError, KeyError, TypeError) as exc:
         return _unqualified(exc)
     if any(r["model"] != cal["model"] for r in ra + rb):
         print("UNQUALIFIED: model differs from calibration")
         return 2
-    pa = [parsed_texts(r) for r in ra]
-    pb = [parsed_texts(r) for r in rb]
     flagged, invalid = 0, False
     print(f"{'text':14s} {'pos':>4s} {'conf':>5s} {'unstd':>5s} {'consFlips':>9s} {'crit':>4s} "
           f"{'sep':>11s} {'tieDis':>6s} {'stockTie':>8s} {'KL':>9s} {'KLcrit':>9s}")
@@ -407,7 +436,7 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             if klass == UNSTABLE:
                 unstable += 1
                 continue
-            amax = max({r[i][2] for r in rows_b}, key=[r[i][2] for r in rows_b].count)
+            amax = _candidate_argmax(rows_b, i)
             if klass == TIE:
                 tie_dis += amax != cons[i]
                 continue
@@ -475,22 +504,31 @@ _BASE = _base_rows()
 
 
 def _synthetic(seed: int, flips: dict[str, int], kl_boost: float,
-               jitter: float = 0.0, unstable_at: int | None = None) -> dict:
+               jitter: float = 0.0, unstable_at: int | None = None,
+               vanish: int = 0) -> dict:
     """Deterministic synthetic capture.
 
     Near-tie rows wobble with `seed`; `flips` counts extra CONFIDENT-row flips;
     `kl_boost` shifts the runner-up probability mass on confident rows (a
     distribution shift); `jitter` adds capture-specific logprob noise so the
     stock null is not exactly zero; `unstable_at` swaps one high-margin row's
-    winner in THIS capture (stock wobble the calibration must classify UNSTABLE).
+    winner in THIS capture (stock wobble the calibration must classify UNSTABLE);
+    `vanish` confident rows in THIS capture drop the stock's top token from the
+    candidate's top-k entirely (the infinite-separation case).
     """
     rng = random.Random(seed)
     texts = {}
     for name in TEXTS:
         n_flips = flips.get(name, 0)
-        rows, done = [], 0
+        rows, done, vanished = [], 0, 0
         for i, (top, second, gap) in enumerate(_BASE):
             eff_gap, eff_top, eff_second = gap, top, second
+            if gap >= 0.25 and vanished < vanish:
+                vanished += 1
+                rows.append({str(second): {"logprob": 0.0},
+                             str(top + 13): {"logprob": -3.0},
+                             str(top + 29): {"logprob": -6.0}})
+                continue
             if gap < 0.25:  # near-tie: wobble the winner per capture
                 if rng.random() < 0.5:
                     eff_top, eff_second = second, top
@@ -569,6 +607,21 @@ def selftest() -> int:
         assert compare(str(calp), [str(paths[0])], [str(tampered_path)]) == 2, \
             "prompt mismatch should be UNQUALIFIED"
 
+        # Separation path: a candidate that drops the stock's token from every
+        # capture FLAGs while its flip count stays far below the critical count.
+        gone = tmpd / "vanish.json"
+        gone.write_text(json.dumps(_synthetic(999, {}, 0.0, jitter=0.05, vanish=2)))
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_gone = compare(str(calp), [str(paths[0])], [str(gone)])
+        assert rc_gone == 1, "vanished stock token should FLAG via separation"
+        prose_line = [ln for ln in buf.getvalue().splitlines() if ln.startswith("prose")][0]
+        flips_field = int(prose_line.split()[3])
+        assert flips_field < 11, "the separation case must not rely on the flip gate: " + prose_line
+        assert "sep>0.25:  2" in prose_line, prose_line
+
         # Malformed receipts are unqualified (2), never the FLAG code (1).
         broken = tmpd / "broken.json"
         broken.write_text("{not json")
@@ -588,7 +641,8 @@ def selftest() -> int:
             sys.argv = saved
 
         print("selftest: clean WITHIN, flips FLAG, kl-shift FLAG, unstable-row "
-              "regression, poisson tail, prompt pin, malformed=2, CLI sides -> OK")
+              "regression, separation FLAG, poisson tail, prompt pin, malformed=2, "
+              "CLI sides -> OK")
         return 0
 
 
