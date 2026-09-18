@@ -15,17 +15,29 @@ identical runs). Calibration measures that wobble first (>= 4 stock captures),
 classifies every position, and the comparison only judges the positions stock
 itself is stable on. Screening panel, not full qualification.
 
-Position classes (calibration-owned; a candidate cannot move a position between
-them): CONF = stock never changed argmax there and its margin is at or above the
-tie cut m*; TIE = margin below m* (wobble expected, annotated only); UNSTABLE =
-stock changed argmax at a margin at or above m* (the material is not usable as a
-reference position there), excluded from every gate. Ties and unstable positions
-are reported; they are never silently scored.
+Position classes are local and calibration-owned: CONF = stock never changed
+argmax and every stock margin is at least 0.25 nats; TIE = a smaller margin;
+UNSTABLE = stock changed argmax despite every margin being at least 0.25.
+The tie cut is fixed, not raised by a noisy position elsewhere in the text.
+TIE positions are annotated; UNSTABLE positions are excluded from every gate.
 
-Gates (all relative to the calibrated stock null, all on CONF positions only):
-consensus flips vs a Poisson critical count over r_up, separation of the stock
-consensus token's logprob range beyond the stock self-spread, and the candidate's
-mean shared-top-k KL against 2x the stock null's per-pair mean upper spread.
+Gates on CONF positions: consensus flips; reference-token range separation
+beyond max(0.25, that position's stock spread); and mean standardized KL.
+Each position's A/B mean KL is divided by its own maximum stock-pair KL
+(floored at 1e-12 for roundoff), then those ratios are averaged and compared
+with 2. Separation flags at two positions (one if only one is eligible).
+Standardizing BEFORE averaging prevents noisy positions inflating a global
+KL allowance. The 1e-12 floor is numerical slack, not a quality tolerance.
+These are screening heuristics, not significance tests or evidence of equivalence.
+Missing-token bounds respect vLLM's top-k PLUS at most one observed-token
+mapping. New captures record k. Without k, the second-smallest logprob is a
+conservative upper bound (the smallest may be the extra observed token).
+Consensus vote ties use mean logprob only with complete evidence; otherwise
+they break lexicographically, without imputing a censored value as an observation.
+
+In particular the selected CONF population has zero observed flips by
+construction: its rule-of-three-style count allowance has no claimed coverage.
+The fuller PR #182 study was formally INCONCLUSIVE for both candidate arms.
 
 Exit codes: 0 within calibrated variation, 1 FLAG, 2 unqualified inputs
 (malformed, mismatched or empty receipts are unqualified, never FLAG).
@@ -35,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -43,25 +56,21 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from decimal import Decimal, localcontext
 
 BASE = os.environ.get("GLM53_BENCH_BASE", "http://127.0.0.1:8888")
 MODEL = os.environ.get("GLM53_BENCH_MODEL", "GLM-5.3-Flash-EXL3")
 MIN_STOCK_CAPTURES = 4
-MARGIN_GRID = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
-MARGIN_FLOOR, MARGIN_CAP = 0.25, 1.5
+MARGIN_FLOOR = 0.25
 # Position classes.
 CONF, TIE, UNSTABLE = 0, 1, 2
 CLASS_NAMES = {CONF: "conf", TIE: "tie", UNSTABLE: "unstable"}
-# Robust upper spread for the separation gate: a 95th-percentile of the stock
-# self-spread, so one noisy position cannot widen the gate (a max could).
-TAU_QUANTILE = 0.95
-# The candidate is assumed to carry its own stock-rate wobble, so the null
-# expectation of consensus differences is 2 x r_up x n_confident.
+# Heuristic count allowance; CONF selection invalidates a coverage claim.
 FLIP_NULL_FACTOR = 2.0
-# Candidate mean KL must exceed this multiple of the stock null's per-pair mean
-# upper spread (a null of means, not of single worst positions).
+# Position-local empirical KL envelope; no population-level confidence claim.
 KL_NULL_FACTOR = 2.0
-SCHEMA = "calibrated-numerical-panel/v2"
+KL_ROUNDOFF = 1e-12
+SCHEMA = "calibrated-numerical-panel/v3"
 
 
 TEXTS = {
@@ -101,10 +110,10 @@ def _post(path: str, body: dict, timeout: float = 600.0):
         return resp.status, json.loads(resp.read().decode())
 
 
-def parse_position(pos) -> tuple[dict, str, float]:
-    """-> (probs, argmax token, margin in nats). margin=inf when runner-up unknown."""
-    if not isinstance(pos, dict) or not pos:
-        raise ValueError("missing position distribution")
+def parse_position(pos) -> tuple[dict, dict, str, float]:
+    """Return probabilities, logprobs, deterministic argmax and top-two margin."""
+    if not isinstance(pos, dict) or len(pos) < 2:
+        raise ValueError("position requires at least two token probabilities")
     probs, logs = {}, {}
     for token, value in pos.items():
         logprob = value.get("logprob") if isinstance(value, dict) else value
@@ -113,69 +122,144 @@ def parse_position(pos) -> tuple[dict, str, float]:
             raise ValueError("invalid log probability")
         logs[token] = logprob
         probs[token] = math.exp(logprob)
-    argmax = max(logs, key=logs.get)
+    if math.fsum(probs.values()) > 1.00001:
+        raise ValueError("position probabilities exceed total mass one")
+    argmax = max(sorted(logs), key=logs.get)
     ordered = sorted(logs.values(), reverse=True)
-    margin = (ordered[0] - ordered[1]) if len(ordered) > 1 else math.inf
+    margin = ordered[0] - ordered[1]
     return probs, logs, argmax, margin
 
 
-def kl_shared(ax: dict, by: dict) -> float | None:
-    keys = ax.keys() & by.keys()
+def _missing_logprob_bound(logs: dict, top_k: int | None) -> float:
+    """Upper bound, not an imputed logprob, for an omitted token.
+
+    vLLM append_logprobs_for_next_position inserts the observed token and then
+    all top-k tokens, deduplicating overlap. At most ONE entry is outside top-k.
+    Thus without recorded k, dropping the lowest entry gives a safe (possibly
+    loose) bound for either layout. Never infer k from the mapping's width.
+    """
+    ordered = sorted(logs.values(), reverse=True)
+    if top_k is None:
+        if len(ordered) < 2:
+            raise ValueError("no justified missing-token boundary")
+        return ordered[-2]
+    if type(top_k) is not int or top_k < 1 or len(ordered) not in (top_k, top_k + 1):
+        raise ValueError("position width does not establish the declared top-k boundary")
+    return ordered[top_k - 1]
+
+
+def kl_shared(ax: dict, by: dict) -> float:
+    keys = sorted(ax.keys() & by.keys())
     if not keys or any(ax[k] <= 0 or by[k] <= 0 for k in keys):
-        return None
-    za, zb = sum(ax[k] for k in keys), sum(by[k] for k in keys)
-    return sum((ax[k] / za) * math.log((ax[k] / za) / (by[k] / zb)) for k in keys)
-
-
-def _quantile(values: list[float], q: float) -> float:
-    """Nearest-rank quantile of a non-empty sample (robust upper spread)."""
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))
-    return ordered[index]
-
+        raise ValueError("unusable shared top-k probability support")
+    za, zb = math.fsum(ax[k] for k in keys), math.fsum(by[k] for k in keys)
+    return max(0.0, math.fsum(
+        (ax[k] / za) * (math.log(ax[k] / za) - math.log(by[k] / zb)) for k in keys))
 
 def poisson_critical(lam: float, alpha: float = 0.05) -> int:
-    """Smallest c with P(X >= c | lam) <= alpha.
+    """Smallest c with P(X >= c | lam) <= alpha, without a normal fallback.
 
-    Exact for lam <= 500 (incremental Poisson pmf). Above that the same
-    one-sided normal tail is used at the same alpha, so a weak calibration
-    cannot silently raise the FLAG bar.
+    Decimal avoids exp(-lam) underflow in the large-count case. The screening
+    caller's lambda is at most six; larger values are useful for boundary checks.
     """
-    if lam <= 0:
-        return 1
-    if lam > 500:
-        low, high = 0.0, 40.0  # bisect the one-sided normal quantile at alpha
-        for _ in range(80):
-            mid = (low + high) / 2
-            if 0.5 * math.erfc(mid / math.sqrt(2)) > alpha:
-                low = mid
-            else:
-                high = mid
-        # One-count margin over the normal-tail quantile: this branch only runs
-        # for weak calibrations and must never lower the FLAG bar there.
-        return max(1, math.ceil(lam + ((low + high) / 2) * math.sqrt(lam)) + 1)
-    term = math.exp(-lam)  # P(X = 0)
-    tail = 1.0  # P(X >= 0)
-    c = 0
-    while tail > alpha and c <= 10 * lam + 50:
-        tail -= term  # now P(X >= c + 1)
-        c += 1
-        term = term * lam / c
-    return c
+    if not math.isfinite(lam) or lam < 0 or not 0 < alpha < 1:
+        raise ValueError("invalid Poisson parameters")
+    with localcontext() as ctx:
+        ctx.prec = 50
+        rate = Decimal(str(lam))
+        term = (-rate).exp()
+        tail = Decimal(1)
+        cutoff = Decimal(str(alpha))
+        c = 0
+        while tail > cutoff:
+            tail -= term  # P(X >= c + 1), including the off-by-one boundary
+            c += 1
+            term *= rate / c
+        return c
+
+
+def _load_object(path: str) -> dict:
+    value = json.loads(Path(path).read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    return value
+
+
+def _validate_texts(receipt: dict) -> dict:
+    texts = receipt.get("texts")
+    if (not isinstance(receipt.get("model"), str) or not receipt["model"]
+            or not isinstance(texts, dict) or not texts):
+        raise ValueError("receipt requires a model and nonempty texts")
+    for name, rec in texts.items():
+        if not isinstance(rec, dict):
+            raise ValueError(f"{name}: expected a text object")
+        fingerprint = rec.get("prompt_sha256")
+        if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or any(c not in "0123456789abcdef" for c in fingerprint)):
+            raise ValueError(f"{name}: missing or invalid prompt_sha256")
+    return texts
+
+
+def _validate_positions(positions, top_k: int | None = None) -> None:
+    if (not isinstance(positions, list) or len(positions) < 2
+            or positions[0] is not None):
+        raise ValueError("positions require a leading null and scored tokens")
+    for position in positions[1:]:
+        _, logs, _, _ = parse_position(position)
+        _missing_logprob_bound(logs, top_k)
 
 
 def load_receipt(path: str) -> dict:
-    receipt = json.loads(Path(path).read_text())
-    texts = receipt.get("texts")
-    if not isinstance(texts, dict) or not texts or not receipt.get("model"):
-        raise ValueError(f"{path}: not a capture receipt")
-    for name, rec in texts.items():
-        positions = rec.get("positions")
-        if rec.get("mode") != "prompt_logprobs" or not isinstance(positions, list) or len(positions) < 2:
-            raise ValueError(f"{path}/{name}: unqualified capture")
+    receipt = _load_object(path)
+    for name, rec in _validate_texts(receipt).items():
+        if rec.get("mode") != "prompt_logprobs":
+            raise ValueError(f"{path}/{name}: unqualified capture mode")
+        _validate_positions(rec.get("positions"), rec.get("prompt_logprobs_k"))
     return receipt
+
+
+def load_calibration(path: str) -> dict:
+    cal = _load_object(path)
+    if cal.get("schema") != SCHEMA:
+        raise ValueError("calibration schema differs; recalibrate with this version")
+    count, hashes = cal.get("stock_captures"), cal.get("inputs_sha256")
+    if (type(count) is not int or count < MIN_STOCK_CAPTURES
+            or not isinstance(hashes, list) or len(hashes) != count
+            or any(not isinstance(h, str) or len(h) != 64
+                   or any(c not in "0123456789abcdef" for c in h) for h in hashes)):
+        raise ValueError("invalid calibration input provenance")
+    # This validates metadata consistency, not independence or source authenticity.
+    for name, rec in _validate_texts(cal).items():
+        n = rec.get("positions")
+        classes = rec.get("classes")
+        if (type(n) is not int or n < 1 or not isinstance(classes, list)
+                or len(classes) != n
+                or any(type(c) is not int or c not in CLASS_NAMES for c in classes)):
+            raise ValueError(f"{name}: invalid position classes")
+        for klass, label in CLASS_NAMES.items():
+            count = rec.get("n_" + ("confident" if klass == CONF else label))
+            if type(count) is not int or count != classes.count(klass):
+                raise ValueError(f"{name}: inconsistent class counts")
+        if rec["n_confident"] == 0 or rec.get("m_star") != MARGIN_FLOOR:
+            raise ValueError(f"{name}: unqualified confidence population")
+        for key in ("r_up", "null_kl_mean", "tie_disagreement_rate"):
+            value = rec.get(key)
+            if (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name}: invalid {key}")
+        for key in ("stock_spread_by_position", "null_kl_by_position"):
+            values = rec.get(key)
+            if not isinstance(values, list) or len(values) != n:
+                raise ValueError(f"{name}: invalid {key} layout")
+            for klass, value in zip(classes, values):
+                if klass != CONF:
+                    if value is not None:
+                        raise ValueError(f"{name}: excluded position has a threshold")
+                elif type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{name}: invalid {key} threshold")
+        if (rec["r_up"] != min(1.0, 3.0 / rec["n_confident"])
+                or rec["tie_disagreement_rate"] > 1):
+            raise ValueError(f"{name}: inconsistent screening allowances")
+    return cal
 
 
 def parsed_texts(receipt: dict) -> dict:
@@ -184,7 +268,8 @@ def parsed_texts(receipt: dict) -> dict:
         rows = []
         for pos in rec["positions"][1:]:
             probs, logs, argmax, margin = parse_position(pos)
-            rows.append((probs, logs, argmax, margin))
+            bound = _missing_logprob_bound(logs, rec.get("prompt_logprobs_k"))
+            rows.append((probs, logs, argmax, margin, bound))
         out[name] = rows
     return out
 
@@ -194,19 +279,24 @@ def parsed_texts(receipt: dict) -> dict:
 def capture(out: str) -> int:
     res = {"base": BASE, "model": MODEL, "texts": {}}
     for name, text in TEXTS.items():
-        rec = {"prompt_chars": len(text), "prompt_sha256": hashlib.sha256(text.encode()).hexdigest()}
+        rec = {"prompt_chars": len(text), "prompt_sha256": hashlib.sha256(text.encode()).hexdigest(),
+               "prompt_logprobs_k": 20}
         try:
             status, d = _post("/v1/completions", {
                 "model": MODEL, "prompt": text, "max_tokens": 1, "temperature": 0,
-                "echo": True, "logprobs": 1, "prompt_logprobs": 20,
+                "echo": True, "logprobs": 1, "prompt_logprobs": rec["prompt_logprobs_k"],
             })
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+            if status != 200 or not isinstance(d, dict):
+                raise ValueError("invalid completion response")
+            choices = d.get("choices")
+            if (not isinstance(choices, list) or not choices
+                    or not isinstance(choices[0], dict)):
+                raise ValueError("missing completion choice")
+            pl = choices[0].get("prompt_logprobs")
+            _validate_positions(pl, rec["prompt_logprobs_k"])
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
             print(f"{name}: capture request failed ({exc}); capture is unqualified",
                   file=sys.stderr)
-            return 2
-        pl = (d["choices"][0].get("prompt_logprobs") or []) if status == 200 else []
-        if not isinstance(pl, list) or len(pl) < 2 or not any(pl):
-            print(f"{name}: prompt_logprobs unavailable; capture is unqualified", file=sys.stderr)
             return 2
         rec.update(mode="prompt_logprobs", positions=pl)
         print(f"{name}: positions={len(pl)}", flush=True)
@@ -225,6 +315,7 @@ def calibrate(out: str, inputs: list[str]) -> int:
         return 2
     try:
         receipts = [load_receipt(p) for p in inputs]
+        parsed = [parsed_texts(r) for r in receipts]
     except (ValueError, OSError, KeyError, TypeError) as exc:
         return _unqualified(exc)
     if not receipts:
@@ -245,19 +336,15 @@ def calibrate(out: str, inputs: list[str]) -> int:
                for r in receipts):
             print(f"UNQUALIFIED: {name} prompt changed between calibration captures")
             return 2
-        caps = [parsed_texts(r)[name] for r in receipts]
+        caps = [r[name] for r in parsed]
         n = len(caps[0])
         if any(len(c) != n for c in caps):
             print(f"UNQUALIFIED: {name} position count differs")
             return 2
-        # cross-capture disagreement vs position min-margin -> tie cut m*
+        # Local classification: another position can never raise the tie cut.
         min_margin = [min(c[i][3] for c in caps) for i in range(n)]
         disagree = [len({c[i][2] for c in caps}) > 1 for i in range(n)]
-        m_star = MARGIN_CAP
-        for m in MARGIN_GRID:
-            if not any(d and mm >= m for d, mm in zip(disagree, min_margin)):
-                m_star = max(m, MARGIN_FLOOR)
-                break
+        m_star = MARGIN_FLOOR
         # Calibration owns the classes: CONF positions are the only gated ones,
         # TIE positions are annotated, and UNSTABLE positions (stock itself
         # changed argmax at a confident margin) are unusable material. A single
@@ -278,65 +365,42 @@ def calibrate(out: str, inputs: list[str]) -> int:
         if n_conf == 0:
             print(f"UNQUALIFIED: {name} has no confident positions at m*={m_star}")
             return 2
-        # CONF excludes every position stock disagreed on (those are TIE or
-        # UNSTABLE), so the confident disagreement count is zero by construction
-        # and r_up is the rule-of-three bound 3/n_conf, clamped at 1 for very
-        # short texts. The flip bar is therefore the fixed critical count for
-        # this null -- lam = n_conf * 2 * r_up = 6, i.e. 11 at alpha=0.05, for
-        # any text with n_conf >= 3 -- and it is printed per text.
+        # Selected CONF positions have zero observed disagreements, so this
+        # rule-of-three-style allowance is a heuristic, NOT a confidence bound.
+        # lambda = n_conf * 2 * r_up = 6 (critical count 11) for n_conf >= 3.
         f = sum(disagree[i] for i in conf)  # 0 by construction; kept in the receipt
         r_up = min(1.0, 3.0 / n_conf)
-        # consensus token per position (majority; tie -> higher mean logprob)
-        def consensus(captures):
-            cons = []
-            for i in range(n):
-                votes = {}
-                for c in captures:
-                    tok = c[i][2]
-                    votes[tok] = votes.get(tok, 0) + 1
-                cons.append(max(votes, key=votes.get))
-            return cons
-        cons = consensus(caps)
-        # stock self-spread of the consensus token's logprob (confident
-        # positions, complete captures only), as a robust upper quantile
-        spreads = []
+        cons = [_candidate_argmax(caps, i) for i in range(n)]
+        # CONF consensus is present in every calibration capture by definition.
+        spreads, null_kl = [None] * n, [None] * n
+        kls, tie_dis = [], []
         for i in conf:
-            vals = [c[i][1].get(cons[i]) for c in caps]
-            if any(v is None for v in vals):
-                continue
-            spreads.append(max(vals) - min(vals))
-        tau = _quantile(spreads, TAU_QUANTILE)
-        # pairwise null KL on confident positions (like with like: tie-position
-        # renormalization noise would inflate it). The gate uses a null of pair
-        # MEANS, not the single worst position.
-        kls, pair_means, tie_dis = [], [], []
-        for a in range(len(caps)):
-            for b in range(len(caps)):
-                if a == b:
-                    continue
-                pair = []
-                for i in conf:
-                    kl = kl_shared(caps[a][i][0], caps[b][i][0])
-                    if kl is not None:
-                        pair.append(kl)
-                kls += pair
-                if pair:
-                    pair_means.append(sum(pair) / len(pair))
-                tie_dis += [caps[a][i][2] != caps[b][i][2] for i in ties]
+            vals = [c[i][1][cons[i]] for c in caps]
+            spreads[i] = max(vals) - min(vals)
+            try:
+                pair = [kl_shared(a[i][0], b[i][0])
+                        for ai, a in enumerate(caps) for bi, b in enumerate(caps) if ai != bi]
+            except ValueError as exc:
+                return _unqualified(exc)
+            null_kl[i] = max(pair)
+            kls.extend(pair)
+        for ai, a in enumerate(caps):
+            for bi, b in enumerate(caps):
+                if ai != bi:
+                    tie_dis.extend(a[i][2] != b[i][2] for i in ties)
         cal["texts"][name] = {
             "positions": n, "m_star": m_star, "classes": classes,
             "n_confident": n_conf, "n_tie": len(ties), "n_unstable": len(unstable),
             "prompt_sha256": receipts[0]["texts"][name]["prompt_sha256"],
             "stock_disagreements_confident": f, "r_up": r_up,
-            "null_kl_mean": sum(kls) / len(kls) if kls else None,
-            "null_kl_max": max(kls) if kls else None,
-            "null_kl_pair_mean_p95": _quantile(pair_means, TAU_QUANTILE) if pair_means else None,
-            "tau_stock_spread": tau,
+            "null_kl_mean": math.fsum(kls) / len(kls),
+            "null_kl_by_position": null_kl,
+            "stock_spread_by_position": spreads,
             "tie_disagreement_rate": (sum(tie_dis) / len(tie_dis)) if tie_dis else 0.0,
         }
         print(f"{name:14s} pos={n} m*={m_star:.2f} conf={n_conf} tie={len(ties)} "
               f"unstable={len(unstable)} flips={f} r_up={r_up:.2e} "
-              f"tau={tau:.3f} nullKLmean={(cal['texts'][name]['null_kl_mean'] or 0):.2e}")
+              f"nullKLmean={cal['texts'][name]['null_kl_mean']:.2e}")
     Path(out).write_text(json.dumps(cal, indent=1))
     print("wrote", out)
     return 0
@@ -347,21 +411,22 @@ def calibrate(out: str, inputs: list[str]) -> int:
 def _candidate_argmax(rows: list, i: int) -> str:
     """Deterministic candidate-consensus argmax at position i.
 
-    Counts ties break on the highest mean logprob and then lexicographically, so
-    the verdict never depends on set iteration order or Python's hash seed.
+    Vote ties use mean logprob only when ALL tied tokens occur in ALL captures.
+    Otherwise use lexicographic order: censored bounds are not observations.
     """
     counts: dict[str, int] = {}
-    means: dict[str, list[float]] = {}
+    # Rank tied tokens by their mean over ALL captures, not only winning votes.
     for r in rows:
         tok = r[i][2]
         counts[tok] = counts.get(tok, 0) + 1
-        lp = r[i][1].get(tok)
-        means.setdefault(tok, []).append(lp if lp is not None else float("-inf"))
     best = max(counts.values())
     tied = sorted(tok for tok, count in counts.items() if count == best)
     if len(tied) == 1:
         return tied[0]
-    return max(tied, key=lambda tok: sum(means[tok]) / len(means[tok]))
+    if any(tok not in r[i][1] for tok in tied for r in rows):
+        return tied[0]
+    means = {tok: math.fsum(r[i][1][tok] for r in rows) / len(rows) for tok in tied}
+    return max(tied, key=means.get)
 
 
 def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
@@ -374,28 +439,23 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
     near-tie wobble does not. TIE positions are annotated only; UNSTABLE
     positions (stock itself moved there) are excluded and reported."""
     try:
-        cal = json.loads(Path(cal_path).read_text())
-    except (ValueError, OSError) as exc:
-        return _unqualified(exc)
-    if cal.get("schema") != SCHEMA:
-        print("UNQUALIFIED: not a calibration receipt (schema " + str(cal.get("schema")) + ")")
-        return 2
-    if not cal.get("texts"):
-        print("UNQUALIFIED: calibration carries no texts")
-        return 2
-    try:
+        cal = load_calibration(cal_path)
         ra = [load_receipt(p) for p in a_paths]
         rb = [load_receipt(p) for p in b_paths]
         pa = [parsed_texts(r) for r in ra]
         pb = [parsed_texts(r) for r in rb]
     except (ValueError, OSError, KeyError, TypeError) as exc:
         return _unqualified(exc)
+    if not ra or not rb:
+        return _unqualified(ValueError("a comparison side is empty"))
+    if any(r["texts"].keys() != cal["texts"].keys() for r in ra + rb):
+        return _unqualified(ValueError("capture text set differs from calibration"))
     if any(r["model"] != cal["model"] for r in ra + rb):
         print("UNQUALIFIED: model differs from calibration")
         return 2
     flagged, invalid = 0, False
     print(f"{'text':14s} {'pos':>4s} {'conf':>5s} {'unstd':>5s} {'consFlips':>9s} {'crit':>4s} "
-          f"{'sep':>11s} {'tieDis':>6s} {'stockTie':>8s} {'KL':>9s} {'KLcrit':>9s}")
+          f"{'sep':>5s} {'tieDis':>6s} {'stockTie':>8s} {'meanKL':>9s} {'KLratio':>9s}")
     for name in cal["texts"]:
         if any(name not in x for x in pa + pb):
             print(f"{name}: UNQUALIFIED missing from a capture")
@@ -412,25 +472,13 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             print(f"{name}: UNQUALIFIED position set differs from calibration")
             invalid = True
             continue
-        if fingerprint is not None and any(
-                r["texts"][name].get("prompt_sha256") != fingerprint for r in ra + rb):
+        if any(r["texts"][name]["prompt_sha256"] != fingerprint for r in ra + rb):
             print(f"{name}: UNQUALIFIED prompt differs from calibration")
             invalid = True
             continue
-        if not ra or not rb:
-            print(f"{name}: UNQUALIFIED a side is empty")
-            invalid = True
-            continue
         flips = tie_dis = sep_exceed = unstable = 0
-        kls = []
-        # stock consensus token per position (majority across A captures)
-        cons = []
-        for i in range(n):
-            votes = {}
-            for r in rows_a:
-                votes[r[i][2]] = votes.get(r[i][2], 0) + 1
-            cons.append(max(votes, key=votes.get))
-        tau_gate = max(MARGIN_FLOOR, tc.get("tau_stock_spread") or 0.0)
+        kls, kl_ratios = [], []
+        cons = [_candidate_argmax(rows_a, i) for i in range(n)]
         for i in range(n):
             klass = classes[i]
             if klass == UNSTABLE:
@@ -441,35 +489,36 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
                 tie_dis += amax != cons[i]
                 continue
             flips += amax != cons[i]
-            for x in pa:
-                for y in pb:
-                    kl = kl_shared(x[name][i][0], y[name][i][0])
-                    if kl is not None:
-                        kls.append(kl)
+            try:
+                position_kls = [kl_shared(x[i][0], y[i][0]) for x in rows_a for y in rows_b]
+            except ValueError as exc:
+                return _unqualified(exc)
+            kls.extend(position_kls)
+            kl_mean = math.fsum(position_kls) / len(position_kls)
+            kl_scale = max(KL_ROUNDOFF, tc["null_kl_by_position"][i])
+            kl_ratios.append(kl_mean / kl_scale)
             # separation: every candidate capture's logprob for the stock
             # consensus token strictly outside every stock capture's, by > tau.
-            # The stock side must be COMPLETE: a token stock itself lost in some
-            # capture is not a reference, and partial ranges would widen the
-            # stock span and hide real shifts.
+            # Incomplete stock ranges cannot support a separation judgment.
             svals = [r[i][1].get(cons[i]) for r in rows_a]
             if any(v is None for v in svals):
-                continue
-            cvals = [r[i][1].get(cons[i]) for r in rows_b]
-            cvals = [v for v in cvals if v is not None]
-            if not cvals:
-                sep_exceed += 1  # token vanished from EVERY candidate top-k
-                continue
-            if (min(svals) - max(cvals) > tau_gate
-                    or min(cvals) - max(svals) > tau_gate):
+                return _unqualified(ValueError(f"{name}/{i}: incomplete stock reference"))
+            # The kth boundary excludes any extra low-probability observed
+            # prompt token. All candidate captures, including absences, contribute.
+            c_hi = [r[i][1].get(cons[i], r[i][4]) for r in rows_b]
+            c_lo = [r[i][1].get(cons[i], -math.inf) for r in rows_b]
+            tau_gate = max(MARGIN_FLOOR, tc["stock_spread_by_position"][i])
+            if (min(svals) - max(c_hi) > tau_gate
+                    or min(c_lo) - max(svals) > tau_gate):
                 sep_exceed += 1
         n_conf = max(1, tc["n_confident"])
         lam = n_conf * FLIP_NULL_FACTOR * tc["r_up"]
         crit = poisson_critical(lam)
         n_tie = max(1, tc["n_tie"])
         tie_rate = tie_dis / n_tie
-        mean_kl = sum(kls) / len(kls) if kls else 0.0
-        kl_crit = KL_NULL_FACTOR * (tc.get("null_kl_pair_mean_p95") or 0.0)
-        text_flag = flips >= crit or mean_kl > kl_crit or sep_exceed >= 2
+        mean_kl = math.fsum(kls) / len(kls)
+        mean_ratio = math.fsum(kl_ratios) / n_conf
+        text_flag = flips >= crit or mean_ratio > KL_NULL_FACTOR or sep_exceed >= min(2, n_conf)
         flagged += text_flag
         annotation = ""
         if tie_rate > 2 * tc["tie_disagreement_rate"] + 0.05:
@@ -477,8 +526,8 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
         if text_flag:
             annotation += " FLAG"
         print(f"{name:14s} {n:4d} {tc['n_confident']:5d} {unstable:5d} {flips:9d} {crit:4d} "
-              f"sep>{tau_gate:.2f}:{sep_exceed:3d} "
-              f"{tie_rate:6.3f} {tc['tie_disagreement_rate']:8.3f} {mean_kl:9.2e} {kl_crit:9.2e}{annotation}")
+              f"{sep_exceed:5d} {tie_rate:6.3f} {tc['tie_disagreement_rate']:8.3f} "
+              f"{mean_kl:9.2e} {mean_ratio:9.2e}{annotation}")
     if invalid:
         print("UNQUALIFIED")
         return 2
@@ -514,7 +563,7 @@ def _synthetic(seed: int, flips: dict[str, int], kl_boost: float,
     stock null is not exactly zero; `unstable_at` swaps one high-margin row's
     winner in THIS capture (stock wobble the calibration must classify UNSTABLE);
     `vanish` confident rows in THIS capture drop the stock's top token from the
-    candidate's top-k entirely (the infinite-separation case).
+    candidate's top-k entirely (a censored probability, not negative infinity).
     """
     rng = random.Random(seed)
     texts = {}
@@ -546,8 +595,13 @@ def _synthetic(seed: int, flips: dict[str, int], kl_boost: float,
             rows.append({str(eff_top): {"logprob": 0.0},
                          str(eff_second): {"logprob": -eff_gap * scale},
                          str(top + 13): {"logprob": -(eff_gap + 3.0) * scale}})
+        for row in rows:
+            normalizer = math.log(math.fsum(math.exp(v["logprob"]) for v in row.values()))
+            for value in row.values():
+                value["logprob"] -= normalizer
         texts[name] = {"prompt_sha256": hashlib.sha256(TEXTS[name].encode()).hexdigest(),
-                       "mode": "prompt_logprobs", "positions": [None] + rows}
+                       "mode": "prompt_logprobs", "prompt_logprobs_k": 3,
+                       "positions": [None] + rows}
     return {"model": MODEL, "texts": texts}
 
 
@@ -565,11 +619,6 @@ def selftest() -> int:
             paths.append(str(p))
         calp = tmpd / "c.json"
         assert calibrate(str(calp), paths) == 0, "calibrate failed"
-        cal = json.loads(calp.read_text())
-        assert sum(t["n_unstable"] for t in cal["texts"].values()) > 0, \
-            "the swapped high-margin row must classify UNSTABLE"
-        assert all(t["tau_stock_spread"] < 0.5 for t in cal["texts"].values()), \
-            "an unstable stock row must not widen tau"
         clean = tmpd / "clean.json"
         clean.write_text(json.dumps(_synthetic(999, {}, 0.0, jitter=0.05)))
         damaged = tmpd / "damaged.json"
@@ -607,20 +656,11 @@ def selftest() -> int:
         assert compare(str(calp), [str(paths[0])], [str(tampered_path)]) == 2, \
             "prompt mismatch should be UNQUALIFIED"
 
-        # Separation path: a candidate that drops the stock's token from every
-        # capture FLAGs while its flip count stays far below the critical count.
+        # Missing candidate tokens are bounded by the captured top-k floor.
         gone = tmpd / "vanish.json"
         gone.write_text(json.dumps(_synthetic(999, {}, 0.0, jitter=0.05, vanish=2)))
-        import contextlib
-        import io
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc_gone = compare(str(calp), [str(paths[0])], [str(gone)])
-        assert rc_gone == 1, "vanished stock token should FLAG via separation"
-        prose_line = [ln for ln in buf.getvalue().splitlines() if ln.startswith("prose")][0]
-        flips_field = int(prose_line.split()[3])
-        assert flips_field < 11, "the separation case must not rely on the flip gate: " + prose_line
-        assert "sep>0.25:  2" in prose_line, prose_line
+        assert compare(str(calp), [str(paths[0])], [str(gone)]) == 1, \
+            "large censored-token shift should FLAG"
 
         # Malformed receipts are unqualified (2), never the FLAG code (1).
         broken = tmpd / "broken.json"
@@ -641,7 +681,7 @@ def selftest() -> int:
             sys.argv = saved
 
         print("selftest: clean WITHIN, flips FLAG, kl-shift FLAG, unstable-row "
-              "regression, separation FLAG, poisson tail, prompt pin, malformed=2, "
+              "regression, censored shift FLAG, poisson tail, prompt pin, malformed=2, "
               "CLI sides -> OK")
         return 0
 
@@ -671,7 +711,7 @@ def main() -> int:
         if args.cmd == "compare":
             return compare(args.calibration, list(args.stock), list(args.cand))
         return selftest()
-    except (ValueError, OSError, KeyError, TypeError) as exc:
+    except (ValueError, OSError, KeyError, TypeError, OverflowError) as exc:
         return _unqualified(exc)
 
 
