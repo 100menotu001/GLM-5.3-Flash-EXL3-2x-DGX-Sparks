@@ -57,20 +57,59 @@ eight blocks per expert) is unchanged.
 * `compute-sanitizer --tool memcheck` on the same battery with `FAST=1`:
   119 cases, 0 errors.
 
-Provenance: every number in this section and the historical serving section
+Provenance: every number in this section and in the historical serving section
 below is an **author-reported** measurement recorded in the parent effort
 (PR #182, branch head `4c0f422`) — SASS on the exact-head `.so`, the in-image
-parity battery, and the TheGrill A/B/A2 campaign. This branch does not carry
-that qualification record and does not re-derive those numbers.
+parity battery, and the earlier TheGrill A/B/A2 campaign. This branch does not
+carry that qualification record and does not re-derive those numbers. The
+current-`main` measurement section below is separate: it was measured here, on
+this branch's own rebased image.
+
+### Measured on current `main` (maintainer-measured at head `3d6ffbd`)
+
+TheGrill v0.3.0, profile `glm-routine-decode-v3` (workload sha256
+`6d075fb8…`), collector binary sha256 `2b48429f…`, image
+`glm53-thin:3d6ffbd` = `sha256:f267534bbe52b792dbcaa3d1439bb4f5aaa02ccde7349eb7bc7eea5becac5116`
+on upstream main `0437c09`, same image in all three arms, fresh two-node boot
+per arm, `GLM53_DENSE_FP8=kda` and `GLM53_KDA_FP8_FAT=0` in every arm,
+thinking-off, no tools, literal-loopback endpoint. Descriptive A/B/A2 — no
+PASS envelope is claimed, and this says nothing about numerical quality.
+
+Decode tokens/s (median) per cell, A (`FAST=0`) / B (`FAST=1`) / A2 (`FAST=0`):
+
+| cell | A | B | A2 | B vs A | A2 vs A (noise) |
+|---|---|---|---|---|---|
+| structured-1 | 72.74 | 78.36 | 72.52 | **+7.71%** | −0.31% |
+| code-1 | 67.83 | 73.86 | 68.04 | **+8.88%** | +0.30% |
+| json-1 | 51.32 | 58.81 | 49.50 | **+14.59%** | −3.54% |
+| structured-2 | 68.86 | 78.07 | 71.67 | withheld (raw +13.4%) | +4.07% |
+| prose-1 | 31.93 | 34.91 | 33.40 | withheld (raw +9.3%) | +4.62% |
+
+Accepted-with-resolved-ranges cells also improve on achieved completion
+throughput (+7.93%, +9.13%, +14.36%) and wave latency (−7.34%, −8.37%,
+−12.56%). Two cells are **withheld by the tool's own range-overlap rule**;
+their raw medians are labelled raw and no change is claimed for them. Every arm
+published 20 waves (15 measured, 15 eligible), with 0 invalid captures, 0
+retries and 0 replacement runs, and every response reports `cached_tokens=0` on
+the declared-cold legs.
+
+Disclosed caveats: the server-side generation override caps every trial at 256
+output tokens (identical in all arms, below the workload's 400-token cap); the
+A2-vs-A noise control is what the B-vs-A deltas are read against; arm A (the
+`FAST=0` baseline) was re-entered through the operator's reuse path after an
+operator bug, with no request served before its capture; and the run
+declarations recorded a placeholder image digest, with the image identity
+independently evidenced by the arm containers, the image inspect and the
+in-image gate — this collector does not attest declarations against the server.
 
 ### Historical serving evidence (earlier head, author-measured)
 
 * TheGrill A/B/A2 decode, `FAST=1` vs stock, `GLM53_DENSE_FP8=off` in both
   arms: **+4.8% to +8.4%** across all cells (structured-1 +8.3%); the A2 stock
   repeat sat within **±2.4%**.
-* These are historical measurements at the pre-rebase head. **No speed
-  comparison against current `main` exists yet**; a fresh A/B/A2 against `main`
-  is planned as separate work. Do not quote the numbers above as current.
+* These are historical measurements at the pre-rebase head. The current-`main`
+  measurement above supersedes them for the rebased branch; do not quote this
+  older pair as current.
 
 ### Numerical qualification (sealed study, cite by hash)
 
@@ -113,8 +152,8 @@ quantile-based tau transfer.
 
 ### What this change does not claim
 
-* No current-`main` serving comparison (planned separately) and no pooled
-  headline percentage.
+* No pooled headline percentage and no PASS envelope: the serving comparison
+  above is descriptive A/B/A2 only, read against its own A2-vs-A noise control.
 * Client tool / structured-tool workloads were **not** validated on the surface
   that #215 (`tool_choice:none` decode guard) introduced; nothing here asserts
   behaviour for them.

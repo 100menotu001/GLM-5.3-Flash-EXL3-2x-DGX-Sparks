@@ -28,12 +28,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   current `main`.
   Kernel evidence (exact head, author-reported under #182): 119/119 parity
   cases at rel RMSE ~1e-8, 0 `compute-sanitizer` errors, 0 local-memory reloads
-  in the fast kernel vs 39 in stock, +8–17% layer latency. Serving speed
-  (+4.8–8.4% decode A/B, A2 within ±2.4%) is historical at the pre-rebase head;
-  a comparison against current `main` is pending. The hash-frozen numerical
-  study is formally **inconclusive** — both predeclared control self-tests (the
-  absolute-KL gate and the tau-transfer bound) fail on unchanged stock repeats —
-  so this stays opt-in; see `docs/sm121-perf-paths.md`.
+  in the fast kernel vs 39 in stock, +8–17% layer latency. Serving speed is
+  measured twice: historically at the pre-rebase head (+4.8–8.4% decode A/B,
+  A2 within ±2.4%) and now on current `main` — maintainer-measured TheGrill
+  v0.3.0 A/B/A2 at head `3d6ffbd` (image `sha256:f267534b…`, fresh boot per arm,
+  `glm-routine-decode-v3`) gives **+7.71% / +8.88% / +14.59%** median decode
+  rate in the three range-resolved cells against A2-vs-A drift of −0.31% /
+  +0.30% / −3.54%, with two cells withheld by the tool's range-overlap rule
+  (descriptive; no PASS envelope). The hash-frozen numerical study is formally
+  **inconclusive** — both predeclared control self-tests (the absolute-KL gate
+  and the tau-transfer bound) fail on unchanged stock repeats — so this stays
+  opt-in; see `docs/sm121-perf-paths.md`.
 
 ### Changed
 
