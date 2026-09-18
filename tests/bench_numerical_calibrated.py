@@ -6,16 +6,29 @@ model's OWN stock-vs-stock variation instead of fixed absolute thresholds.
 
     GLM53_BENCH_BASE=http://127.0.0.1:8888 python3 tests/bench_numerical_calibrated.py capture --out A.json
     python3 tests/bench_numerical_calibrated.py calibrate --out C.json A1.json A2.json A3.json A4.json [A5.json ...]
-    python3 tests/bench_numerical_calibrated.py compare --calibration C.json A.json B.json
+    python3 tests/bench_numerical_calibrated.py compare --calibration C.json --stock A1.json A2.json --cand B1.json B2.json B3.json
     python3 tests/bench_numerical_calibrated.py selftest
 
 Why: a fixed "argmax agreement >= 0.99 / mean KL <= 0.01" gate fails on
 unchanged stock repeats of this model family (near-tie tokens flip between
 identical runs). Calibration measures that wobble first (>= 4 stock captures),
-derives a tie margin m* and a flip-rate bound, and the comparison only flags
-changes beyond stock's own variation. Screening panel, not full qualification.
+classifies every position, and the comparison only judges the positions stock
+itself is stable on. Screening panel, not full qualification.
 
-Exit codes: 0 within calibrated variation, 1 FLAG, 2 unqualified inputs.
+Position classes (calibration-owned; a candidate cannot move a position between
+them): CONF = stock never changed argmax there and its margin is at or above the
+tie cut m*; TIE = margin below m* (wobble expected, annotated only); UNSTABLE =
+stock changed argmax at a margin at or above m* (the material is not usable as a
+reference position there), excluded from every gate. Ties and unstable positions
+are reported; they are never silently scored.
+
+Gates (all relative to the calibrated stock null, all on CONF positions only):
+consensus flips vs a Poisson critical count over r_up, separation of the stock
+consensus token's logprob range beyond the stock self-spread, and the candidate's
+mean shared-top-k KL against 2x the stock null's per-pair mean upper spread.
+
+Exit codes: 0 within calibrated variation, 1 FLAG, 2 unqualified inputs
+(malformed, mismatched or empty receipts are unqualified, never FLAG).
 """
 
 from __future__ import annotations
@@ -36,6 +49,20 @@ MODEL = os.environ.get("GLM53_BENCH_MODEL", "GLM-5.3-Flash-EXL3")
 MIN_STOCK_CAPTURES = 4
 MARGIN_GRID = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
 MARGIN_FLOOR, MARGIN_CAP = 0.25, 1.5
+# Position classes.
+CONF, TIE, UNSTABLE = 0, 1, 2
+CLASS_NAMES = {CONF: "conf", TIE: "tie", UNSTABLE: "unstable"}
+# Robust upper spread for the separation gate: a 95th-percentile of the stock
+# self-spread, so one noisy position cannot widen the gate (a max could).
+TAU_QUANTILE = 0.95
+# The candidate is assumed to carry its own stock-rate wobble, so the null
+# expectation of consensus differences is 2 x r_up x n_confident.
+FLIP_NULL_FACTOR = 2.0
+# Candidate mean KL must exceed this multiple of the stock null's per-pair mean
+# upper spread (a null of means, not of single worst positions).
+KL_NULL_FACTOR = 2.0
+SCHEMA = "calibrated-numerical-panel/v2"
+
 
 TEXTS = {
     "prose": (
@@ -98,6 +125,15 @@ def kl_shared(ax: dict, by: dict) -> float | None:
         return None
     za, zb = sum(ax[k] for k in keys), sum(by[k] for k in keys)
     return sum((ax[k] / za) * math.log((ax[k] / za) / (by[k] / zb)) for k in keys)
+
+
+def _quantile(values: list[float], q: float) -> float:
+    """Nearest-rank quantile of a non-empty sample (robust upper spread)."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))
+    return ordered[index]
 
 
 def poisson_critical(lam: float, alpha: float = 0.05) -> int:
@@ -187,7 +223,12 @@ def calibrate(out: str, inputs: list[str]) -> int:
     if len(inputs) < MIN_STOCK_CAPTURES:
         print(f"calibrate needs >= {MIN_STOCK_CAPTURES} stock receipts", file=sys.stderr)
         return 2
-    receipts = [load_receipt(p) for p in inputs]
+    try:
+        receipts = [load_receipt(p) for p in inputs]
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        return _unqualified(exc)
+    if not receipts:
+        return _unqualified(ValueError("no stock receipts"))
     model = receipts[0]["model"]
     if any(r["model"] != model for r in receipts):
         print("UNQUALIFIED: mixed models in calibration set")
@@ -196,7 +237,7 @@ def calibrate(out: str, inputs: list[str]) -> int:
     if any(r["texts"].keys() != receipts[0]["texts"].keys() for r in receipts):
         print("UNQUALIFIED: calibration texts differ")
         return 2
-    cal = {"schema": "calibrated-numerical-panel/v1", "model": model,
+    cal = {"schema": SCHEMA, "model": model,
            "stock_captures": len(receipts), "inputs_sha256":
            [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in inputs], "texts": {}}
     for name in names:
@@ -217,13 +258,27 @@ def calibrate(out: str, inputs: list[str]) -> int:
             if not any(d and mm >= m for d, mm in zip(disagree, min_margin)):
                 m_star = max(m, MARGIN_FLOOR)
                 break
-        conf = [i for i in range(n) if min_margin[i] >= m_star]
-        ties = [i for i in range(n) if min_margin[i] < m_star]
-        f = sum(disagree[i] for i in conf)
+        # Calibration owns the classes: CONF positions are the only gated ones,
+        # TIE positions are annotated, and UNSTABLE positions (stock itself
+        # changed argmax at a confident margin) are unusable material. A single
+        # bimodal position therefore cannot widen tau, raise the flip bar or
+        # deaden the KL gate -- it is excluded and reported instead.
+        classes = []
+        for i in range(n):
+            if min_margin[i] < m_star:
+                classes.append(TIE)
+            elif disagree[i]:
+                classes.append(UNSTABLE)
+            else:
+                classes.append(CONF)
+        conf = [i for i in range(n) if classes[i] == CONF]
+        ties = [i for i in range(n) if classes[i] == TIE]
+        unstable = [i for i in range(n) if classes[i] == UNSTABLE]
         n_conf = len(conf)
         if n_conf == 0:
             print(f"UNQUALIFIED: {name} has no confident positions at m*={m_star}")
             return 2
+        f = sum(disagree[i] for i in conf)  # 0 by construction, kept explicit
         r_up = 3.0 / n_conf if f == 0 else min(1.0, (f + 2 * math.sqrt(f) + 2) / n_conf)
         # consensus token per position (majority; tie -> higher mean logprob)
         def consensus(captures):
@@ -236,39 +291,46 @@ def calibrate(out: str, inputs: list[str]) -> int:
                 cons.append(max(votes, key=votes.get))
             return cons
         cons = consensus(caps)
-        # stock self-spread of the consensus token's logprob (confident positions)
-        def token_logprob(capture_row, token):
-            return capture_row[1].get(token)
+        # stock self-spread of the consensus token's logprob (confident
+        # positions, complete captures only), as a robust upper quantile
         spreads = []
         for i in conf:
-            vals = [token_logprob(c[i], cons[i]) for c in caps]
-            vals = [v for v in vals if v is not None]
-            if len(vals) >= 2:
-                spreads.append(max(vals) - min(vals))
-        tau = max(spreads) if spreads else 0.0
-        # pairwise null KL (confident positions only: gate must compare like
-        # with like — tie-position renormalization noise would inflate it)
-        kls, tie_dis = [], []
+            vals = [c[i][1].get(cons[i]) for c in caps]
+            if any(v is None for v in vals):
+                continue
+            spreads.append(max(vals) - min(vals))
+        tau = _quantile(spreads, TAU_QUANTILE)
+        # pairwise null KL on confident positions (like with like: tie-position
+        # renormalization noise would inflate it). The gate uses a null of pair
+        # MEANS, not the single worst position.
+        kls, pair_means, tie_dis = [], [], []
         for a in range(len(caps)):
             for b in range(len(caps)):
                 if a == b:
                     continue
+                pair = []
                 for i in conf:
                     kl = kl_shared(caps[a][i][0], caps[b][i][0])
                     if kl is not None:
-                        kls.append(kl)
+                        pair.append(kl)
+                kls += pair
+                if pair:
+                    pair_means.append(sum(pair) / len(pair))
                 tie_dis += [caps[a][i][2] != caps[b][i][2] for i in ties]
         cal["texts"][name] = {
-            "positions": n, "m_star": m_star, "n_confident": n_conf, "n_tie": len(ties),
+            "positions": n, "m_star": m_star, "classes": classes,
+            "n_confident": n_conf, "n_tie": len(ties), "n_unstable": len(unstable),
             "prompt_sha256": receipts[0]["texts"][name]["prompt_sha256"],
             "stock_disagreements_confident": f, "r_up": r_up,
             "null_kl_mean": sum(kls) / len(kls) if kls else None,
             "null_kl_max": max(kls) if kls else None,
+            "null_kl_pair_mean_p95": _quantile(pair_means, TAU_QUANTILE) if pair_means else None,
             "tau_stock_spread": tau,
             "tie_disagreement_rate": (sum(tie_dis) / len(tie_dis)) if tie_dis else 0.0,
         }
-        print(f"{name:14s} pos={n} m*={m_star:.2f} conf={n_conf} flips={f} "
-              f"r_up={r_up:.2e} nullKLmax={(cal['texts'][name]['null_kl_max'] or 0):.2e}")
+        print(f"{name:14s} pos={n} m*={m_star:.2f} conf={n_conf} tie={len(ties)} "
+              f"unstable={len(unstable)} flips={f} r_up={r_up:.2e} "
+              f"tau={tau:.3f} nullKLmean={(cal['texts'][name]['null_kl_mean'] or 0):.2e}")
     Path(out).write_text(json.dumps(cal, indent=1))
     print("wrote", out)
     return 0
@@ -277,27 +339,34 @@ def calibrate(out: str, inputs: list[str]) -> int:
 # --------------------------------------------------------------- compare
 
 def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
-    """Consensus compare: any number of stock (A) and candidate (B) receipts.
+    """Consensus compare: stock (A) and candidate (B) receipts, explicit sides.
 
     A position counts as a flip only when the CANDIDATE CONSENSUS argmax
     (majority across B captures) differs from the STOCK CONSENSUS argmax
-    (majority across A captures). Systematic damage flips whole consensus
-    groups; random near-tie wobble does not. Single receipts per side also
-    work (degenerates to a plain pair comparison with less power)."""
-    cal = json.loads(Path(cal_path).read_text())
-    if cal.get("schema") != "calibrated-numerical-panel/v1":
-        print("UNQUALIFIED: not a calibration receipt")
+    (majority across A captures), and only at positions the CALIBRATION
+    classified CONF. Systematic damage flips whole consensus groups; random
+    near-tie wobble does not. TIE positions are annotated only; UNSTABLE
+    positions (stock itself moved there) are excluded and reported."""
+    try:
+        cal = json.loads(Path(cal_path).read_text())
+    except (ValueError, OSError) as exc:
+        return _unqualified(exc)
+    if cal.get("schema") != SCHEMA:
+        print("UNQUALIFIED: not a calibration receipt (schema " + str(cal.get("schema")) + ")")
         return 2
-    ra = [load_receipt(p) for p in a_paths]
-    rb = [load_receipt(p) for p in b_paths]
+    try:
+        ra = [load_receipt(p) for p in a_paths]
+        rb = [load_receipt(p) for p in b_paths]
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        return _unqualified(exc)
     if any(r["model"] != cal["model"] for r in ra + rb):
         print("UNQUALIFIED: model differs from calibration")
         return 2
     pa = [parsed_texts(r) for r in ra]
     pb = [parsed_texts(r) for r in rb]
     flagged, invalid = 0, False
-    print(f"{'text':14s} {'pos':>4s} {'consFlips':>9s} {'crit':>4s} {'sep':>11s} "
-          f"{'tieDis':>6s} {'stockTie':>8s} {'KL':>9s} {'KLcrit':>9s}")
+    print(f"{'text':14s} {'pos':>4s} {'conf':>5s} {'unstd':>5s} {'consFlips':>9s} {'crit':>4s} "
+          f"{'sep':>11s} {'tieDis':>6s} {'stockTie':>8s} {'KL':>9s} {'KLcrit':>9s}")
     for name in cal["texts"]:
         if any(name not in x for x in pa + pb):
             print(f"{name}: UNQUALIFIED missing from a capture")
@@ -305,19 +374,25 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             continue
         tc = cal["texts"][name]
         n = tc["positions"]
+        classes = tc.get("classes")
         rows_a = [x[name] for x in pa]
         rows_b = [x[name] for x in pb]
-        if any(len(r) != n for r in rows_a + rows_b):
-            print(f"{name}: UNQUALIFIED position count differs from calibration")
+        fingerprint = tc.get("prompt_sha256")
+        if (not isinstance(classes, list) or len(classes) != n
+                or any(len(r) != n for r in rows_a + rows_b)):
+            print(f"{name}: UNQUALIFIED position set differs from calibration")
             invalid = True
             continue
-        fingerprint = tc.get("prompt_sha256")
         if fingerprint is not None and any(
                 r["texts"][name].get("prompt_sha256") != fingerprint for r in ra + rb):
             print(f"{name}: UNQUALIFIED prompt differs from calibration")
             invalid = True
             continue
-        flips = tie_dis = sep_exceed = 0
+        if not ra or not rb:
+            print(f"{name}: UNQUALIFIED a side is empty")
+            invalid = True
+            continue
+        flips = tie_dis = sep_exceed = unstable = 0
         kls = []
         # stock consensus token per position (majority across A captures)
         cons = []
@@ -326,18 +401,22 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             for r in rows_a:
                 votes[r[i][2]] = votes.get(r[i][2], 0) + 1
             cons.append(max(votes, key=votes.get))
-        tau_gate = max(0.25, tc.get("tau_stock_spread") or 0.0)
+        tau_gate = max(MARGIN_FLOOR, tc.get("tau_stock_spread") or 0.0)
         for i in range(n):
-            margins = [r[i][3] for r in rows_a + rows_b]
-            ta = {r[i][2] for r in rows_a}
-            tb = {r[i][2] for r in rows_b}
-            kl_pairs = [(x[name][i][0], y[name][i][0]) for x in pa for y in pb]
-            amax = max(tb, key=[r[i][2] for r in rows_b].count)
-            if min(margins) >= tc["m_star"]:
-                flips += amax != cons[i]
-                kls += [k for k in (kl_shared(x, y) for x, y in kl_pairs) if k is not None]
-            else:
+            klass = classes[i]
+            if klass == UNSTABLE:
+                unstable += 1
+                continue
+            amax = max({r[i][2] for r in rows_b}, key=[r[i][2] for r in rows_b].count)
+            if klass == TIE:
                 tie_dis += amax != cons[i]
+                continue
+            flips += amax != cons[i]
+            for x in pa:
+                for y in pb:
+                    kl = kl_shared(x[name][i][0], y[name][i][0])
+                    if kl is not None:
+                        kls.append(kl)
             # separation: every candidate capture's logprob for the stock
             # consensus token strictly outside every stock capture's, by > tau.
             # The stock side must be COMPLETE: a token stock itself lost in some
@@ -354,12 +433,13 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             if (min(svals) - max(cvals) > tau_gate
                     or min(cvals) - max(svals) > tau_gate):
                 sep_exceed += 1
-        lam = tc["n_confident"] * 2 * tc["r_up"]
+        n_conf = max(1, tc["n_confident"])
+        lam = n_conf * FLIP_NULL_FACTOR * tc["r_up"]
         crit = poisson_critical(lam)
         n_tie = max(1, tc["n_tie"])
         tie_rate = tie_dis / n_tie
         mean_kl = sum(kls) / len(kls) if kls else 0.0
-        kl_crit = 2 * (tc["null_kl_max"] or 0.0)
+        kl_crit = KL_NULL_FACTOR * (tc.get("null_kl_pair_mean_p95") or 0.0)
         text_flag = flips >= crit or mean_kl > kl_crit or sep_exceed >= 2
         flagged += text_flag
         annotation = ""
@@ -367,7 +447,8 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             annotation += " tieRate!"
         if text_flag:
             annotation += " FLAG"
-        print(f"{name:14s} {n:4d} {flips:9d} {crit:4d} sep>{tau_gate:.2f}:{sep_exceed:3d} "
+        print(f"{name:14s} {n:4d} {tc['n_confident']:5d} {unstable:5d} {flips:9d} {crit:4d} "
+              f"sep>{tau_gate:.2f}:{sep_exceed:3d} "
               f"{tie_rate:6.3f} {tc['tie_disagreement_rate']:8.3f} {mean_kl:9.2e} {kl_crit:9.2e}{annotation}")
     if invalid:
         print("UNQUALIFIED")
@@ -393,10 +474,16 @@ def _base_rows() -> list[tuple[int, int, float]]:
 _BASE = _base_rows()
 
 
-def _synthetic(seed: int, flips: dict[str, int], kl_boost: float) -> dict:
-    """Deterministic synthetic capture: near-tie rows wobble with `seed`;
-    `flips` counts extra CONFIDENT-row flips; `kl_boost` shifts the runner-up
-    probability mass on confident rows (a distribution shift)."""
+def _synthetic(seed: int, flips: dict[str, int], kl_boost: float,
+               jitter: float = 0.0, unstable_at: int | None = None) -> dict:
+    """Deterministic synthetic capture.
+
+    Near-tie rows wobble with `seed`; `flips` counts extra CONFIDENT-row flips;
+    `kl_boost` shifts the runner-up probability mass on confident rows (a
+    distribution shift); `jitter` adds capture-specific logprob noise so the
+    stock null is not exactly zero; `unstable_at` swaps one high-margin row's
+    winner in THIS capture (stock wobble the calibration must classify UNSTABLE).
+    """
     rng = random.Random(seed)
     texts = {}
     for name in TEXTS:
@@ -407,14 +494,20 @@ def _synthetic(seed: int, flips: dict[str, int], kl_boost: float) -> dict:
             if gap < 0.25:  # near-tie: wobble the winner per capture
                 if rng.random() < 0.5:
                     eff_top, eff_second = second, top
+            elif unstable_at is not None and i == unstable_at:
+                eff_top, eff_second = second, top
             elif done < n_flips:  # damage: flip a confident row
                 eff_top, eff_second = second, top
                 done += 1
             if gap >= 0.25 and kl_boost:
                 eff_gap = max(0.3, gap - kl_boost)
+            # Relative jitter: it varies the runner-up mass between captures
+            # without ever making a non-argmax logprob positive or reordering
+            # the top-1.
+            scale = rng.uniform(1.0 - jitter, 1.0 + jitter) if jitter else 1.0
             rows.append({str(eff_top): {"logprob": 0.0},
-                         str(eff_second): {"logprob": -eff_gap},
-                         str(top + 13): {"logprob": -eff_gap - 3.0}})
+                         str(eff_second): {"logprob": -eff_gap * scale},
+                         str(top + 13): {"logprob": -(eff_gap + 3.0) * scale}})
         texts[name] = {"prompt_sha256": hashlib.sha256(TEXTS[name].encode()).hexdigest(),
                        "mode": "prompt_logprobs", "positions": [None] + rows}
     return {"model": MODEL, "texts": texts}
@@ -423,26 +516,38 @@ def _synthetic(seed: int, flips: dict[str, int], kl_boost: float) -> dict:
 def selftest() -> int:
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
+        tmpd = Path(tmp)
         paths = []
-        for k in range(5):  # stock wobbles only at near-ties (seed noise)
-            p = Path(tmp) / f"s{k}.json"
-            p.write_text(json.dumps(_synthetic(1000 + k, {}, 0.0)))
+        for k in range(5):
+            # Stock wobbles at near-ties; capture 4 also swaps ONE high-margin
+            # row, the bimodal-stock case that used to deaden every gate.
+            p = tmpd / f"s{k}.json"
+            p.write_text(json.dumps(_synthetic(1000 + k, {}, 0.0, jitter=0.05,
+                                               unstable_at=5 if k == 4 else None)))
             paths.append(str(p))
-        calp = Path(tmp) / "c.json"
-        rc = calibrate(str(calp), paths)
-        assert rc == 0, "calibrate failed"
-        clean = Path(tmp) / "clean.json"
-        clean.write_text(json.dumps(_synthetic(999, {}, 0.0)))
-        damaged = Path(tmp) / "damaged.json"
-        damaged.write_text(json.dumps(_synthetic(999, {"prose": 15, "dense_tokens": 12}, 0.0)))
-        klshift = Path(tmp) / "kl.json"
+        calp = tmpd / "c.json"
+        assert calibrate(str(calp), paths) == 0, "calibrate failed"
+        cal = json.loads(calp.read_text())
+        assert sum(t["n_unstable"] for t in cal["texts"].values()) > 0, \
+            "the swapped high-margin row must classify UNSTABLE"
+        assert all(t["tau_stock_spread"] < 0.5 for t in cal["texts"].values()), \
+            "an unstable stock row must not widen tau"
+        clean = tmpd / "clean.json"
+        clean.write_text(json.dumps(_synthetic(999, {}, 0.0, jitter=0.05)))
+        damaged = tmpd / "damaged.json"
+        damaged.write_text(json.dumps(_synthetic(999, {"prose": 15, "dense_tokens": 12}, 0.0, jitter=0.05)))
+        klshift = tmpd / "kl.json"
         klshift.write_text(json.dumps(_synthetic(999, {}, 2.0)))
-        rc0 = compare(str(calp), [str(paths[0])], [str(clean)])
-        rc1 = compare(str(calp), [str(paths[0])], [str(damaged)])
-        rc2 = compare(str(calp), [str(paths[0])], [str(klshift)])
-        assert rc0 == 0, "clean candidate should be WITHIN"
-        assert rc1 == 1, "systematic confident flips should FLAG"
-        assert rc2 == 1, "KL shift should FLAG"
+        shifted = tmpd / "shift.json"
+        shifted.write_text(json.dumps(_synthetic(999, {"prose": 6}, 0.0, jitter=0.05)))
+        assert compare(str(calp), [str(paths[0])], [str(clean)]) == 0, \
+            "clean candidate should be WITHIN"
+        assert compare(str(calp), [str(paths[0])], [str(damaged)]) == 1, \
+            "systematic confident flips should FLAG"
+        assert compare(str(calp), [str(paths[0])], [str(klshift)]) == 1, \
+            "KL shift should FLAG"
+        assert compare(str(calp), [str(paths[0])], [str(shifted)]) == 1, \
+            "a moderate shift must still FLAG despite the unstable stock row"
 
         def tail_at(start: int, lam: float) -> float:
             bound = int(lam + 12 * math.sqrt(lam)) + 40
@@ -457,16 +562,40 @@ def selftest() -> int:
 
         # A capture whose prompt does not match the calibration is unqualified
         # instead of being compared position-by-position.
-        tampered = json.loads(json.dumps(_synthetic(999, {}, 0.0)))
+        tampered = json.loads(json.dumps(_synthetic(999, {}, 0.0, jitter=0.05)))
         tampered["texts"]["prose"]["prompt_sha256"] = "0" * 64
-        tampered_path = Path(tmp) / "tampered.json"
+        tampered_path = tmpd / "tampered.json"
         tampered_path.write_text(json.dumps(tampered))
         assert compare(str(calp), [str(paths[0])], [str(tampered_path)]) == 2, \
             "prompt mismatch should be UNQUALIFIED"
 
-        print("selftest: clean WITHIN, flips FLAG, kl-shift FLAG, "
-              "poisson tail + prompt pin OK -> OK")
+        # Malformed receipts are unqualified (2), never the FLAG code (1).
+        broken = tmpd / "broken.json"
+        broken.write_text("{not json")
+        assert compare(str(calp), [str(paths[0])], [str(broken)]) == 2, \
+            "malformed receipt should be UNQUALIFIED"
+
+        # The CLI must keep the sides apart with several receipts per side.
+        saved = sys.argv
+        try:
+            sys.argv = ["x", "compare", "--calibration", str(calp), "--stock", str(paths[0]),
+                        "--cand", str(damaged), str(klshift)]
+            assert main() == 1, "CLI compare with two candidate receipts"
+            sys.argv = ["x", "compare", "--calibration", str(calp), "--stock", str(paths[0]),
+                        "--cand", str(clean)]
+            assert main() == 0, "CLI compare with one candidate receipt"
+        finally:
+            sys.argv = saved
+
+        print("selftest: clean WITHIN, flips FLAG, kl-shift FLAG, unstable-row "
+              "regression, poisson tail, prompt pin, malformed=2, CLI sides -> OK")
         return 0
+
+
+def _unqualified(exc: Exception) -> int:
+    """Malformed / missing / mismatched inputs are unqualified (2), never FLAG."""
+    print(f"UNQUALIFIED: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return 2
 
 
 def main() -> int:
@@ -474,19 +603,22 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("capture"); c.add_argument("--out", required=True)
     k = sub.add_parser("calibrate"); k.add_argument("--out", required=True); k.add_argument("inputs", nargs="+")
-    p = sub.add_parser("compare")
+    p = sub.add_parser("compare", help="judge candidate receipt(s) against stock receipt(s)")
     p.add_argument("--calibration", required=True)
-    p.add_argument("a", nargs="+", help="stock receipt(s)")
-    p.add_argument("b", nargs="+", help="candidate receipt(s)")
+    p.add_argument("--stock", nargs="+", required=True, help="stock receipt(s): the A side")
+    p.add_argument("--cand", nargs="+", required=True, help="candidate receipt(s): the B side")
     sub.add_parser("selftest")
     args = ap.parse_args()
-    if args.cmd == "capture":
-        return capture(args.out)
-    if args.cmd == "calibrate":
-        return calibrate(args.out, args.inputs)
-    if args.cmd == "compare":
-        return compare(args.calibration, list(args.a), list(args.b))
-    return selftest()
+    try:
+        if args.cmd == "capture":
+            return capture(args.out)
+        if args.cmd == "calibrate":
+            return calibrate(args.out, args.inputs)
+        if args.cmd == "compare":
+            return compare(args.calibration, list(args.stock), list(args.cand))
+        return selftest()
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        return _unqualified(exc)
 
 
 if __name__ == "__main__":
