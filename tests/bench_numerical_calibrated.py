@@ -27,6 +27,7 @@ import math
 import os
 import random
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -100,20 +101,33 @@ def kl_shared(ax: dict, by: dict) -> float | None:
 
 
 def poisson_critical(lam: float, alpha: float = 0.05) -> int:
-    """Smallest c with P(X >= c | lam) <= alpha (normal-tail fallback for large lam)."""
+    """Smallest c with P(X >= c | lam) <= alpha.
+
+    Exact for lam <= 500 (incremental Poisson pmf). Above that the same
+    one-sided normal tail is used at the same alpha, so a weak calibration
+    cannot silently raise the FLAG bar.
+    """
     if lam <= 0:
         return 1
     if lam > 500:
-        return max(1, math.ceil(lam + 3 * math.sqrt(lam)))
-    term, total, c = math.exp(-lam), math.exp(-lam), 0
-    while True:
+        low, high = 0.0, 40.0  # bisect the one-sided normal quantile at alpha
+        for _ in range(80):
+            mid = (low + high) / 2
+            if 0.5 * math.erfc(mid / math.sqrt(2)) > alpha:
+                low = mid
+            else:
+                high = mid
+        # One-count margin over the normal-tail quantile: this branch only runs
+        # for weak calibrations and must never lower the FLAG bar there.
+        return max(1, math.ceil(lam + ((low + high) / 2) * math.sqrt(lam)) + 1)
+    term = math.exp(-lam)  # P(X = 0)
+    tail = 1.0  # P(X >= 0)
+    c = 0
+    while tail > alpha and c <= 10 * lam + 50:
+        tail -= term  # now P(X >= c + 1)
         c += 1
-        total += term * lam / c
-        if 1.0 - total <= alpha:  # P(X >= c) = 1 - P(X <= c-1)
-            return c
         term = term * lam / c
-        if c > 10 * lam + 50:
-            return c
+    return c
 
 
 def load_receipt(path: str) -> dict:
@@ -145,10 +159,15 @@ def capture(out: str) -> int:
     res = {"base": BASE, "model": MODEL, "texts": {}}
     for name, text in TEXTS.items():
         rec = {"prompt_chars": len(text), "prompt_sha256": hashlib.sha256(text.encode()).hexdigest()}
-        status, d = _post("/v1/completions", {
-            "model": MODEL, "prompt": text, "max_tokens": 1, "temperature": 0,
-            "echo": True, "logprobs": 1, "prompt_logprobs": 20,
-        })
+        try:
+            status, d = _post("/v1/completions", {
+                "model": MODEL, "prompt": text, "max_tokens": 1, "temperature": 0,
+                "echo": True, "logprobs": 1, "prompt_logprobs": 20,
+            })
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+            print(f"{name}: capture request failed ({exc}); capture is unqualified",
+                  file=sys.stderr)
+            return 2
         pl = (d["choices"][0].get("prompt_logprobs") or []) if status == 200 else []
         if not isinstance(pl, list) or len(pl) < 2 or not any(pl):
             print(f"{name}: prompt_logprobs unavailable; capture is unqualified", file=sys.stderr)
@@ -241,6 +260,7 @@ def calibrate(out: str, inputs: list[str]) -> int:
                 tie_dis += [caps[a][i][2] != caps[b][i][2] for i in ties]
         cal["texts"][name] = {
             "positions": n, "m_star": m_star, "n_confident": n_conf, "n_tie": len(ties),
+            "prompt_sha256": receipts[0]["texts"][name]["prompt_sha256"],
             "stock_disagreements_confident": f, "r_up": r_up,
             "null_kl_mean": sum(kls) / len(kls) if kls else None,
             "null_kl_max": max(kls) if kls else None,
@@ -291,6 +311,12 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             print(f"{name}: UNQUALIFIED position count differs from calibration")
             invalid = True
             continue
+        fingerprint = tc.get("prompt_sha256")
+        if fingerprint is not None and any(
+                r["texts"][name].get("prompt_sha256") != fingerprint for r in ra + rb):
+            print(f"{name}: UNQUALIFIED prompt differs from calibration")
+            invalid = True
+            continue
         flips = tie_dis = sep_exceed = 0
         kls = []
         # stock consensus token per position (majority across A captures)
@@ -313,13 +339,15 @@ def compare(cal_path: str, a_paths: list[str], b_paths: list[str]) -> int:
             else:
                 tie_dis += amax != cons[i]
             # separation: every candidate capture's logprob for the stock
-            # consensus token strictly outside every stock capture's, by > tau
+            # consensus token strictly outside every stock capture's, by > tau.
+            # The stock side must be COMPLETE: a token stock itself lost in some
+            # capture is not a reference, and partial ranges would widen the
+            # stock span and hide real shifts.
             svals = [r[i][1].get(cons[i]) for r in rows_a]
+            if any(v is None for v in svals):
+                continue
             cvals = [r[i][1].get(cons[i]) for r in rows_b]
-            svals = [v for v in svals if v is not None]
             cvals = [v for v in cvals if v is not None]
-            if not svals:
-                continue  # stock itself lost the token: no reference to test
             if not cvals:
                 sep_exceed += 1  # token vanished from EVERY candidate top-k
                 continue
@@ -415,7 +443,29 @@ def selftest() -> int:
         assert rc0 == 0, "clean candidate should be WITHIN"
         assert rc1 == 1, "systematic confident flips should FLAG"
         assert rc2 == 1, "KL shift should FLAG"
-        print("selftest: clean WITHIN, flips FLAG, kl-shift FLAG -> OK")
+
+        def tail_at(start: int, lam: float) -> float:
+            bound = int(lam + 12 * math.sqrt(lam)) + 40
+            return sum(math.exp(-lam) * lam ** k / math.factorial(k)
+                       for k in range(max(0, start), bound + 1))
+
+        # The critical count is the documented tail definition: the smallest c
+        # with P(X >= c) <= alpha, not alpha one step early.
+        for lam in (0.5, 5.0, 30.0):
+            crit = poisson_critical(lam)
+            assert tail_at(crit, lam) <= 0.05 < tail_at(crit - 1, lam), (lam, crit)
+
+        # A capture whose prompt does not match the calibration is unqualified
+        # instead of being compared position-by-position.
+        tampered = json.loads(json.dumps(_synthetic(999, {}, 0.0)))
+        tampered["texts"]["prose"]["prompt_sha256"] = "0" * 64
+        tampered_path = Path(tmp) / "tampered.json"
+        tampered_path.write_text(json.dumps(tampered))
+        assert compare(str(calp), [str(paths[0])], [str(tampered_path)]) == 2, \
+            "prompt mismatch should be UNQUALIFIED"
+
+        print("selftest: clean WITHIN, flips FLAG, kl-shift FLAG, "
+              "poisson tail + prompt pin OK -> OK")
         return 0
 
 
