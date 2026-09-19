@@ -85,8 +85,24 @@ set +a
 # from #207. Use ABLIT=1 ./start.sh to opt in.
 ABLIT=0
 # Each entry is NAME=value; quoting preserves whitespace and empty values.
+# Warn when an inherited environment value silently displaces a .env value for a key
+# that changes what gets served. Ambient env (systemd unit, login profile, docker -e)
+# is indistinguishable from an explicit caller export at the capture above, so say so
+# out loud rather than fail later against a path the operator never configured. #168
+_glm53_env_watch=" HF_HOME WORKER_HF_HOME MODEL MODEL_REVISION IMAGE PORT TP NNODES "
 # shellcheck disable=SC2163
-for _kv in ${_caller_overrides[@]+"${_caller_overrides[@]}"}; do export "$_kv"; done
+for _kv in ${_caller_overrides[@]+"${_caller_overrides[@]}"}; do
+    _name="${_kv%%=*}"; _cval="${_kv#*=}"
+    case "$_glm53_env_watch" in
+      *" $_name "*)
+        if [ -n "${!_name+x}" ] && [ "${!_name}" != "$_cval" ]; then
+            printf "\033[1;33m[glm53-exl3]\033[0m NOTE: %s=%s from the environment overrides .env value %s\n" \
+                   "$_name" "$_cval" "${!_name}" >&2
+        fi ;;
+    esac
+    export "$_kv"
+done
+unset _glm53_env_watch _name _cval
 unset _k _kv _flags _caller_overrides
 
 # ----------------------------- configuration -------------------------------

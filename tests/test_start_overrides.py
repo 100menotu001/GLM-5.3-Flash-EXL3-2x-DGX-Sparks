@@ -183,3 +183,31 @@ if __name__ == "__main__":
     test_indexer_workspace_caller_capture_is_setness_aware()
     test_spinwait_caller_capture_is_setness_aware()
     print("start.sh caller override regression OK")
+
+def _run_preamble_stderr(env_file: str, caller: dict) -> str:
+    source = (ROOT / "start.sh").read_text()
+    marker = "# ----------------------------- configuration -------------------------------"
+    preamble, separator, _rest = source.partition(marker)
+    assert separator, "start.sh configuration marker is missing"
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp); script = tmp / "start.sh"
+        script.write_text(preamble + "\n"); script.chmod(0o755)
+        (tmp / ".env").write_text(env_file)
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}; env.update(caller)
+        r = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+        return r.stderr
+
+def test_ambient_override_of_model_affecting_key_is_announced() -> None:
+    """#168: an inherited env value that displaces .env for a model-affecting key is
+    named on stderr, with both values. Silent when nothing diverges."""
+    dotenv = "HF_HOME=/from/dotenv\nMODEL=from/dotenv\nMAX_NUM_SEQS=2\n"
+    err = _run_preamble_stderr(dotenv, {"HF_HOME": "/from/ambient"})
+    assert "NOTE: HF_HOME=/from/ambient from the environment overrides .env value /from/dotenv" in err
+    assert err.count("NOTE:") == 1
+    # ambient value equal to .env: nothing to report
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {"HF_HOME": "/from/dotenv"})
+    # clean environment: nothing to report
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {})
+    # an unwatched key still wins (PR #161) and is not announced
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {"MAX_NUM_SEQS": "4"})
