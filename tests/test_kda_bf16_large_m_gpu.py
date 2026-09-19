@@ -65,7 +65,7 @@ def _run() -> int:
     import vllm.model_executor.layers.quantization.exl3 as exl3mod
 
     os.environ["GLM53_KDA_BF16_LARGE_M"] = "1"
-    os.environ.pop("GLM53_KDA_BF16_LARGE_M_MIN_M", None)
+    check("threshold-constant-512", exl3mod.KDA_BF16_LARGE_M_MIN_M == 512)
     meth, layer = build_real_layer(device)
     check("retention-present", hasattr(layer, "glm53_bf16_lm_w"),
           f"w={tuple(layer.glm53_bf16_lm_w.shape)} dtype={layer.glm53_bf16_lm_w.dtype}")
@@ -140,7 +140,9 @@ def _run() -> int:
         dd = (yg.cpu().float() - ye.cpu().float()).abs()
         check(f"graph-{tag}-replay", float(dd.max()) == 0.0, f"maxabs={float(dd.max()):.2e}")
 
-    # Fail-closed: bad flag, bad threshold, and TP != 2 all raise at load.
+    # Fail-closed: bad flag and TP != 2 raise at load. The M>512 boundary is
+    # a fixed constant (checked above), not a knob, so there is no threshold
+    # value to reject.
     os.environ["GLM53_KDA_BF16_LARGE_M"] = "bogus"
     try:
         build_real_layer(device)
@@ -148,13 +150,6 @@ def _run() -> int:
     except RuntimeError:
         check("bad-flag-raises", True)
     os.environ["GLM53_KDA_BF16_LARGE_M"] = "1"
-    os.environ["GLM53_KDA_BF16_LARGE_M_MIN_M"] = "bogus"
-    try:
-        build_real_layer(device)
-        check("bad-threshold-raises", False)
-    except RuntimeError:
-        check("bad-threshold-raises", True)
-    os.environ.pop("GLM53_KDA_BF16_LARGE_M_MIN_M", None)
     try:
         import torch as _t
         from vllm.model_executor.layers.quantization.exl3 import (

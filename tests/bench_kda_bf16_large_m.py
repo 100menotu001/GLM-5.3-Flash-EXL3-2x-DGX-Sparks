@@ -130,18 +130,13 @@ def build_real_in_proj(checkpoint: str, layer: int, tp_size: int, tp_rank: int) 
 
 
 def build_method_layer(exl3mod, master: torch.Tensor, enabled: bool, n: int, k: int,
-                       device, threshold_env: str | None = None):
+                       device):
     """Real Glm53DenseFp8Method on a fake layer, through the shipped code path."""
     import vllm.distributed as dist
 
-    names = ("GLM53_KDA_BF16_LARGE_M", "GLM53_KDA_BF16_LARGE_M_MIN_M")
-    prev = {name: os.environ.get(name) for name in names}
+    prev = os.environ.get("GLM53_KDA_BF16_LARGE_M")
     try:
         os.environ["GLM53_KDA_BF16_LARGE_M"] = "1" if enabled else "0"
-        if threshold_env is None:
-            os.environ.pop("GLM53_KDA_BF16_LARGE_M_MIN_M", None)
-        else:
-            os.environ["GLM53_KDA_BF16_LARGE_M_MIN_M"] = threshold_env
         method = exl3mod.Glm53DenseFp8Method(
             "kda", "model.layers.0.self_attn.in_proj_qkvbfg_a")
         layer = torch.nn.Module()
@@ -157,11 +152,10 @@ def build_method_layer(exl3mod, master: torch.Tensor, enabled: bool, n: int, k: 
             method.process_weights_after_loading(layer)
         load_ms = (time.perf_counter() - started) * 1e3
     finally:
-        for name, value in prev.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        if prev is None:
+            os.environ.pop("GLM53_KDA_BF16_LARGE_M", None)
+        else:
+            os.environ["GLM53_KDA_BF16_LARGE_M"] = prev
     return method, layer, load_ms
 
 

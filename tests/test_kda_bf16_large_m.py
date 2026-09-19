@@ -180,7 +180,6 @@ def _load_method_class(torch_fake):
     tree = ast.parse(source)
     wanted_fns = {
         "kda_bf16_large_m_enabled",
-        "kda_bf16_large_m_min_m",
         "kda_bf16_large_m_logical_weight",
         "kda_large_m_dispatch_stats",
         "_kda_large_m_note",
@@ -249,31 +248,12 @@ def _lm_layer(n=_N, k=_K):
     )
 
 
-class MinMTests(unittest.TestCase):
-    """GLM53_KDA_BF16_LARGE_M_MIN_M resolution: default 512, strict ints."""
+class FixedThresholdTests(unittest.TestCase):
+    """The dispatch boundary is a fixed qualified constant, not a knob."""
 
-    def setUp(self):
-        self.env = _load_method_class(_fake_torch())
-        self.threshold = self.env["kda_bf16_large_m_min_m"]
-
-    def test_default_and_override(self):
-        with unittest.mock.patch.dict(os.environ):
-            os.environ.pop("GLM53_KDA_BF16_LARGE_M_MIN_M", None)
-            self.assertEqual(self.threshold(), 512)
-        for value, expected in (("0", 0), ("512", 512), ("1024", 1024),
-                                ("0007", 7)):
-            with unittest.mock.patch.dict(
-                os.environ, {"GLM53_KDA_BF16_LARGE_M_MIN_M": value}
-            ):
-                self.assertEqual(self.threshold(), expected)
-
-    def test_rejects_bad_values(self):
-        for bad in ("-1", "abc", "1.5", " 5", "1e3", "512 "):
-            with unittest.mock.patch.dict(
-                os.environ, {"GLM53_KDA_BF16_LARGE_M_MIN_M": bad}
-            ):
-                with self.assertRaises(RuntimeError):
-                    self.threshold()
+    def test_constant_is_512(self):
+        env = _load_method_class(_fake_torch())
+        self.assertEqual(env["KDA_BF16_LARGE_M_MIN_M"], 512)
 
 
 class Bf16LogicalWeightTests(unittest.TestCase):
@@ -389,12 +369,11 @@ class Bf16RetentionTests(unittest.TestCase):
             raise unittest.SkipTest("install CPU PyTorch for tensor-value regressions")
         cls.torch = torch
 
-    def _env(self, *, enabled=True, threshold=4, shapes=None):
+    def _env(self, *, enabled=True, shapes=None):
         env = _load_method_class(self.torch)
         env["KDA_BF16_LARGE_M_SHAPES"] = frozenset(shapes or {(8, 16)})
         env["KDA_BF16_LARGE_M_DTYPE"] = self.torch.bfloat16
         env["kda_bf16_large_m_enabled"] = lambda: enabled
-        env["kda_bf16_large_m_min_m"] = lambda: threshold
         return env
 
     def _inputs(self, n=8, k=16, seed=3, scale_dtype=None):
@@ -425,20 +404,20 @@ class Bf16RetentionTests(unittest.TestCase):
 
     def test_retains_one_bf16_copy(self):
         torch = self.torch
-        layer, fp8, stored = self._retain(self._env(threshold=4))
+        layer, fp8, stored = self._retain(self._env())
         self.assertTrue(hasattr(layer, "glm53_bf16_lm_w"))
         self.assertEqual(layer.glm53_bf16_lm_w.dtype, torch.bfloat16)
         self.assertEqual(tuple(layer.glm53_bf16_lm_w.shape), (8, 16))
         self.assertEqual(layer.glm53_bf16_lm_n, 8)
         self.assertEqual(layer.glm53_bf16_lm_k, 16)
-        self.assertEqual(layer.glm53_bf16_lm_min_m, 4)
         want = (fp8.to(torch.float32) * stored.to(torch.float32).unsqueeze(1)).to(
             torch.bfloat16)
         self.assertTrue(torch.equal(layer.glm53_bf16_lm_w, want))
 
-    def test_threshold_override_is_what_lands_on_the_layer(self):
-        layer, _, _ = self._retain(self._env(threshold=1024))
-        self.assertEqual(layer.glm53_bf16_lm_min_m, 1024)
+    def test_layer_records_the_fixed_boundary(self):
+        """No override exists: retention always stores 512."""
+        layer, _, _ = self._retain(self._env())
+        self.assertEqual(layer.glm53_bf16_lm_min_m, 512)
 
     def test_disabled_retains_nothing(self):
         layer, _, _ = self._retain(self._env(enabled=False))
@@ -494,7 +473,7 @@ class Bf16RetentionTests(unittest.TestCase):
 
 
 class Bf16ApplyDispatchTests(unittest.TestCase):
-    """Real apply() source: which GEMM path runs for which M and threshold."""
+    """Real apply() source: the fixed M>512 boundary."""
 
     def setUp(self):
         self.marlin_calls = []
@@ -507,58 +486,44 @@ class Bf16ApplyDispatchTests(unittest.TestCase):
         self.meth = self.cls("kda", _IN_PROJ)
         self.meth.ready = True
 
-    def _layer(self, threshold=512):
+    def _layer(self):
         layer = _lm_layer()
         layer.glm53_bf16_lm_w = _FT((_N, _K), dtype="bf16")
         layer.glm53_bf16_lm_n = _N
         layer.glm53_bf16_lm_k = _K
-        layer.glm53_bf16_lm_min_m = threshold
+        layer.glm53_bf16_lm_min_m = 512
         return layer
 
-    def test_bf16_only_above_the_layer_threshold(self):
-        layer = self._layer(threshold=512)
-        self.assertEqual(len(_BF16_LINEAR_CALLS), 0)
-        self.meth.apply(layer, _FT((512, _K)))
-        self.assertEqual(len(_BF16_LINEAR_CALLS), 0)
-        self.assertEqual(len(self.marlin_calls), 1)
-        out = self.meth.apply(layer, _FT((513, _K)))
-        self.assertEqual(len(_BF16_LINEAR_CALLS), 1)
-        self.assertEqual(out.shape, (513, _N))
-
-    def test_default_threshold_keeps_the_decode_band_on_marlin(self):
-        layer = self._layer(threshold=512)
-        for m in (1, 65, 220, 512):
+    def test_fixed_boundary_table(self):
+        """M<=512 runs Marlin; M>=513 runs the BF16 copy."""
+        layer = self._layer()
+        for m in (1, 64, 220, 511, 512):
             self.meth.apply(layer, _FT((m, _K)))
         self.assertEqual(len(_BF16_LINEAR_CALLS), 0)
-        self.assertEqual(len(self.marlin_calls), 4)
-        self.meth.apply(layer, _FT((1536, _K)))
-        self.assertEqual(len(_BF16_LINEAR_CALLS), 1)
+        self.assertEqual(len(self.marlin_calls), 5)
+        for m in (513, 768, 1536):
+            out = self.meth.apply(layer, _FT((m, _K)))
+            self.assertEqual(out.shape, (m, _N))
+        self.assertEqual(len(_BF16_LINEAR_CALLS), 3)
+        self.assertEqual(len(self.marlin_calls), 5)
 
     def test_old_v1_boundary_lengths_stay_marlin(self):
         """M=63/64/65/66 show no dispatch discontinuity under the BF16 path."""
-        layer = self._layer(threshold=512)
+        layer = self._layer()
         for m in (63, 64, 65, 66):
             self.meth.apply(layer, _FT((m, _K)))
         self.assertEqual(len(_BF16_LINEAR_CALLS), 0)
         self.assertEqual(len(self.marlin_calls), 4)
 
-    def test_threshold_is_per_layer(self):
-        low = self._layer(threshold=64)
-        high = self._layer(threshold=1024)
-        self.meth.apply(low, _FT((128, _K)))
-        self.meth.apply(high, _FT((128, _K)))
-        self.assertEqual(len(_BF16_LINEAR_CALLS), 1)
-        self.assertEqual(len(self.marlin_calls), 1)
-
     def test_3d_and_bias_and_wrong_k(self):
-        layer = self._layer(threshold=64)
-        out = self.meth.apply(layer, _FT((2, 40, _K)))
+        layer = self._layer()
+        out = self.meth.apply(layer, _FT((2, 300, _K)))
         self.assertEqual(len(_BF16_LINEAR_CALLS), 1)
-        self.assertEqual(_BF16_LINEAR_CALLS[0][0].shape, (80, _K))
-        self.assertEqual(out.shape, (2, 40, _N))
+        self.assertEqual(_BF16_LINEAR_CALLS[0][0].shape, (600, _K))
+        self.assertEqual(out.shape, (2, 300, _N))
         before = len(_BF16_LINEAR_CALLS)
-        self.meth.apply(layer, _FT((512, _K)), bias=_FT((_N,)))
-        self.meth.apply(layer, _FT((512, _K + 8)))
+        self.meth.apply(layer, _FT((600, _K)), bias=_FT((_N,)))
+        self.meth.apply(layer, _FT((600, _K + 8)))
         self.assertEqual(len(_BF16_LINEAR_CALLS), before)
         self.assertEqual(len(self.marlin_calls), 2)
 
@@ -570,11 +535,11 @@ class Bf16ApplyDispatchTests(unittest.TestCase):
 
     def test_dispatch_counters_track_rows(self):
         stats = self.env["kda_large_m_dispatch_stats"]
-        layer = self._layer(threshold=64)
-        self.meth.apply(layer, _FT((100, _K)))
+        layer = self._layer()
+        self.meth.apply(layer, _FT((600, _K)))
         self.meth.apply(layer, _FT((10, _K)))
         self.assertEqual(stats()["bf16_calls"], 1)
-        self.assertEqual(stats()["bf16_rows"], 100)
+        self.assertEqual(stats()["bf16_rows"], 600)
         self.assertEqual(stats()["marlin_calls"], 1)
         self.assertEqual(stats()["marlin_rows"], 10)
 

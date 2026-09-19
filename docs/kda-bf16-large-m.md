@@ -26,8 +26,12 @@ master is never restored, so FP8 weight-quantization semantics stay constant.
 Activations stay BF16. Construction uses 512-row chunks (~8 MiB FP32 scratch,
 no second full-size FP32 allocation); a tiny-M cuBLAS probe at load fails a
 broken path during load, not on the first prefill. Dispatch reads only tensor
-metadata (no host sync); the threshold resolves once at load and is stored on
-the layer, so CUDA-graph capture and replay cannot disagree.
+metadata (no host sync). The dispatch boundary is fixed at M > 512: it was
+selected from the measured TP2 runtime distribution (decode stayed at
+M<=220, the 221-511 band was empty in the measured workloads, prefill was
+dominated by much larger M), it is stored on the layer at load so CUDA-graph
+capture and replay cannot disagree, and it is intentionally not
+user-configurable -- 512 is the boundary actually measured and qualified.
 
 ## Why not W8A8
 
@@ -93,9 +97,10 @@ Do not combine these percentages; each is a separate bounded measurement.
 
 ## Validation
 
-* `tests/test_kda_bf16_large_m.py`: flag/threshold parsing, chunk-invariant
-  construction, stored-scale-vs-fp32 regression, fail-closed retention,
-  M<=512 Marlin / M>512 BF16 dispatch, per-layer thresholds, counters.
+* `tests/test_kda_bf16_large_m.py`: flag validation, fixed-512 constant,
+  chunk-invariant construction, stored-scale-vs-fp32 regression,
+  fail-closed retention, the fixed M<=512 Marlin / M>512 BF16 dispatch table
+  (including the old 63/64/65/66 boundary), counters.
 * `tests/test_kda_bf16_large_m_gpu.py`: retention, dispatch counters,
   BF16-vs-Marlin numerics, graph capture/replay on both branches, fail-closed.
 * `tests/bench_kda_bf16_large_m.py`: Marlin-vs-BF16 numerics and crossover

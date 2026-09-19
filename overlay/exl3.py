@@ -1857,10 +1857,11 @@ def _glm53_use_marlin(group: str, prefix: str, tp_size: int) -> bool:
 # load-time BF16 copy of the SAME logical FP8 weight: the e4m3 tensor times
 # the stored per-output-channel scale that Marlin itself multiplies by.
 # Activations stay BF16, so there is no activation-quantization term.
-# Dispatch boundary from SM121 microbenchmarks on in_proj [12576x4096]:
+# Fixed dispatch boundary from SM121 microbenchmarks on in_proj [12576x4096]:
 # decode never exceeds M=220, prefill chunks land at M>=768, and the band
 # 221-511 is empty in every measured step, so 512 sits inside the gap and
-# keeps ordinary decode entirely on stock Marlin.
+# keeps ordinary decode entirely on stock Marlin. Intentionally not
+# user-configurable: 512 is the boundary actually measured and qualified.
 KDA_BF16_LARGE_M_MIN_M = 512
 # Only projection shape the path is validated for (TP2-local KDA
 # in_proj_qkvbfg_a). Everything else stays Marlin by construction.
@@ -1879,24 +1880,6 @@ def kda_bf16_large_m_enabled() -> bool:
     if raw not in ("0", "1"):
         raise RuntimeError("GLM53_KDA_BF16_LARGE_M must be 0 or 1")
     return raw == "1"
-
-
-def kda_bf16_large_m_min_m() -> int:
-    """Largest M still served by Marlin; larger M uses the BF16 copy.
-
-    Resolved once at load and stored on the layer, so a serving boot cannot
-    drift between CUDA-graph capture and replay. Overridable via
-    GLM53_KDA_BF16_LARGE_M_MIN_M; the default is the measured crossover.
-    """
-    raw = os.environ.get("GLM53_KDA_BF16_LARGE_M_MIN_M", "")
-    if raw == "":
-        return KDA_BF16_LARGE_M_MIN_M
-    # Strict: int() would accept " 5", "+5" and unicode digits.
-    if not re.fullmatch(r"[0-9]+", raw):
-        raise RuntimeError(
-            "GLM53_KDA_BF16_LARGE_M_MIN_M must be a non-negative integer"
-        )
-    return int(raw)
 
 
 def kda_bf16_large_m_logical_weight(
@@ -2067,7 +2050,9 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
                 "GLM53_KDA_BF16_LARGE_M=1 expects the stored Marlin scale "
                 f"in BF16/FP16 (got {scales_stored.dtype})"
             )
-        threshold = kda_bf16_large_m_min_m()
+        # Fixed qualified boundary: stored on the layer so capture and replay
+        # cannot disagree about the branch.
+        threshold = KDA_BF16_LARGE_M_MIN_M
         try:
             w_bf16 = kda_bf16_large_m_logical_weight(
                 fp8, scales_stored, KDA_BF16_LARGE_M_DTYPE)
