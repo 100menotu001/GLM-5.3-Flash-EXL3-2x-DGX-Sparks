@@ -42,7 +42,9 @@ def test_max_num_seqs_inline_override_wins() -> None:
     assert result.stdout.strip() == "MAX_NUM_SEQS=4"
 
 
-def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
+def _run_preamble_proc(
+    env_file: str, caller: dict[str, str], probe: str
+) -> subprocess.CompletedProcess[str]:
     """Run start.sh's pre-configuration preamble with a synthetic .env."""
     source = (ROOT / "start.sh").read_text()
     marker = "# ----------------------------- configuration -------------------------------"
@@ -58,10 +60,14 @@ def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
 
         env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}
         env.update(caller)
-        result = subprocess.run(
+        return subprocess.run(
             ["bash", str(script)], check=True, capture_output=True, text=True, env=env
         )
-    return result.stdout.strip()
+
+
+def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
+    """Stdout of the preamble run, stripped."""
+    return _run_preamble_proc(env_file, caller, probe).stdout.strip()
 
 
 def test_default_reasoning_effort_caller_override_is_setness_aware() -> None:
@@ -184,19 +190,10 @@ if __name__ == "__main__":
     test_spinwait_caller_capture_is_setness_aware()
     print("start.sh caller override regression OK")
 
-def _run_preamble_stderr(env_file: str, caller: dict) -> str:
-    source = (ROOT / "start.sh").read_text()
-    marker = "# ----------------------------- configuration -------------------------------"
-    preamble, separator, _rest = source.partition(marker)
-    assert separator, "start.sh configuration marker is missing"
-    with tempfile.TemporaryDirectory() as raw_tmp:
-        tmp = Path(raw_tmp); script = tmp / "start.sh"
-        script.write_text(preamble + "\n"); script.chmod(0o755)
-        (tmp / ".env").write_text(env_file)
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}; env.update(caller)
-        r = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
-        assert r.returncode == 0, r.stderr
-        return r.stderr
+def _run_preamble_stderr(env_file: str, caller: dict[str, str]) -> str:
+    """Stderr of the preamble run with no probe appended."""
+    return _run_preamble_proc(env_file, caller, "\n").stderr
+
 
 def test_ambient_override_of_model_affecting_key_is_announced() -> None:
     """#168: an inherited env value that displaces .env for a model-affecting key is
