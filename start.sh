@@ -390,6 +390,15 @@ GLM53_EXL3_MOE_FAST="${GLM53_EXL3_MOE_FAST-0}"
 # Dense projections FP8 weight-only via Marlin (overlay/patch_dense_fp8.py). off = BF16 as shipped.
 # PROVISIONAL (changes target numerics; needs a KLD panel). Groups: shared,dense,kda,mla.
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
+# Large-M KDA BF16 prefill path (overlay/exl3.py). Requires kda in
+# GLM53_DENSE_FP8; retains a BF16 copy of the logical FP8 in_proj weight at
+# load and serves M > GLM53_KDA_BF16_LARGE_M_MIN_M from BF16 GEMM. Small M
+# stays on stock FP8-Marlin. Changes target numerics (see
+# docs/kda-bf16-large-m.md); default off.
+GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
+# BF16 path only: largest M still served by Marlin. Empty keeps the code
+# default (512), inside the measured decode/prefill gap.
+GLM53_KDA_BF16_LARGE_M_MIN_M="${GLM53_KDA_BF16_LARGE_M_MIN_M-}"
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
@@ -579,6 +588,31 @@ _glm53_validate_enum() {
     return 2
 }
 
+# Empty inherits the overlay's own default; otherwise any base-10 value in
+# [0, GLM53_NONNEG_MAX] is accepted (0 is meaningful for dispatch thresholds,
+# unlike _glm53_canonical_positive_int). Leading zeros are stripped so both
+# ranks receive the same canonical text.
+GLM53_NONNEG_MAX=1000000
+_glm53_validate_nonneg_int() {
+    local name="$1" value="$2" canonical
+    [ -n "$value" ] || return 0
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$name must be empty or a base-10 integer (got: $value)" >&2
+        return 2
+    fi
+    canonical="$value"
+    while [ "${canonical#0}" != "$canonical" ]; do canonical="${canonical#0}"; done
+    [ -n "$canonical" ] || canonical=0
+    if [ "${#canonical}" -gt "${#GLM53_NONNEG_MAX}" ] \
+       || [ "$canonical" -gt "$GLM53_NONNEG_MAX" ]; then
+        echo "$name must be between 0 and $GLM53_NONNEG_MAX (got: $value)" >&2
+        return 2
+    fi
+    printf -v "$name" '%s' "$canonical"
+    # shellcheck disable=SC2163
+    export "$name"
+}
+
 _glm53_validate_spinwait_ms() {
     if [ "$GLM53_SPINWAIT_MS" = "stock" ]; then
         export GLM53_SPINWAIT_MS
@@ -649,6 +683,9 @@ validate_numeric_config() {
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
+    _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
+    _glm53_validate_nonneg_int GLM53_KDA_BF16_LARGE_M_MIN_M \
+        "${GLM53_KDA_BF16_LARGE_M_MIN_M-}" || return
     _glm53_validate_spinwait_ms || return
     _glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}" || return
     _glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}" || return
@@ -1961,7 +1998,8 @@ launch_cluster() {
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_EXL3_MOE_FAST \
+             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M \
+             GLM53_KDA_BF16_LARGE_M_MIN_M \
              GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
@@ -2146,6 +2184,8 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
         -e GLM53_EXL3_MOE_FAST="$GLM53_EXL3_MOE_FAST" \
+        -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
+        -e GLM53_KDA_BF16_LARGE_M_MIN_M="$GLM53_KDA_BF16_LARGE_M_MIN_M" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
         -e MODEL_DIR="$MODEL_DIR" \
         -e VLLM_API_KEY \
