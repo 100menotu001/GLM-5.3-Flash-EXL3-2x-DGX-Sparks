@@ -181,15 +181,6 @@ def test_shell_assignments_preserve_caller_values() -> None:
     )
 
 
-if __name__ == "__main__":
-    test_every_env_example_key_preserves_caller_setness()
-    test_shell_assignments_preserve_caller_values()
-    test_max_num_seqs_inline_override_wins()
-    test_default_reasoning_effort_caller_override_is_setness_aware()
-    test_indexer_workspace_caller_capture_is_setness_aware()
-    test_spinwait_caller_capture_is_setness_aware()
-    print("start.sh caller override regression OK")
-
 def _run_preamble_stderr(env_file: str, caller: dict[str, str]) -> str:
     """Stderr of the preamble run with no probe appended."""
     return _run_preamble_proc(env_file, caller, "\n").stderr
@@ -208,3 +199,14 @@ def test_ambient_override_of_model_affecting_key_is_announced() -> None:
     assert "NOTE:" not in _run_preamble_stderr(dotenv, {})
     # an unwatched key still wins (PR #161) and is not announced
     assert "NOTE:" not in _run_preamble_stderr(dotenv, {"MAX_NUM_SEQS": "4"})
+
+
+if __name__ == "__main__":
+    test_ambient_override_of_model_affecting_key_is_announced()
+    test_every_env_example_key_preserves_caller_setness()
+    test_shell_assignments_preserve_caller_values()
+    test_max_num_seqs_inline_override_wins()
+    test_default_reasoning_effort_caller_override_is_setness_aware()
+    test_indexer_workspace_caller_capture_is_setness_aware()
+    test_spinwait_caller_capture_is_setness_aware()
+    print("start.sh caller override regression OK")
