@@ -464,6 +464,15 @@ class Bf16RetentionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._retain(self._env(), scale_dtype=self.torch.float32)
 
+    def test_fp16_activation_path_rejected_at_load(self):
+        with self.assertRaises(RuntimeError):
+            self._retain(self._env(), scale_dtype=self.torch.float16)
+
+    def test_disabled_fp16_path_remains_available(self):
+        layer, _, _ = self._retain(
+            self._env(enabled=False), scale_dtype=self.torch.float16)
+        self.assertFalse(hasattr(layer, "glm53_bf16_lm_w"))
+
     def test_probe_failure_raises(self):
         def boom(*a, **k):
             raise RuntimeError("no cublas for you")

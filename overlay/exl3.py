@@ -2007,7 +2007,7 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
 
         Fail-closed: a KDA in_proj layer with the feature enabled must satisfy
         every predicate (TP=2, SM121 capability, validated shape, e4m3 weight
-        with a BF16/FP16 stored scale); anything else raises at load instead
+        with a BF16 stored scale); anything else raises at load instead
         of silently running Marlin under a large-M label. Non-candidate
         layers retain nothing and stay on Marlin.
         """
@@ -2045,10 +2045,12 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
                 "GLM53_KDA_BF16_LARGE_M=1 expects an e4m3 logical weight "
                 f"(got {fp8.dtype})"
             )
-        if scales_stored.dtype not in (torch.bfloat16, torch.float16):
+        # process_weights_after_loading stores scales in layer.orig_dtype.
+        # FP16 scales therefore identify an unqualified FP16 activation path.
+        if scales_stored.dtype != torch.bfloat16:
             raise RuntimeError(
-                "GLM53_KDA_BF16_LARGE_M=1 expects the stored Marlin scale "
-                f"in BF16/FP16 (got {scales_stored.dtype})"
+                "GLM53_KDA_BF16_LARGE_M=1 requires BF16 weights/activations "
+                f"(stored scale dtype is {scales_stored.dtype}); FP16 is not qualified"
             )
         # Fixed qualified boundary: stored on the layer so capture and replay
         # cannot disagree about the branch.

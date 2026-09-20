@@ -1,7 +1,8 @@
 # KDA large-M BF16 prefill optimization
 
-Status: implementation PR document. Opt-in via `GLM53_KDA_BF16_LARGE_M=1`;
-default is `0` (stock behavior everywhere). Research provenance: PR #182.
+Status: experimental, default off. Opt-in via `GLM53_KDA_BF16_LARGE_M=1`;
+default is `0` (stock behavior everywhere). BF16 weights/activations only:
+enabling this path with FP16 is rejected at load. Research provenance: PR #182.
 
 ## Motivation
 
@@ -32,6 +33,11 @@ M<=220, the 221-511 band was empty in the measured workloads, prefill was
 dominated by much larger M), it is stored on the layer at load so CUDA-graph
 capture and replay cannot disagree, and it is intentionally not
 user-configurable -- 512 is the boundary actually measured and qualified.
+
+M is the number of scheduled matrix rows, not a prefill/decode mode flag.
+The distribution above describes the original measurements, not every workload:
+later probes exercised prefill at M=511/512/513. Mixed batches can include
+decode rows in a large-M operation.
 
 ## Why not W8A8
 
@@ -69,6 +75,13 @@ same position stayed 0.768-0.782 alongside stock). The remaining BF16-vs-stock
 differences sit inside measured stock/runtime variation. This is engineering
 evidence, not an equivalence claim: no mathematical or bitwise equivalence is
 asserted.
+
+Later maintainer qualification covered 46 texts across eight fresh boots.
+The frozen numerical comparator also flagged the held-out stock control,
+so that broader compatibility result is inconclusive. Saved code-answer
+inspection did not establish a general accuracy regression or improvement.
+See the [qualification report](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/pull/233#issuecomment-5748560505)
+for measured speed, output-budget limitations, and cache/preemption caveats.
 
 ## Performance (TP2 / 2xGB10)
 
