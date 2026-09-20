@@ -10,7 +10,10 @@ FP8-Marlin W8A16 performs well at small M but is slow for the observed KDA
 prefill geometry. On TP2/2xGB10, the KDA `in_proj` (TP2-local `[12576x4096]`)
 runs decode at M=1..220 and prefill at M>=768, with the band 221-511 empty in
 every measured step. A large-M GEMM for that projection recovers 11-14% of
-cold/mixed prefill TTFT while leaving decode untouched.
+cold/mixed prefill TTFT while leaving decode untouched. TP=3 uses the same
+dispatch on the padded-head local shape `[8726x4096]` (64→66 heads, 22 per
+rank, `f_a`/`g_a` replicated); serving speed on 3×GB10 is not a TP2
+percentage.
 
 ## Architecture
 
@@ -101,12 +104,14 @@ Do not combine these percentages; each is a separate bounded measurement.
 
 ## Memory cost
 
-* Retained copy: 12576 x 4096 x 2 bytes = 98.25 MiB/layer/rank, 34 KDA layers
-* Theoretical +3.26 GiB/rank; measured model load 79.65 -> 82.94 GiB
-  (**+3.29 GiB/rank**)
-* KV reservation and the tested 850k context remain unchanged (883,552 KV
-  tokens, 552 blocks), while idle headroom is reduced approximately
-  7.7 GiB -> 4.7 GiB on this unified-memory platform.
+* TP2 retained copy: 12576 x 4096 x 2 bytes = 98.25 MiB/layer/rank, 34 KDA
+  layers. Theoretical +3.26 GiB/rank; measured model load 79.65 -> 82.94 GiB
+  (**+3.29 GiB/rank**). Idle headroom on the TP2 kit dropped approximately
+  7.7 GiB -> 4.7 GiB; KV reservation and the tested 850k context stayed
+  unchanged (883,552 KV tokens, 552 blocks).
+* TP3 retained copy: 8726 x 4096 x 2 bytes = 68.17 MiB/layer/rank
+  (**~2.26 GiB/rank** theoretical). Same 34 KDA layers; KV reservation is
+  the TP3 profile's, not the TP2 14 GiB cap.
 
 ## Validation
 
@@ -118,17 +123,19 @@ Do not combine these percentages; each is a separate bounded measurement.
   BF16-vs-Marlin numerics, graph capture/replay on both branches, fail-closed.
 * `tests/bench_kda_bf16_large_m.py`: Marlin-vs-BF16 numerics and crossover
   timing receipt.
-* Launcher: both-rank parity and pre-stop validation for the two new knobs.
+* Launcher: TP2 both-rank and TP3 three-rank forwarding, plus pre-stop
+  `0`/`1` validation.
 
 ## Scope and limitations
 
-* Qualification scope: TP=2 homogeneous GB10/SM121. TP3 is intentionally out
-  of scope: it has different KDA sharding/head-padding geometry and was not
-  testable on this cluster. The loader fails closed on TP != 2 rather than
-  silently running Marlin.
+* Qualification scope: TP=2 and TP=3 homogeneous GB10/SM121. The loader
+  fails closed on any other world size, and on a TP-local `in_proj` shape
+  other than `[12576x4096]` (TP2) or `[8726x4096]` (TP3, 64→66 head pad).
+  Serving-speed receipts above are TP2-only; TP3 uses the same GEMM and
+  the same 512-row dispatch boundary.
 * Not claimed: mathematical/bitwise equivalence, universal quality
-  preservation, zero memory cost, all-workload improvement, TP3 support, or
-  formal numerical certification.
+  preservation, zero memory cost, all-workload improvement, a TP3 speed
+  receipt, or formal numerical certification.
 * The exact maintainer-only study texts were not available locally; the
   campaign reconstructed the mechanism prospectively with the W8A8 path as a
   positive control. Running the maintainer's exact cases against this draft is

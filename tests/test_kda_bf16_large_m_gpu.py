@@ -4,8 +4,8 @@
 Covers: load-time retention gating (flag/shape/TP/capability), M<=512 Marlin
 vs M>512 BF16 dispatch (via the production dispatch counters), BF16-vs-Marlin
 numerics, CUDA graph capture/replay on both branches, and fail-closed
-behavior for a bad flag, bad threshold, or TP != 2. Run with the server
-STOPPED (the test builds real layers outside the engine):
+behavior for a bad flag, bad threshold, or TP not in {2, 3}. Run with the
+server STOPPED (the test builds real layers outside the engine):
 
     GLM53_KDA_BF16_LARGE_M=1 python3 tests/test_kda_bf16_large_m_gpu.py
 """

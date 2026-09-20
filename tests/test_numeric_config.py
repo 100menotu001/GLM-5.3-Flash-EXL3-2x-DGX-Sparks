@@ -253,6 +253,24 @@ def test_kda_bf16_large_m_flag_rejects_bad_values_before_host_actions() -> None:
             assert not harness.host_touching_calls(), (value, harness.calls())
 
 
+def test_tp3_kda_bf16_large_m_flag_is_0_or_1() -> None:
+    """start-tp3.sh validates GLM53_KDA_BF16_LARGE_M before any stop."""
+    guard = guard_source(ROOT / "start-tp3.sh")
+    for value, expected in (("0", 0), ("1", 0), ("", 2), ("yes", 2), ("2", 2)):
+        script = (
+            guard
+            + '\nGLM53_KDA_BF16_LARGE_M="$1"\n'
+            + '_glm53_validate_enum GLM53_KDA_BF16_LARGE_M '
+            + '"$GLM53_KDA_BF16_LARGE_M" 0 1\n'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "test", value],
+            capture_output=True, text=True)
+        assert result.returncode == expected, (value, result.stderr)
+        if expected:
+            assert "GLM53_KDA_BF16_LARGE_M" in result.stderr
+
+
 # #207 makes the prefix-cache retention intervals configurable on every launcher
 # (start.sh / start-tp3.sh / start-tp4.sh): "" (unset) and 0 pass, and a positive
 # value must sit on the 3584-token scheduler-block grid, at most 1e6.
@@ -383,6 +401,7 @@ if __name__ == "__main__":
     test_mixed_prefill_contract()
     test_thin_decode_flag_rejects_bad_values_before_host_actions()
     test_kda_bf16_large_m_flag_rejects_bad_values_before_host_actions()
+    test_tp3_kda_bf16_large_m_flag_is_0_or_1()
     for _launcher in RETENTION_LAUNCHERS:
         test_global_retention_interval_contract(_launcher)
         test_swa_retention_interval_needs_the_dflash_drafter(_launcher)
