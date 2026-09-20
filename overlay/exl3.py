@@ -1863,9 +1863,14 @@ def _glm53_use_marlin(group: str, prefix: str, tp_size: int) -> bool:
 # keeps ordinary decode entirely on stock Marlin. Intentionally not
 # user-configurable: 512 is the boundary actually measured and qualified.
 KDA_BF16_LARGE_M_MIN_M = 512
-# Only projection shape the path is validated for (TP2-local KDA
-# in_proj_qkvbfg_a). Everything else stays Marlin by construction.
-KDA_BF16_LARGE_M_SHAPES = frozenset({(12576, 4096)})
+# TP-local in_proj_qkvbfg_a shapes. TP2 shards 64 heads; TP3 pads 64→66
+# (local 22) and concatenates q/k/v/b + replicated f_a/g_a (128 each).
+# Everything else stays Marlin by construction.
+KDA_BF16_LARGE_M_SHAPES_BY_TP = {
+    2: (12576, 4096),
+    3: (8726, 4096),
+}
+KDA_BF16_LARGE_M_SHAPES = frozenset(KDA_BF16_LARGE_M_SHAPES_BY_TP.values())
 # Rows per dequant chunk: bounds the peak fp32 intermediate to ~8 MiB at
 # K=4096 instead of one [12576,4096] fp32 allocation (~196 MiB).
 KDA_BF16_LARGE_M_CHUNK_ROWS = 512
@@ -2002,14 +2007,15 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
         Materializes the logical weight the stock path already implements --
         the FP8 e4m3 tensor times the STORED per-output-channel scale that
         Marlin consumes -- as one BF16 [N,K] copy, and retains nothing else.
-        Cost when enabled: 12576 x 4096 x 2 bytes = 98.25 MiB per
-        layer-rank (34 KDA layers, ~3.26 GiB/rank theoretical).
+        Cost when enabled: TP2 12576 x 4096 x 2 bytes = 98.25 MiB per
+        layer-rank (~3.26 GiB/rank, 34 KDA layers); TP3 8726 x 4096 x 2
+        bytes = 68.17 MiB per layer-rank (~2.26 GiB/rank).
 
         Fail-closed: a KDA in_proj layer with the feature enabled must satisfy
-        every predicate (TP=2, SM121 capability, validated shape, e4m3 weight
-        with a BF16 stored scale); anything else raises at load instead
-        of silently running Marlin under a large-M label. Non-candidate
-        layers retain nothing and stay on Marlin.
+        every predicate (TP=2 or TP=3, SM121 capability, validated TP-local
+        shape, e4m3 weight with a BF16 stored scale); anything else raises at
+        load instead of silently running Marlin under a large-M label.
+        Non-candidate layers retain nothing and stay on Marlin.
         """
         if not kda_bf16_large_m_enabled():
             return
@@ -2018,10 +2024,11 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
             and self.prefix.endswith("in_proj_qkvbfg_a")
         ):
             return
-        if tp_size != 2:
+        expected = KDA_BF16_LARGE_M_SHAPES_BY_TP.get(tp_size)
+        if expected is None:
             raise RuntimeError(
-                "GLM53_KDA_BF16_LARGE_M=1 requires TP=2 "
-                f"(got tp_size={tp_size}); TP3 is out of scope"
+                "GLM53_KDA_BF16_LARGE_M=1 requires TP=2 or TP=3 "
+                f"(got tp_size={tp_size})"
             )
         try:
             cap = torch.cuda.get_device_capability(fp8.device)
@@ -2035,10 +2042,11 @@ class Glm53DenseFp8Method(UnquantizedLinearMethod):
                 "GLM53_KDA_BF16_LARGE_M=1 is qualified for SM121/GB10 "
                 f"only (got capability {tuple(int(v) for v in cap)})"
             )
-        if (n, k) not in KDA_BF16_LARGE_M_SHAPES:
+        if (n, k) != expected:
             raise RuntimeError(
-                "GLM53_KDA_BF16_LARGE_M=1 is qualified for the TP2-local "
-                f"KDA in_proj shape only (got [{n}x{k}])"
+                "GLM53_KDA_BF16_LARGE_M=1 is qualified for the "
+                f"TP{tp_size}-local KDA in_proj shape {expected[0]}x{expected[1]} "
+                f"(got [{n}x{k}])"
             )
         if fp8.dtype != torch.float8_e4m3fn:
             raise RuntimeError(

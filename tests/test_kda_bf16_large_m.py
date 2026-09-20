@@ -185,7 +185,8 @@ def _load_method_class(torch_fake):
         "_kda_large_m_note",
     }
     wanted_assigns = {
-        "KDA_BF16_LARGE_M_SHAPES", "KDA_BF16_LARGE_M_MIN_M",
+        "KDA_BF16_LARGE_M_SHAPES", "KDA_BF16_LARGE_M_SHAPES_BY_TP",
+        "KDA_BF16_LARGE_M_MIN_M",
         "KDA_BF16_LARGE_M_CHUNK_ROWS", "KDA_BF16_LARGE_M_DTYPE",
         "_KDA_LARGE_M_DISPATCH_STATS", "_KDA_LARGE_M_STATS_DUMP_EVERY",
     }
@@ -255,6 +256,15 @@ class FixedThresholdTests(unittest.TestCase):
         env = _load_method_class(_fake_torch())
         self.assertEqual(env["KDA_BF16_LARGE_M_MIN_M"], 512)
 
+    def test_shipped_shapes_are_tp2_and_tp3(self):
+        env = _load_method_class(_fake_torch())
+        self.assertEqual(env["KDA_BF16_LARGE_M_SHAPES_BY_TP"], {
+            2: (12576, 4096),
+            3: (8726, 4096),
+        })
+        self.assertEqual(env["KDA_BF16_LARGE_M_SHAPES"],
+                         frozenset({(12576, 4096), (8726, 4096)}))
+
 
 class Bf16LogicalWeightTests(unittest.TestCase):
     """Real dequant source: the exact logical weight, chunk-invariant."""
@@ -322,14 +332,22 @@ class Bf16LogicalWeightTests(unittest.TestCase):
         self.assertLess(rel, 0.005)
 
     def test_memory_math_matches_the_disclosed_cost(self):
-        """12576 x 4096 BF16 = 98.25 MiB per layer-rank."""
+        """TP2 12576x4096 = 98.25 MiB; TP3 8726x4096 ≈ 68.17 MiB per layer-rank."""
         torch = self.torch
-        self.assertEqual(self._env()["KDA_BF16_LARGE_M_SHAPES"],
-                         frozenset({(12576, 4096)}))
-        self.assertEqual(self._env()["KDA_BF16_LARGE_M_DTYPE"], torch.bfloat16)
+        env = _load_method_class(torch)
+        self.assertEqual(env["KDA_BF16_LARGE_M_SHAPES_BY_TP"], {
+            2: (12576, 4096),
+            3: (8726, 4096),
+        })
+        self.assertEqual(env["KDA_BF16_LARGE_M_SHAPES"],
+                         frozenset({(12576, 4096), (8726, 4096)}))
+        self.assertEqual(env["KDA_BF16_LARGE_M_DTYPE"], torch.bfloat16)
         per_layer = 12576 * 4096 * torch.bfloat16.itemsize
         self.assertEqual(per_layer / 2**20, 98.25)
         self.assertAlmostEqual(per_layer * 34 / 2**30, 3.26, places=2)
+        tp3 = 8726 * 4096 * torch.bfloat16.itemsize
+        self.assertAlmostEqual(tp3 / 2**20, 68.17, places=2)
+        self.assertAlmostEqual(tp3 * 34 / 2**30, 2.26, places=2)
 
 
 class _RealTorchCudaPatch:
@@ -371,7 +389,9 @@ class Bf16RetentionTests(unittest.TestCase):
 
     def _env(self, *, enabled=True, shapes=None):
         env = _load_method_class(self.torch)
-        env["KDA_BF16_LARGE_M_SHAPES"] = frozenset(shapes or {(8, 16)})
+        shape = next(iter(shapes)) if shapes else (8, 16)
+        env["KDA_BF16_LARGE_M_SHAPES_BY_TP"] = {2: shape, 3: shape}
+        env["KDA_BF16_LARGE_M_SHAPES"] = frozenset(shapes or {shape})
         env["KDA_BF16_LARGE_M_DTYPE"] = self.torch.bfloat16
         env["kda_bf16_large_m_enabled"] = lambda: enabled
         return env
@@ -438,7 +458,12 @@ class Bf16RetentionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._retain(self._env(), tp_size=1)
         with self.assertRaises(RuntimeError):
-            self._retain(self._env(), tp_size=3)
+            self._retain(self._env(), tp_size=4)
+
+    def test_tp3_retains(self):
+        layer, _, _ = self._retain(self._env(), tp_size=3)
+        self.assertTrue(hasattr(layer, "glm53_bf16_lm_w"))
+        self.assertEqual(tuple(layer.glm53_bf16_lm_w.shape), (8, 16))
 
     def test_wrong_capability_raises(self):
         with self.assertRaises(RuntimeError):

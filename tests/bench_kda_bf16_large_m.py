@@ -145,7 +145,7 @@ def build_method_layer(exl3mod, master: torch.Tensor, enabled: bool, n: int, k: 
         layer.input_size_per_partition = k
         layer = layer.to(device)
         started = time.perf_counter()
-        # Report TP=2: the retention path is qualified for TP=2 only, and
+        # Report TP=2: this harness builds the TP2-local [12576x4096] in_proj.
         # Marlin prep itself never reads the world size.
         with unittest.mock.patch.object(
                 dist, "get_tensor_model_parallel_world_size", lambda: 2):

@@ -414,8 +414,9 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # Large-M KDA BF16 prefill path (overlay/exl3.py). Requires kda in
 # GLM53_DENSE_FP8; retains a BF16 copy of the logical FP8 in_proj weight at
 # load and serves M > 512 prefill from BF16 GEMM (fixed qualified boundary:
-# M <= 512 stays on stock FP8-Marlin). Changes target numerics (see
-# docs/kda-bf16-large-m.md); default off.
+# M <= 512 stays on stock FP8-Marlin). TP=2 local shape [12576x4096];
+# TP=3 local shape [8726x4096] (64→66 head pad). Changes target numerics
+# (see docs/kda-bf16-large-m.md); default off.
 GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on both ranks and set
