@@ -56,6 +56,8 @@
 # Handy overrides: SKIP_DOWNLOAD=1 SKIP_SYNC=1 SKIP_PULL=1 SKIP_SHIP=1 SKIP_BUILD=1 PULL=1 BUILD=1 TAIL=1 HF_TOKEN=...
 # ============================================================================
 set -euo pipefail
+# Non-login environments (cron, some service managers) may omit USER; default to the effective account. #197
+USER="${USER:-$(id -un)}"
 # log/warn/die live here (not under helpers) so the .env preamble below can use them.
 log()  { printf '\033[1;36m[glm53-exl3]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[glm53-exl3]\033[0m %s\n' "$*" >&2; }
