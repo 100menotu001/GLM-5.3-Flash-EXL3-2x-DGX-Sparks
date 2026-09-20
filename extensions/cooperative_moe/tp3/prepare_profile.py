@@ -8,15 +8,14 @@ from pathlib import Path
 
 from manifest import verify_artifacts
 
-# Reviewed repin (thin-decode split from #182). overlay/exl3.py gained the
-# opt-in GLM53_EXL3_MOE_FAST dispatch, the gate/up SUH pointer alias (created
-# only in fast mode, whose equality is proven per expert at load, so the aliased
-# table is content-identical) and the FAST=1 fail-closed raises. With the flag
-# unset -- the launcher default, and what start-tp3.sh enforces by unsetting it
-# -- the module builds exactly the pointer tables and takes exactly the paths it
-# did before, so a profile generated from this source behaves like the
-# previously pinned one. Refusal on any further drift is unchanged.
-STOCK_SHA = "7677ab42f4a20698371b5c22d27ecb1b0b416a6860d00a137e13f25e9fd0ed40"
+# Reviewed repin for the default-off KDA large-M BF16 path (#233).
+# Cooperative MoE implementation and TP3's unaligned f_b/g_b exclusion are
+# unchanged. With GLM53_KDA_BF16_LARGE_M unset/0, no BF16 copy is retained and
+# dense projections still use their existing Marlin/base paths. Enabling the
+# new in_proj path on TP3 fails closed at load because it requires TP2.
+# This source review preserves the existing TP3 profile; it does not qualify
+# the new BF16 path on TP3. Refusal on further source drift is unchanged.
+STOCK_SHA = "8ae0e8aa81616c6fbf681924464a9f21d642a84a654ebe88b6a65da3d3d93106"
 
 
 def prepare(stock, bundle):

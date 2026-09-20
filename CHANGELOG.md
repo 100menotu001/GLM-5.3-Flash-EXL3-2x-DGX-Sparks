@@ -11,6 +11,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- Experimental TP2/SM121 KDA large-M BF16 prefill path
+  (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
+  weights for scheduled M > 512, with approximately 3.26 GiB extra retained
+  weights per rank. BF16-only eligibility fails closed at load; smaller
+  matrices keep Marlin. See `docs/kda-bf16-large-m.md` for qualification,
+  numerical uncertainty, and memory/cache tradeoffs. (#233)
 - Opt-in bounded final sparse-MLA attention call for TP=4
   (`VLLM_SM120_SPARSE_MLA_SLICE_TOKENS`, default `0`): `overlay/patch_sparse_mla_slice.py`
   slices the final `flashinfer_trtllm_batch_decode_with_kv_cache_mla` call into
