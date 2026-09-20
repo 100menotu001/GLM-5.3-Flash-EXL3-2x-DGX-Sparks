@@ -210,6 +210,15 @@ def test_backend_split_guard_and_unpadded_exception(allocator, monkeypatch):
     unpadded = dataclasses.replace(draft, page_size_padded=None)
     cache.kv_cache_groups = [allocator["KVCacheGroupSpec"](["draft.0"], unpadded)]
     assert select([64]) == [64]
+    # Even zero extra padding selects the strided reshape when the field is set.
+    explicit_stride = dataclasses.replace(
+        draft, page_size_padded=draft.real_page_size_bytes
+    )
+    cache.kv_cache_groups = [
+        allocator["KVCacheGroupSpec"](["draft.0"], explicit_stride)
+    ]
+    with pytest.raises(ValueError, match="cannot be split"):
+        select([64])
 
 
 def test_patch_is_idempotent_and_preflights_both_files(sources):

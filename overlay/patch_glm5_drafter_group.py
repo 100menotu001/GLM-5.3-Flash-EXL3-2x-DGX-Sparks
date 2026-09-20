@@ -734,7 +734,7 @@ KERNEL_GUARD_NEW = """\
             # Splitting it applies that stride to each kernel block (OOB).
             if (
                 type(kv_cache_spec) is SlidingWindowSpec
-                and kv_cache_spec.page_size_bytes > kv_cache_spec.real_page_size_bytes
+                and kv_cache_spec.page_size_padded is not None
                 and selected_kernel_size != kv_manager_block_size
             ):
                 raise ValueError(
