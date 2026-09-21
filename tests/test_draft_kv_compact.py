@@ -342,6 +342,44 @@ def test_patch_is_idempotent_and_preflights_both_files(sources):
     assert (kv.read_bytes(), worker.read_bytes()) == applied
 
 
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_hybrid_overlay_migrates_every_installation_state(sources, tmp_path, flag):
+    """Pristine, the stock image's legacy hybrid-apc form, that form after the
+    published replay overlay, and already-current source all install to the
+    same bytes for either flag value, and a second application is a no-op."""
+    pristine = (sources / "core/kv_cache_coordinator.py").read_text()
+    results = {}
+    for state in ("pristine", "stock", "stock+replay"):
+        target = tmp_path / f"{state}.py"
+        target.write_text(coordinator_state(pristine, state))
+        run = apply_hybrid(target, flag)
+        assert run.returncode == 0, (state, run.stderr)
+        applied = target.read_bytes()
+        assert hybrid.EAGLE_VERIFY_MARK in applied.decode()
+        assert hybrid.LEGACY_MIN not in applied.decode()
+        ast.parse(applied)
+        run = apply_hybrid(target, flag)
+        assert run.returncode == 0 and target.read_bytes() == applied, state
+        results[state] = applied
+    assert results["stock"] == results["pristine"] == results["stock+replay"]
+
+
+def test_hybrid_overlay_rejects_unrecognized_legacy_drift(sources, tmp_path):
+    pristine = (sources / "core/kv_cache_coordinator.py").read_text()
+    stock = coordinator_state(pristine, "stock")
+    drifted = stock.replace(
+        "if _glm53_is_draft_swa_spec(spec):  # [glm53-hybrid-apc]",
+        "if _glm53_is_draft_swa_spec(spec):  # [glm53-hybrid-apc] local edit",
+    )
+    assert drifted != stock
+    for text in (drifted, stock + stock[stock.index("                if drop_eagle_block:"):]):
+        target = tmp_path / "drift.py"
+        target.write_text(text)
+        run = apply_hybrid(target, "0")
+        assert run.returncode != 0 and "legacy-hybrid-min" in run.stderr
+        assert target.read_text() == text
+
+
 # ---------------------------------------------------------------------------
 # Prefix-cache lookup: the pinned HybridKVCacheCoordinator (with
 # overlay/patch_hybrid_prefix_hit.py applied) and the pinned single-type
@@ -380,13 +418,53 @@ class FakeBlockPool:
         self.cached = {k: v for k, v in self.cached.items() if v is not block}
 
 
-@pytest.fixture
-def prefix_hits(allocator, sources):
-    coordinator = sources / "core/kv_cache_coordinator.py"
-    subprocess.check_call(
-        [sys.executable, str(HYBRID_PATCH)],
-        env={**os.environ, "GLM53_KV_COORDINATOR_PY": str(coordinator)},
+HYBRID_SPEC = importlib.util.spec_from_file_location("hybrid_patch", HYBRID_PATCH)
+hybrid = importlib.util.module_from_spec(HYBRID_SPEC)
+HYBRID_SPEC.loader.exec_module(hybrid)
+RETENTION_NEEDLE = "def _validate_prefix_cache_retention_interval(\n"
+# The coordinator shipped in the stock image
+# (ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor, image
+# ef9f5013c41a...): the pinned source plus the first hybrid-apc form.
+STOCK_COORDINATOR_SHA = "1f4f11011bff2a4aab1f0deaaa1c77878c354e939e19441064bd56933c50919d"
+
+
+def coordinator_state(pristine, state):
+    """Manufacture an installation state from the pinned pristine source."""
+    if state == "pristine":
+        return pristine
+    legacy = (
+        pristine.replace(RETENTION_NEEDLE, hybrid.BASE_HELPER + RETENTION_NEEDLE, 1)
+        .replace(hybrid.EAGLE_OLD, hybrid.EAGLE_NEW, 1)
+        .replace(hybrid.MIN_OLD, hybrid.LEGACY_MIN, 1)
+        .replace(hybrid.LOG_OLD, hybrid.LOG_NEW, 1)
     )
+    if state == "stock":
+        assert hashlib.sha256(legacy.encode()).hexdigest() == STOCK_COORDINATOR_SHA
+        return legacy
+    assert state == "stock+replay"  # the published 2945711 overlay on the stock image
+    return (
+        legacy.replace(RETENTION_NEEDLE, hybrid.DFLASH_REPLAY_HELPER + RETENTION_NEEDLE, 1)
+        .replace(hybrid.INIT_OLD, hybrid.INIT_NEW, 1)
+        .replace(hybrid.CONVERGE_OLD, hybrid.CONVERGE_FINAL, 1)
+    )
+
+
+def apply_hybrid(coordinator, flag=None):
+    env = {**os.environ, "GLM53_KV_COORDINATOR_PY": str(coordinator)}
+    if flag is not None:
+        env[ENV] = flag
+    return subprocess.run(
+        [sys.executable, str(HYBRID_PATCH)], env=env, text=True, capture_output=True
+    )
+
+
+@pytest.fixture(params=["pristine", "stock"])
+def prefix_hits(request, allocator, sources):
+    """Coordinator harness over the overlay applied to the pinned pristine
+    source and to the stock image's legacy hybrid-apc form."""
+    coordinator = sources / "core/kv_cache_coordinator.py"
+    coordinator.write_text(coordinator_state(coordinator.read_text(), request.param))
+    assert apply_hybrid(coordinator).returncode == 0
     ns = allocator
     ns.update({
         "ABC": abc.ABC, "abstractmethod": abc.abstractmethod,

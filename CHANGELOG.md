@@ -30,6 +30,11 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   qualification pass: 153 requests, 90 correct reference values, three
   rollover checks, and no preemptions. The measured 100k prefix-reuse loss is
   fixed while reservation demand remains lower; cold prefill can be slower.
+  The prefix overlay migrates the stock image's legacy hybrid-apc
+  coordinator form (with or without the published replay stage) to the
+  current verification form before installing the boundary lookup; the
+  result is byte-identical to a pristine install for either flag value,
+  and unrecognized legacy drift still fails before any write.
   Default remains off; TP3/TP4 GPU and higher-concurrency behavior remain
   unqualified. See README for measurements, receipt hash, and limitations.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
