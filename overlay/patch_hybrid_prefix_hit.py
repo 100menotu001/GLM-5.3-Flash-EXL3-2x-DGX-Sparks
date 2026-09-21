@@ -30,6 +30,18 @@ boundary when necessary so at least one complete kpool is rebuilt before
 decode. This preserves the older MLA/Mamba prefix hit while making the
 non-shareable target state deterministic.
 
+``GLM53_DRAFT_KV_COMPACT=1`` adds a DFlash-specific boundary lookup. The
+EAGLE hit rule needs one complete, cached block AFTER the reconciled
+boundary (then pops it) because an EAGLE draft KV at position p embeds
+token p+1. DFlash context KV at position p is a per-position projection of
+the target hidden state at p (``precompute_and_store_context_kv``: row-wise
+RMSNorm, fused KV GEMM, K-norm, RoPE at p), so no such block exists in its
+dataflow, and with a compact draft block B it cannot exist for any prompt
+whose tail past the boundary is shorter than B. The drafter group is then
+looked up ending exactly at the boundary (``drop_eagle_block=False``); the
+complete-window check, replay clamp, EAGLE flag, retention and caching are
+unchanged. Default ``0`` keeps the EAGLE lookahead lookup.
+
 Fail closed if the vLLM coordinator anchors drift.
 """
 from __future__ import annotations
@@ -46,6 +58,7 @@ P = Path(
 )
 MARK = "# [glm53-hybrid-apc]"
 DFLASH_REPLAY_MARK = "# [glm53-dflash-swa-replay-v1]"
+DFLASH_BOUNDARY_MARK = "# [glm53-dflash-boundary-lookup-v1]"
 
 BASE_HELPER = '''
 def _glm53_inner_kv_spec(spec):
@@ -298,6 +311,108 @@ CONVERGE_FINAL = """            if curr_hit_length >= hit_length:
                 break
 """
 
+# ---- [glm53-dflash-boundary-lookup-v1] --------------------------------------
+# Applied on top of the hybrid-min and replay edits above (anchors are their
+# NEW text), so it installs over pristine and previously patched images alike.
+
+IMPORT_OLD = """from abc import ABC, abstractmethod
+from collections.abc import Sequence
+"""
+
+IMPORT_NEW = """import os
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+"""
+
+DFLASH_BOUNDARY_HELPER = '''
+def _glm53_dflash_boundary_lookup_enabled() -> bool:
+    """GLM53_DRAFT_KV_COMPACT=1: allocator-verified DFlash drafter pages.
+
+    The allocator (patch_glm5_drafter_group.py) only builds compact pages when
+    the speculative method is DFlash and its draft layer count equals the
+    number of SlidingWindowSpec layers, so under this flag every exact
+    SlidingWindowSpec group is the DFlash drafter.
+    """
+    mode = os.environ.get("GLM53_DRAFT_KV_COMPACT", "0")
+    if mode not in ("0", "1"):
+        raise ValueError("GLM53_DRAFT_KV_COMPACT must be 0 or 1")
+    return mode == "1"
+
+
+'''
+
+BOUNDARY_INIT_OLD = """        logger.info(
+            "[glm53-dflash-swa-replay-v1] replay_tokens=%d alignment=%d",
+            self.dflash_swa_replay_tokens,
+            self._cache_hit_alignment_tokens,
+        )
+"""
+
+BOUNDARY_INIT_NEW = """        logger.info(
+            "[glm53-dflash-swa-replay-v1] replay_tokens=%d alignment=%d",
+            self.dflash_swa_replay_tokens,
+            self._cache_hit_alignment_tokens,
+        )
+        # [glm53-dflash-boundary-lookup-v1] KV cache group ids whose window is
+        # verified ending exactly at the reconciled boundary instead of one
+        # EAGLE lookahead block past it. DFlash context KV at position p is a
+        # per-position projection of the target hidden state at p (no token
+        # p+1 in its dataflow), so the lookahead block adds nothing; with a
+        # compact draft block B it cannot exist for prompts whose tail past
+        # the boundary is shorter than B. Only the EAGLE-flagged drafter
+        # SlidingWindowSpec groups qualify; the flag, retention, caching and
+        # replay clamp are unchanged.
+        self.dflash_boundary_group_ids: frozenset[int] = (
+            frozenset(
+                i
+                for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                if i in self.eagle_group_ids
+                and _glm53_is_draft_swa_spec(g.kv_cache_spec)
+            )
+            if _glm53_dflash_boundary_lookup_enabled()
+            else frozenset()
+        )
+        logger.info(
+            "[glm53-dflash-boundary-lookup-v1] boundary_group_ids=%s",
+            sorted(self.dflash_boundary_group_ids),
+        )
+"""
+
+BOUNDARY_LOOKUP_OLD = """                drop_eagle_block = use_eagle and idx not in eagle_verified
+
+                _max_length = curr_hit_length
+"""
+
+BOUNDARY_LOOKUP_NEW = """                # [glm53-dflash-boundary-lookup-v1] No lookahead block, no
+                # margin: the window must end exactly at curr_hit_length.
+                _glm53_boundary_lookup = (
+                    first_group_id in self.dflash_boundary_group_ids
+                )
+                drop_eagle_block = (
+                    use_eagle
+                    and idx not in eagle_verified
+                    and not _glm53_boundary_lookup
+                )
+
+                _max_length = curr_hit_length
+"""
+
+BOUNDARY_VERIFY_OLD = """                _glm53_draft_swa = _glm53_is_draft_swa_spec(spec)
+                if drop_eagle_block:
+"""
+
+BOUNDARY_VERIFY_NEW = """                _glm53_draft_swa = _glm53_is_draft_swa_spec(spec)
+                if _glm53_boundary_lookup:
+                    # [glm53-dflash-boundary-lookup-v1] Verified iff the
+                    # complete window is cached up to the boundary; the
+                    # replay check below still inspects the returned blocks.
+                    if _new_hit_length >= curr_hit_length:
+                        eagle_verified.add(idx)
+                    else:
+                        eagle_verified.discard(idx)
+                elif drop_eagle_block:
+"""
+
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -338,9 +453,35 @@ def main() -> int:
         text = replace_once(
             text, CONVERGE_OLD, CONVERGE_FINAL, "dflash-replay-clamp"
         )
+    if DFLASH_BOUNDARY_MARK not in text:
+        # patch_apc_per_group_retention.py adds ``import os  # [...]``; either
+        # overlay may run first.
+        if not any(line.startswith("import os") for line in text.splitlines()):
+            text = replace_once(text, IMPORT_OLD, IMPORT_NEW, "os-import")
+        if "def _glm53_dflash_boundary_lookup_enabled(" not in text:
+            # Same placement rule as the replay helper: ahead of the per-group
+            # overlay's helpers, so both application orders yield one AST.
+            boundary_needle = (
+                "def _glm53_swa_retention_env("
+                if "def _glm53_swa_retention_env(" in text
+                else needle
+            )
+            text = text.replace(
+                boundary_needle, DFLASH_BOUNDARY_HELPER + boundary_needle, 1
+            )
+        text = replace_once(
+            text, BOUNDARY_INIT_OLD, BOUNDARY_INIT_NEW, "dflash-boundary-init"
+        )
+        text = replace_once(
+            text, BOUNDARY_LOOKUP_OLD, BOUNDARY_LOOKUP_NEW, "dflash-boundary-lookup"
+        )
+        text = replace_once(
+            text, BOUNDARY_VERIFY_OLD, BOUNDARY_VERIFY_NEW, "dflash-boundary-verify"
+        )
     P.write_text(text)
     print(
-        f"patched {P.name} (hybrid APC + versioned DFlash SWA replay clamp)"
+        f"patched {P.name} (hybrid APC + versioned DFlash SWA replay clamp "
+        "+ DFlash boundary lookup)"
     )
     return 0
 

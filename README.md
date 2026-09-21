@@ -496,9 +496,10 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 
 `GLM53_DRAFT_KV_COMPACT=1` reduces the block IDs reserved by the drafter's
 padded slot-shared cache. Default `0` keeps 64-token padded blocks. The
-TP2/TP3/TP4 launchers accept exactly `0` or `1`; this is a startup setting.
-It changes neither weight nor KV precision, the sliding window, nor the
-target cache groups. The PR233 KDA path is independent and unchanged.
+TP2/TP3/TP4 launchers accept exactly `0` or `1` and reject `1` unless
+`SPEC_METHOD=dflash`; this is a startup setting. It changes neither weight
+nor KV precision, the sliding window, nor the target cache groups. The
+PR233 KDA path is independent and unchanged.
 
 The block size is derived from the actual cache geometry: the largest
 multiple of 64 that divides the MLA block and fits inside its physical
@@ -514,19 +515,46 @@ Padded pages must not be split into smaller kernel blocks. Backend setup
 rejects that combination; use a backend supporting the full derived block
 (the pinned `FLASH_ATTN` backend declares multiples of 16), or disable the
 option. Unpadded exact-fit pages retain their existing behavior.
+
+**Prefix reuse with larger draft blocks.** The drafter group is looked up
+with the EAGLE rule: a hit needs one complete, cached draft block *after*
+the reconciled 3,584-token boundary, which is then dropped. With 64-token
+blocks that block exists whenever at least 64 prompt tokens follow the
+boundary; with 896-token blocks it needs 896, so a same-prompt reuse whose
+tail is shorter (the live 100,701-token prompt has 349) lost one MLA page
+to the replay clamp (96,768 instead of 100,352 cached tokens). DFlash
+context KV at a position is a per-position projection of the target
+hidden state at that position (`precompute_and_store_context_kv`: row-wise
+RMSNorm, fused KV GEMM, K-norm, RoPE), so unlike EAGLE, whose draft KV at
+position p embeds token p+1, no block past the boundary is needed. Under
+`GLM53_DRAFT_KV_COMPACT=1` `overlay/patch_hybrid_prefix_hit.py` therefore
+looks the DFlash drafter group up ending exactly at the boundary
+(`# [glm53-dflash-boundary-lookup-v1]`); the complete-window check, replay
+clamp, EAGLE flag, retention, and caching are unchanged, and the result is
+identical to the EAGLE lookup whenever that one succeeds. The allocator
+builds compact pages only when the speculative method is DFlash and its
+draft layer count equals the sliding-window layer count; any other drafter
+fails at boot. Default `0` keeps the EAGLE lookup and its 64-token rule.
 GPU correctness, draft acceptance, prefix reuse, and throughput remain
-unqualified. Do not increase concurrency or batching based on this bound alone.
+unqualified at this head. Do not increase concurrency or batching based on
+the admission bound alone.
 
 CPU verification, using pristine
 [vLLM `487ecf187`](https://github.com/vllm-project/vllm/tree/487ecf187d3dfe74d2cf6119a92881dba403c219)
-sources (the three required files and hashes are listed in the test):
+sources (the five required files and hashes are listed in the test):
 
 ```bash
 GLM53_VLLM_SRC=/path/to/vllm-source python3 -m pytest -q tests/test_draft_kv_compact.py
 ```
 
 No torch import or model is needed. Without the source path, the two
-geometry/configuration tests run and the three pinned-source tests skip.
+geometry/configuration tests run and the pinned-source tests skip. The
+pinned-source tests drive the real allocator, scheduler config, coordinator
+(with the overlay applied), and single-type managers over a dict block
+pool: the live 100,701-token reuse (64-token hit, 896-token clamp, 896-token
+boundary hit), every tail length across one 3,584-token page, lookahead
+equivalence, changed suffixes and shared prefixes, evicted window blocks,
+and the off-by-default gate.
 The direction was motivated by
 [Alexbob0's draft-page sizing work](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/9bf39c3e84194a57c630a42c0d79066159a5b787/overlay/patch_kv_drafter_group.py#L64-L83);
 the geometry-derived selection and backend guard here are specific to this recipe.
@@ -1277,7 +1305,7 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/patch_dflash2.py` | registry + `decoder_layer_cls` + speculator dispatch + draft KV `auto` on MLA/FP8 |
 | `overlay/patch_glm_eagle3.py` | Glm5Next EAGLE3 aux-hidden layers (mHC `hc_post` + contract) |
 | `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-sharing; 64-token default, optional geometry-derived block size, and worker-side split guard. Runtime-mounted through `DRAFTER_PATCH_HOST` |
-| `tests/test_draft_kv_compact.py` | CPU geometry/alignment checks and pinned-source allocator, backend rejection, idempotence, and two-file preflight tests |
+| `tests/test_draft_kv_compact.py` | CPU geometry/alignment checks and pinned-source allocator, backend rejection, idempotence, two-file preflight, and prefix-cache lookup (coordinator + managers) tests |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `overlay/patch_scheduler_decode_floor.py` | skip / cap / off / `fair` mixed-prefill; v5 fixed-cost step fit + largest step-fitting chunk + bounded contention credit, decode first; versioned installer |

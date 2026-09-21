@@ -14,8 +14,16 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 - Experimental compact DFlash2 KV pages (`GLM53_DRAFT_KV_COMPACT`, default
   `0`): derive a page-fitting divisor of the MLA block to reduce draft
   block-ID demand without changing precision or backing allocations.
-  Reject padded-page kernel splitting during backend setup. CPU allocator
-  and launcher verification only; GPU behavior and performance remain unqualified.
+  Reject padded-page kernel splitting during backend setup. DFlash-only:
+  the allocator and the TP2/TP3/TP4 launchers refuse `1` for any other
+  speculative method. Under `1`, `overlay/patch_hybrid_prefix_hit.py` looks
+  the DFlash drafter group up ending exactly at the reconciled prefix
+  boundary instead of requiring one complete draft block past it
+  (`# [glm53-dflash-boundary-lookup-v1]`), so a same-prompt reuse whose tail
+  is shorter than the draft block no longer loses one MLA page to the replay
+  clamp; DFlash context KV is a per-position projection of the target hidden
+  state, so no lookahead block is needed. CPU allocator, coordinator, and
+  launcher verification only; GPU behavior and performance remain unqualified.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
   weights for scheduled M > 512, with approximately 3.26 GiB extra retained
