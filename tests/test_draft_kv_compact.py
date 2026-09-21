@@ -456,11 +456,16 @@ def test_hybrid_overlay_rejects_helper_binding_collisions(sources, tmp_path, fla
         f"\nif True:\n    def {name}():\n        return False\n",
         f"\n{name} = lambda: False\n",
         f"\nfrom builtins import bool as {name}\n",
+        f"\nmatch False:\n    case {name}:\n        pass\n",
+        f"\n[({name} := False) for _ in [0]]\n",
     )
     for override in overrides:
         rejected_unchanged(target, current + override, flag, name)
-    # A local name in unrelated code does not replace the module helper.
-    local_shadow = current + f"\ndef unrelated():\n    {name} = False\n"
+    # Function and inlined-comprehension locals do not replace the helper.
+    local_shadow = (
+        current + f"\ndef unrelated():\n    {name} = False\n"
+        + f"\n[None for {name} in []]\n"
+    )
     target.write_text(local_shadow)
     assert apply_hybrid(target, flag).returncode == 0
     assert target.read_text() == local_shadow

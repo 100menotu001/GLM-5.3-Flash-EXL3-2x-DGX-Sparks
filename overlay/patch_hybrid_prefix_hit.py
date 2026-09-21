@@ -52,9 +52,11 @@ Fail closed if the vLLM coordinator anchors drift.
 from __future__ import annotations
 
 import ast
+import dis
 import os
 import sys
 from pathlib import Path
+from types import CodeType
 
 P = Path(
     os.environ.get(
@@ -509,39 +511,41 @@ def verify_complete(text: str) -> list[str]:
         module = ast.parse(text)
     except SyntaxError as exc:
         return problems + [f"coordinator syntax: {exc.msg}"]
-    # A different implementation can shadow a canonical helper without
-    # duplicating its text. Count module bindings, including conditional
-    # definitions, but do not confuse unrelated local names with globals.
-    bindings = dict.fromkeys(OWNED_HELPERS, 0)
-    scopes = (
-        ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
-        ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
-    )
-    pending = list(module.body)
-    while pending:
-        node = pending.pop()
-        names = ()
-        if isinstance(node, scopes):
-            names = (getattr(node, "name", None),)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = (
-                alias.asname or alias.name.split(".", 1)[0]
-                for alias in node.names
-            )
+    # Remove the one canonical definition of each helper from an analysis-only
+    # AST. Let Python's compiler identify any remaining global bindings; this
+    # includes pattern captures without guessing at each binding syntax.
+    definitions = dict.fromkeys(OWNED_HELPERS, 0)
+    remaining = []
+    for node in module.body:
+        if isinstance(node, ast.FunctionDef) and node.name in definitions:
+            definitions[node.name] += 1
         else:
-            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                names = (node.id,)
-            elif isinstance(node, ast.ExceptHandler):
-                names = (node.name,)
-            pending.extend(ast.iter_child_nodes(node))
-        for name in names:
-            if name in bindings:
-                bindings[name] += 1
+            remaining.append(node)
     problems += [
-        f"{name}: expected exactly one module binding, found {count}"
-        for name, count in sorted(bindings.items())
+        f"{name}: expected exactly one module definition, found {count}"
+        for name, count in sorted(definitions.items())
         if count != 1
     ]
+    module.body = remaining
+    try:
+        compiled = compile(module, str(P), "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        return problems + [f"coordinator bindings: {exc.msg}"]
+    rebound = set()
+    pending = [(compiled, True)]
+    while pending:
+        code, module_scope = pending.pop()
+        for instruction in dis.get_instructions(code):
+            if instruction.opname in ("STORE_GLOBAL", "DELETE_GLOBAL") or (
+                module_scope and instruction.opname in ("STORE_NAME", "DELETE_NAME")
+            ):
+                if instruction.argval in OWNED_HELPERS:
+                    rebound.add(instruction.argval)
+        pending.extend(
+            (constant, False) for constant in code.co_consts
+            if isinstance(constant, CodeType)
+        )
+    problems += [f"{name}: competing global binding" for name in sorted(rebound)]
     return problems
 
 
