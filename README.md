@@ -508,8 +508,9 @@ page. Divisibility preserves prefix-cache alignment. For example, a
 selects 896 tokens, not a fixed size borrowed from another deployment.
 With a 2,048-token window and 2,048 in-flight tokens, the pinned allocator's
 draft admission bound drops from **65 to 6 block IDs per request**.
-This is a **CPU allocator result, not a serving benchmark**: backing
-tensor allocations and the total pool block count are unchanged.
+This is a **CPU allocator result, not a serving benchmark**: at a fixed
+cache budget, it reduces ID demand rather than backing tensor allocations.
+Automatic memory profiling can select different pool sizes between boots.
 
 Padded pages must not be split into smaller kernel blocks. Backend setup
 rejects that combination; use a backend supporting the full derived block
@@ -537,40 +538,87 @@ before any exact-fit or padded page is chosen: every sliding-window layer
 must belong to the DFlash drafter (speculative method and one layer per
 draft decoder layer), else boot fails. Default `0` never gates and keeps
 the EAGLE lookup and its 64-token rule.
-**Scoped live qualification (2026-09-21).** The two runtime overlays from
-`6d5dd89` were tested on one existing TP2/DFlash2 deployment with unchanged
-precision and serving settings apart from this flag, using fresh baseline,
-candidate, and restored-baseline boots. The 51 request hashes matched across
-all three phases: 153 requests completed, 90/90 reference values were correct,
-and all three 3,200-token rollover sequence checks passed. Reference checking
-accepted the sorted-list answer's JSON wrapper; this is not a formatting or
-general model-quality claim. There were no runtime errors or preemptions.
 
-| Measurement | Baseline | Compact + boundary lookup | Restored baseline |
-|---|---:|---:|---:|
-| Reservation IDs per maximum-length request | 176 | 117 | 176 |
-| Cached tokens on the 100,701-token repeat | 100,352 | 100,352 | 100,352 |
-| Repeat time to first token (s) | 1.040 | 0.706 | 1.033 |
-| Cold 100,701-token time to first token (s) | 83.458 | 86.880 | 85.186 |
-| Two-request code aggregate throughput (tokens/s, median of 3) | 80.20 | 76.56 | 74.60 |
-| 3,200-token rollover decode (tokens/s) | 72.48 | 75.89 | 73.81 |
+**Installer compatibility.** The public InstantTensor image carries a legacy
+`glm53-hybrid-apc` coordinator without the current v3 verification form.
+The prefix overlay now migrates that exact form, with or without the published
+replay stage, before adding boundary lookup. It validates every owned stage
+and ordinary helper binding before writing; unsupported drift, partial or
+duplicate stages, and competing helper bindings fail with the file untouched.
+Supported stock-derived output is byte-identical to a pristine installation.
+This is source-shape validation, not a sandbox for arbitrary Python.
 
-The candidate retained all 28,672 prefix tokens at each tested tail length
-(64, 65, 349, 896, 897, and 2,048); both baselines lost one page at tail 64.
-Concurrent changed-suffix answers and the subsequent original-prompt answer
-were correct. Two near-243k requests and follow-ups also passed, but cold
-prefills were effectively serialized; this does not qualify higher concurrency.
-The 33.5% reservation reduction is **not a reduction in backing tensor memory**.
-Cold 100k prefill was 2.0–4.1% slower than the bracketing baselines, and
-single-request code/prose decode medians were lower by 0.6–2.3% and 1.8–5.7%,
-respectively. Freeform output
-sequences varied, so these rates are not an identical-output kernel benchmark.
-This is not a universal speedup; default remains `0`.
+**Custom live qualification (2026-09-21).** Runtime source `9a3aca4` was
+tested with fresh OFF / ON / OFF boots and the existing custom TP2/DFlash2
+configuration otherwise unchanged. All **153 requests** completed; all
+**90 marker/reference answers** and three 3,200-token rollover sequence
+checks passed. The 51 prompt hashes matched across arms. No preemptions or
+safety stops occurred; minimum sampled available RAM was 4.73 GiB.
 
-TP3/TP4 GPU behavior, higher concurrency, other backends/architectures, and
-tensor-level numerical parity remain unqualified. Do not increase concurrency
-or batching based on the admission bound alone. Neutralized result receipt
-SHA-256 (retained privately):
+| Measurement | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Reservation IDs per configured maximum-length request | 176 | 117 | 176 | −33.52% |
+| Usable pool IDs after automatic profiling | 507 | 519 | 514 | — |
+| Cached tokens on the 100,701-token repeat | 100,352 | 100,352 | 100,352 | Equal |
+| Repeat time to first token (s) | 1.043 | 0.728 | 1.052 | −30.46% |
+| Cold 100,701-token time to first token (s) | 89.109 | 87.489 | 84.729 | +0.66% |
+| Two long follow-ups, pair wall time (s) | 8.427 | 5.551 | 6.735 | −26.78% |
+| Structured decode (tokens/s) | 74.53 | 79.31 | 78.33 | +3.77% |
+| Code decode (tokens/s) | 51.23 | 50.45 | 49.64 | +0.03% |
+| Prose decode (tokens/s) | 38.81 | 30.72 | 32.19 | −13.46% |
+| C2 code aggregate (tokens/s) | 74.68 | 72.60 | 81.54 | −7.05% |
+
+Decode/concurrency values are medians of three trials. The enabled arm
+retained all 28,672 prefix tokens at tails 64, 65, 349, 896, 897 and 2,048;
+both OFF arms lost one page at tail 64. Changed-suffix references, the
+subsequent original-prompt reference, and two near-243k requests plus their
+follow-ups passed. Cold long prefills were effectively serialized.
+Freeform outputs differed, and OFF baselines drifted substantially for prose,
+C2 and long follow-ups. These are descriptive measurements, not
+identical-output kernel timings or statistical significance claims.
+The repeat-TTFT benefit reproduced; **there is no universal decode speedup**.
+Reservation-ID reduction is **not a measured reduction in VRAM**.
+
+**Stock live qualification is incomplete.** The same source was tested on the
+public InstantTensor image with the stock 850k context, four sequences,
+7,168-token batching and GPU utilization 0.85. Cached public model revisions
+were reused; this was not a fresh model download.
+
+* **Automatic budget, OFF:** installation succeeded, but startup rejected
+  capacity: 13.46 GiB required versus 10.73 GiB available. No inference ran.
+* **Automatic budget, ON:** booted with 10.93 GiB; 64/65 requests completed,
+  31/31 marker references and the rollover check passed. The 814,571-token
+  cold prompt answered correctly (TTFT 634.510 s), with at least 5.15 GiB
+  sampled available RAM. Its repeat triggered the preemption guard
+  (two observed preemptions), so it was not completed.
+* **Adjusted stock, fixed 14 GiB:** a separate approved OFF / ON / OFF
+  comparison added only `--kv-cache-memory-bytes 15032385536`. OFF 1
+  completed 64/65 requests, then its near-limit repeat preempted. ON
+  completed 63/65, then the near-limit cold prompt crossed the 2 GiB
+  memory floor (1.668 GiB sampled). OFF 2 completed 48/65, then failed the
+  sequence check by repeating 202, before the sliding-window boundary.
+  These failed arms were preserved, not replaced by retries-to-pass.
+
+| Adjusted-stock measurement | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Reservation IDs per 850k request | 532 | 295 | 532 | −44.55% |
+| 100k repeat TTFT (s) | 1.114 | 0.817 | 1.090 | −25.80% |
+| Cold 100k TTFT (s) | 66.544 | 70.319 | 69.253 | +3.56% |
+| C4 code aggregate (tokens/s) | 92.35 | 95.73 | 91.18 | +4.32% |
+
+The stock comparison has 48 matching completed prompt hashes, including the
+failed OFF rollover check; it is not a full workload pass. The 14 GiB override
+is **not a safe blanket recommendation**. The cause of near-limit reuse
+preemption remains undetermined. Smaller reservation bounds do not alone
+justify increasing context, concurrency or batching.
+
+At `9a3aca4`, 61 focused CPU tests passed without skips, plus the standalone
+hybrid smoke. SIX independently cleared the scoped source/CPU review.
+TP3/TP4 GPU behavior, other backends/architectures, tensor-level numerical
+parity and clean near-limit stock reuse remain unqualified. **Default stays
+`0`.** Neutralized result receipt SHA-256 (raw evidence retained privately):
+`de9dc16deb0aafbbe60bc469d71cd250a988287c52e2f069f62537f6f4e79b46`.
+The earlier `6d5dd89` custom experiment remains separate and byte-frozen:
 `35fd5ef14b9e9502116311c5706e0ae874056369f90e38ba2184f2be3257e7e2`.
 
 CPU verification, using pristine

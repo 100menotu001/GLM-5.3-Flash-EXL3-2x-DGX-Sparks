@@ -25,11 +25,11 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   (`# [glm53-dflash-boundary-lookup-v1]`), so a same-prompt reuse whose tail
   is shorter than the draft block no longer loses one MLA page to the replay
   clamp; DFlash context KV is a per-position projection of the target hidden
-  state, so no lookahead block is needed. CPU allocator, coordinator, and
-  launcher checks plus scoped TP2 live baseline/candidate/restored-baseline
-  qualification pass: 153 requests, 90 correct reference values, three
-  rollover checks, and no preemptions. The measured 100k prefix-reuse loss is
-  fixed while reservation demand remains lower; cold prefill can be slower.
+  state, so no lookahead block is needed. At `9a3aca4`, 61 focused CPU
+  tests pass without skips. Fresh custom TP2 OFF/ON/OFF qualification
+  completed 153 requests, 90 correct reference answers and three rollover
+  checks without preemptions or safety stops. Repeat TTFT was 30.46% lower
+  versus mean OFF; prose and C2 throughput were lower, not universally faster.
   The prefix overlay migrates the stock image's legacy hybrid-apc
   coordinator form (with or without the published replay stage) to the
   current verification form before installing the boundary lookup; the
@@ -40,8 +40,13 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   a stale stage marker, a partial stage, edited verification logic, a
   duplicated stage, a competing module binding for an owned helper, or
   unrecognized legacy drift exits non-zero with the file untouched.
-  Default remains off; TP3/TP4 GPU and higher-concurrency behavior remain
-  unqualified. See README for measurements, receipt hash, and limitations.
+  Stock installation now succeeds, but full stock qualification remains
+  incomplete: automatic-budget OFF cannot fit the configured 850k context;
+  automatic-budget ON handles the 814,571-token cold prompt but its repeat
+  preempts. A separate fixed-14-GiB comparison hit preemption, memory-floor
+  and OFF sequence-reference stops; failed runs are retained. Default remains
+  off. TP3/TP4 GPU and tensor-level numerical parity remain unqualified.
+  See README for both profiles, receipt hash, baseline drift and limitations.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
   weights for scheduled M > 512, with approximately 3.26 GiB extra retained
