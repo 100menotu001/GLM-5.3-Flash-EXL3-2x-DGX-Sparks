@@ -1036,6 +1036,7 @@ preflight_instanttensor_kv_note() {
     [[ "$util" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] || return 0
     awk -v u="$util" 'BEGIN { exit !(u <= 0.85) }' || return 0
     local _tok
+    # shellcheck disable=SC2086
     for _tok in $extra_args; do
         case "$_tok" in --kv-cache-memory-bytes|--kv-cache-memory-bytes=*) return 0 ;; esac
     done
