@@ -444,6 +444,28 @@ def test_hybrid_overlay_rejects_edited_or_duplicated_owned_stages(sources, tmp_p
     assert apply_hybrid(target, flag).returncode == 0 and target.read_text() == current
 
 
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_hybrid_overlay_rejects_helper_binding_collisions(sources, tmp_path, flag):
+    target = tmp_path / "coordinator.py"
+    target.write_text((sources / "core/kv_cache_coordinator.py").read_text())
+    assert apply_hybrid(target, flag).returncode == 0
+    current = target.read_text()
+    name = "_glm53_dflash_boundary_lookup_enabled"
+    overrides = (
+        f"\ndef {name}():\n    return False\n",
+        f"\nif True:\n    def {name}():\n        return False\n",
+        f"\n{name} = lambda: False\n",
+        f"\nfrom builtins import bool as {name}\n",
+    )
+    for override in overrides:
+        rejected_unchanged(target, current + override, flag, name)
+    # A local name in unrelated code does not replace the module helper.
+    local_shadow = current + f"\ndef unrelated():\n    {name} = False\n"
+    target.write_text(local_shadow)
+    assert apply_hybrid(target, flag).returncode == 0
+    assert target.read_text() == local_shadow
+
+
 # ---------------------------------------------------------------------------
 # Prefix-cache lookup: the pinned HybridKVCacheCoordinator (with
 # overlay/patch_hybrid_prefix_hit.py applied) and the pinned single-type

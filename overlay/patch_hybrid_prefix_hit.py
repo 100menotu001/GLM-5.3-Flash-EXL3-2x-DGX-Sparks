@@ -51,6 +51,7 @@ Fail closed if the vLLM coordinator anchors drift.
 """
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from pathlib import Path
@@ -481,6 +482,13 @@ SUPERSEDED = (
     ("dflash-boundary-lookup", BOUNDARY_LOOKUP_OLD),
     ("dflash-boundary-verify", BOUNDARY_VERIFY_OLD),
 )
+OWNED_HELPERS = {
+    node.name
+    for node in ast.parse(
+        BASE_HELPER + DFLASH_REPLAY_HELPER + DFLASH_BOUNDARY_HELPER
+    ).body
+    if isinstance(node, ast.FunctionDef)
+}
 
 
 def verify_complete(text: str) -> list[str]:
@@ -497,6 +505,43 @@ def verify_complete(text: str) -> list[str]:
     ]
     if sum(line.startswith("import os") for line in text.splitlines()) != 1:
         problems.append("os-import: expected exactly one module-level import")
+    try:
+        module = ast.parse(text)
+    except SyntaxError as exc:
+        return problems + [f"coordinator syntax: {exc.msg}"]
+    # A different implementation can shadow a canonical helper without
+    # duplicating its text. Count module bindings, including conditional
+    # definitions, but do not confuse unrelated local names with globals.
+    bindings = dict.fromkeys(OWNED_HELPERS, 0)
+    scopes = (
+        ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+        ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+    )
+    pending = list(module.body)
+    while pending:
+        node = pending.pop()
+        names = ()
+        if isinstance(node, scopes):
+            names = (getattr(node, "name", None),)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                alias.asname or alias.name.split(".", 1)[0]
+                for alias in node.names
+            )
+        else:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                names = (node.id,)
+            elif isinstance(node, ast.ExceptHandler):
+                names = (node.name,)
+            pending.extend(ast.iter_child_nodes(node))
+        for name in names:
+            if name in bindings:
+                bindings[name] += 1
+    problems += [
+        f"{name}: expected exactly one module binding, found {count}"
+        for name, count in sorted(bindings.items())
+        if count != 1
+    ]
     return problems
 
 

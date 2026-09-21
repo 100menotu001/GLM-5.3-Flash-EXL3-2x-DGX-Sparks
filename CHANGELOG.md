@@ -38,8 +38,8 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   EAGLE narrowing, v3 hybrid-min verification, replay init/clamp, boundary
   init/lookup/verification) is present exactly once in its supported form;
   a stale stage marker, a partial stage, edited verification logic, a
-  duplicated stage, or unrecognized legacy drift exits non-zero with the
-  file untouched.
+  duplicated stage, a competing module binding for an owned helper, or
+  unrecognized legacy drift exits non-zero with the file untouched.
   Default remains off; TP3/TP4 GPU and higher-concurrency behavior remain
   unqualified. See README for measurements, receipt hash, and limitations.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
