@@ -116,6 +116,23 @@ _cli_kda_bf16="${GLM53_KDA_BF16_LARGE_M-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
+# TP=3 does not inherit the 2-node KV cap from .env (#204): .env.example ships
+# EXTRA_ARGS="--kv-cache-memory-bytes 15032385536", sized for TP=2 at 850k, and 14 GiB does
+# not hold one 1,000,000-token request. Drop that token (either spelling) and keep the rest;
+# set a TP=3 value in .env.tp3 if you want to pin the pool.
+if [ -n "${EXTRA_ARGS:-}" ]; then
+    _kept=""; _skip=0
+    # shellcheck disable=SC2086
+    for _tok in $EXTRA_ARGS; do
+        if [ "$_skip" = 1 ]; then _skip=0; continue; fi
+        case "$_tok" in
+            --kv-cache-memory-bytes) _skip=1; continue ;;
+            --kv-cache-memory-bytes=*) continue ;;
+        esac
+        _kept="${_kept:+$_kept }$_tok"
+    done
+    EXTRA_ARGS="$_kept"; unset _kept _skip _tok
+fi
 # TP=3 does not inherit ABLIT=1 from the 2-node .env. Opt in from .env.tp3
 # or ABLIT=1 on the command line.
 ABLIT=0

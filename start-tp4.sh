@@ -90,6 +90,23 @@ _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
+# TP=4 does not inherit the 2-node KV cap from .env (#204): .env.example ships
+# EXTRA_ARGS="--kv-cache-memory-bytes 15032385536", sized for TP=2 at 850k, and 14 GiB does
+# not hold one 1,000,000-token request. Drop that token (either spelling) and keep the rest;
+# set a TP=4 value in .env.tp4 if you want to pin the pool.
+if [ -n "${EXTRA_ARGS:-}" ]; then
+    _kept=""; _skip=0
+    # shellcheck disable=SC2086
+    for _tok in $EXTRA_ARGS; do
+        if [ "$_skip" = 1 ]; then _skip=0; continue; fi
+        case "$_tok" in
+            --kv-cache-memory-bytes) _skip=1; continue ;;
+            --kv-cache-memory-bytes=*) continue ;;
+        esac
+        _kept="${_kept:+$_kept }$_tok"
+    done
+    EXTRA_ARGS="$_kept"; unset _kept _skip _tok
+fi
 # TP=4 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp4"

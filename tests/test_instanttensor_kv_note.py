@@ -93,16 +93,35 @@ def test_note_is_wired_into_preflight() -> None:
     assert source.count("preflight_instanttensor_kv_note ") == 1, "called exactly once"
 
 
-def test_topology_examples_clear_the_tp2_kv_cap() -> None:
-    """The shared .env ships a 14 GiB cap sized for TP=2 at 850k. start-tp3/tp4 source .env
-    first and then their own file, so each topology example must reset EXTRA_ARGS or a fresh
-    multi-Spark install inherits a cap that cannot hold one 1M-token request."""
-    shared = (ROOT / ".env.example").read_text()
-    assert 'EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"' in shared.splitlines()
-    for name in (".env.tp3.example", ".env.tp4.example"):
-        lines = (ROOT / name).read_text().splitlines()
-        assert "EXTRA_ARGS=" in lines, f"{name} must clear the inherited TP=2 cap"
-        assert not any(l.startswith("EXTRA_ARGS=") and "kv-cache-memory-bytes" in l for l in lines), name
+def _tp_strip_block(launcher: str) -> str:
+    source = (ROOT / launcher).read_text()
+    begin = source.index("# TP=") ; begin = source.index("does not inherit the 2-node KV cap", begin)
+    begin = source.rfind("\n", 0, begin) + 1
+    end = source.index('EXTRA_ARGS="$_kept"; unset _kept _skip _tok\nfi\n', begin) + len('EXTRA_ARGS="$_kept"; unset _kept _skip _tok\nfi\n')
+    return source[begin:end]
+
+
+def test_tp3_tp4_drop_the_inherited_tp2_kv_cap_and_keep_other_flags() -> None:
+    """start-tp3/tp4 source .env (which now ships the 14 GiB cap) and then their own file.
+    They must drop that token — bare or =value, with its value — and keep every other flag,
+    so a user's unrelated EXTRA_ARGS survive and 1M-token topologies are not capped at 14 GiB."""
+    shipped = next(l for l in (ROOT / ".env.example").read_text().splitlines() if l.startswith("EXTRA_ARGS="))
+    assert "--kv-cache-memory-bytes 15032385536" in shipped
+    for launcher in ("start-tp3.sh", "start-tp4.sh"):
+        block = _tp_strip_block(launcher)
+        for given, want in (
+            ("--kv-cache-memory-bytes 15032385536", ""),
+            ("--kv-cache-memory-bytes 15032385536 --no-async-scheduling", "--no-async-scheduling"),
+            ("--no-async-scheduling --kv-cache-memory-bytes 15032385536 --foo bar", "--no-async-scheduling --foo bar"),
+            ("--kv-cache-memory-bytes=15032385536 --no-async-scheduling", "--no-async-scheduling"),
+            ("--no-async-scheduling", "--no-async-scheduling"),
+            ("", ""),
+        ):
+            r = subprocess.run(["bash", "-c", "set -euo pipefail\nEXTRA_ARGS=\"$1\"\n" + block + 'printf "%s" "${EXTRA_ARGS-}"', "_", given],
+                               capture_output=True, text=True, timeout=30)
+            assert r.returncode == 0, (launcher, given, r.stderr)
+            assert r.stdout == want, (launcher, given, r.stdout)
+
 
 
 if __name__ == "__main__":
@@ -110,5 +129,5 @@ if __name__ == "__main__":
     test_note_is_silent_when_the_combination_is_not_the_failing_one()
     test_note_lives_inside_the_memory_guard_block()
     test_note_is_wired_into_preflight()
-    test_topology_examples_clear_the_tp2_kv_cap()
+    test_tp3_tp4_drop_the_inherited_tp2_kv_cap_and_keep_other_flags()
     print("instanttensor kv-fit note OK")

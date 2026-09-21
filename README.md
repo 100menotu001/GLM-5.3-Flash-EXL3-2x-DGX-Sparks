@@ -654,17 +654,27 @@ wheel-less image and InstantTensor will not load.
 git pull
 ```
 
-2. Set these lines in `.env` (already the default in `.env.example`; do
+2. Set these two lines in `.env` (already the default in `.env.example`; do
    the same in `.env.tp3` / `.env.tp4` if you use those):
 
 ```
 IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
 LOAD_FORMAT=instanttensor
+```
+
+   **TP=2 only**, also add to `.env` (it is now the default in `.env.example`; an existing
+   `.env` predates it):
+
+```
 EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"
 ```
 
-   The third line is now on by default in `.env.example`; existing `.env` files predate it
-   and need it added. It is required at `MAX_MODEL_LEN=850000` / `GPU_MEM_UTIL=0.85`: the
+   TP=3 / TP=4 do not need it and must not rely on it: `start-tp3.sh` and `start-tp4.sh` drop
+   that token from the inherited `EXTRA_ARGS` (keeping any other flags), because 14 GiB does
+   not hold one 1,000,000-token request and those topologies were not measured. Pin a
+   topology-specific value in `.env.tp3` / `.env.tp4` if you want one.
+
+   The cap is required for TP=2 at `MAX_MODEL_LEN=850000` / `GPU_MEM_UTIL=0.85`: the
    InstantTensor loader leaves ~4.4–5.6 GiB less for the KV pool than vLLM auto, and
    without an explicit pool size the engine refuses to boot (needs 13.46 GiB, ~12.4 GiB
    available). Raising `GPU_MEM_UTIL` to 0.88 instead is marginal on 2x GB10 — it booted
