@@ -9,10 +9,12 @@ GLM53_DRAFT_KV_COMPACT=1 selects the largest 64-token-multiple divisor of
 the MLA block that fits its physical page. This reduces draft block-id
 demand without increasing prefix-cache alignment or changing cache dtype,
 window length, tensor allocation, or the target's groups. Default: 0.
-Compact pages are DFlash-only (speculative method plus draft layer count
-are checked): under the flag, patch_hybrid_prefix_hit.py looks the drafter
-group up ending exactly at the reconciled prefix boundary, which relies on
-DFlash's per-position context KV.
+Compact pages are DFlash-only: a preflight at get_kv_cache_groups (every
+grouping path, before exact-fit or padded selection) requires that all
+sliding-window layers are the DFlash drafter's (speculative method plus
+draft layer count), else boot fails. Under the flag,
+patch_hybrid_prefix_hit.py looks the drafter group up ending exactly at the
+reconciled prefix boundary, which relies on DFlash's per-position context KV.
 
 Padded pages cannot be virtually split into smaller kernel blocks: their
 physical stride applies once per manager block. Patch worker/utils.py to
@@ -679,27 +681,42 @@ def _prepare_group(text: str, path: str) -> str:
 
 
 COMPACT_BLOCK_HELPER = '''\
-def _glm53_draft_block_size(
-    mla_block: int, mla_page: int, bytes_per_token: int, dflash: bool
-) -> int:
-    """Fill a shared page without increasing the prefix-cache alignment.
+def _glm53_draft_kv_compact(vllm_config, kv_cache_spec) -> bool:
+    """GLM53_DRAFT_KV_COMPACT preflight; runs on every grouping path.
 
-    ``dflash`` is the positive drafter identification (DFlash speculative
-    method and one sliding-window layer per draft layer). Compact pages need
-    it: the prefix-cache coordinator then verifies the drafter's window ending
-    exactly at the reconciled boundary, which is valid only because DFlash
-    context KV at a position depends on nothing after that position.
+    Compact pages are DFlash-only: under the flag the prefix-cache
+    coordinator verifies the drafter's window ending exactly at the
+    reconciled boundary, which is valid only because DFlash context KV at a
+    position depends on nothing after that position. So with the flag on,
+    every exact SlidingWindowSpec layer must be positively a DFlash draft
+    layer (speculative method plus one layer per draft decoder layer), or
+    boot fails before any group, exact-fit or padded, is chosen.
     """
     mode = os.environ.get("GLM53_DRAFT_KV_COMPACT", "0")
     if mode not in ("0", "1"):
         raise ValueError("GLM53_DRAFT_KV_COMPACT must be 0 or 1")
     if mode == "0":
-        return 64
-    if not dflash:
+        return False
+    swa_layers = sum(type(s) is SlidingWindowSpec for s in kv_cache_spec.values())
+    spec_config = vllm_config.speculative_config
+    if swa_layers and (
+        spec_config is None
+        or not spec_config.use_dflash()
+        or swa_layers != spec_config.draft_model_config.hf_config.num_hidden_layers
+    ):
         raise ValueError(
             "GLM53_DRAFT_KV_COMPACT=1 requires the DFlash drafter to own "
             "every sliding-window layer"
         )
+    return True
+
+
+def _glm53_draft_block_size(
+    mla_block: int, mla_page: int, bytes_per_token: int, compact: bool
+) -> int:
+    """Fill a shared page without increasing the prefix-cache alignment."""
+    if not compact:
+        return 64
     if (
         mla_block <= 0 or mla_block % 64
         or bytes_per_token <= 0 or mla_page < 64 * bytes_per_token
@@ -725,20 +742,29 @@ COMPACT_SELECTION_NEW = """\
             # Layer i shares MLA tensor i at disjoint block ids. Padded
             # pages must not be split; prepare_kernel_block_sizes checks
             # the actual attention backends before any cache is allocated.
-            # Compact pages are DFlash-only: the coordinator's boundary
-            # lookup relies on its per-position context KV.
-            spec_config = vllm_config.speculative_config
+            # The DFlash-only preflight already ran at get_kv_cache_groups.
             compact_block = _glm53_draft_block_size(
                 mla_block,
                 mla_page,
                 draft_bytes_per_token,
-                dflash=(
-                    spec_config is not None
-                    and spec_config.use_dflash()
-                    and len(draft_specs)
-                    == spec_config.draft_model_config.hf_config.num_hidden_layers
-                ),
+                _glm53_draft_kv_compact(vllm_config, kv_cache_spec),
             )
+"""
+COMPACT_PREFLIGHT_OLD = """\
+        The generated KVCacheGroups
+    \"\"\"
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        unify_hybrid_kv_cache_specs(kv_cache_spec)
+"""
+COMPACT_PREFLIGHT_NEW = """\
+        The generated KVCacheGroups
+    \"\"\"
+    # Fail closed before any grouping path (uniform, DeepseekV4, GLM-5-Next,
+    # generic) can build a sliding-window group the coordinator would treat
+    # as a DFlash drafter under GLM53_DRAFT_KV_COMPACT=1.
+    _glm53_draft_kv_compact(vllm_config, kv_cache_spec)
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        unify_hybrid_kv_cache_specs(kv_cache_spec)
 """
 COMPACT_VALIDATION_OLD = """\
                 s.block_size != 64 or s.page_size_padded != mla_page
@@ -793,10 +819,13 @@ def patch_file(path: str, dry_run: bool = False) -> int:
     worker_source = worker_path.read_text()
     text = _prepare_group(kv_source, path)
     helper_anchor = "def _get_kv_cache_groups_glm5_next("
-    if "def _glm53_draft_block_size(" in text and COMPACT_BLOCK_HELPER not in text:
+    if (
+        "def _glm53_draft_block_size(" in text or "def _glm53_draft_kv_compact(" in text
+    ) and COMPACT_BLOCK_HELPER not in text:
         raise AssertionError("DFlash2 compact block helper has drifted")
     text = _replace_once(text, helper_anchor, COMPACT_BLOCK_HELPER + helper_anchor)
     text = _replace_once(text, COMPACT_SELECTION_OLD, COMPACT_SELECTION_NEW)
+    text = _replace_once(text, COMPACT_PREFLIGHT_OLD, COMPACT_PREFLIGHT_NEW)
     text = _replace_once(text, COMPACT_VALIDATION_OLD, COMPACT_VALIDATION_NEW)
     worker = _replace_once(
         worker_source,

@@ -328,9 +328,10 @@ DFLASH_BOUNDARY_HELPER = '''
 def _glm53_dflash_boundary_lookup_enabled() -> bool:
     """GLM53_DRAFT_KV_COMPACT=1: allocator-verified DFlash drafter pages.
 
-    The allocator (patch_glm5_drafter_group.py) only builds compact pages when
-    the speculative method is DFlash and its draft layer count equals the
-    number of SlidingWindowSpec layers, so under this flag every exact
+    The allocator preflight (patch_glm5_drafter_group.py, at the entry of
+    get_kv_cache_groups on every grouping path) fails boot under this flag
+    unless every SlidingWindowSpec layer is the DFlash drafter's (speculative
+    method and one layer per draft decoder layer), so here every exact
     SlidingWindowSpec group is the DFlash drafter.
     """
     mode = os.environ.get("GLM53_DRAFT_KV_COMPACT", "0")

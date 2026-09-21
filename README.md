@@ -531,10 +531,12 @@ position p embeds token p+1, no block past the boundary is needed. Under
 looks the DFlash drafter group up ending exactly at the boundary
 (`# [glm53-dflash-boundary-lookup-v1]`); the complete-window check, replay
 clamp, EAGLE flag, retention, and caching are unchanged, and the result is
-identical to the EAGLE lookup whenever that one succeeds. The allocator
-builds compact pages only when the speculative method is DFlash and its
-draft layer count equals the sliding-window layer count; any other drafter
-fails at boot. Default `0` keeps the EAGLE lookup and its 64-token rule.
+identical to the EAGLE lookup whenever that one succeeds. Under the flag
+the allocator preflights every grouping path at `get_kv_cache_groups`,
+before any exact-fit or padded page is chosen: every sliding-window layer
+must belong to the DFlash drafter (speculative method and one layer per
+draft decoder layer), else boot fails. Default `0` never gates and keeps
+the EAGLE lookup and its 64-token rule.
 GPU correctness, draft acceptance, prefix reuse, and throughput remain
 unqualified at this head. Do not increase concurrency or batching based on
 the admission bound alone.
@@ -549,12 +551,14 @@ GLM53_VLLM_SRC=/path/to/vllm-source python3 -m pytest -q tests/test_draft_kv_com
 
 No torch import or model is needed. Without the source path, the two
 geometry/configuration tests run and the pinned-source tests skip. The
-pinned-source tests drive the real allocator, scheduler config, coordinator
-(with the overlay applied), and single-type managers over a dict block
-pool: the live 100,701-token reuse (64-token hit, 896-token clamp, 896-token
-boundary hit), every tail length across one 3,584-token page, lookahead
+pinned-source tests drive the real allocator entry point, scheduler
+config, coordinator (with the overlay applied), and single-type managers
+over a dict block pool: the live 100,701-token reuse (64-token hit,
+896-token clamp, 896-token boundary hit), every one of the 3,584 tail
+lengths across one page under dense and boundary-only retention, lookahead
 equivalence, changed suffixes and shared prefixes, evicted window blocks,
-and the off-by-default gate.
+the off-by-default gate, and the DFlash-only preflight on padded, exact-fit,
+and non-GLM grouping paths.
 The direction was motivated by
 [Alexbob0's draft-page sizing work](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/9bf39c3e84194a57c630a42c0d79066159a5b787/overlay/patch_kv_drafter_group.py#L64-L83);
 the geometry-derived selection and backend guard here are specific to this recipe.

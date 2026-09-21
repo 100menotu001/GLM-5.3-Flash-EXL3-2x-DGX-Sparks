@@ -48,9 +48,8 @@ MLA_BLOCK = 3584
 WINDOW = 2048
 
 
-def test_compact_block_preserves_alignment_and_fits_page(monkeypatch):
-    monkeypatch.setenv(ENV, "1")
-    ns = {"os": os}
+def test_compact_block_preserves_alignment_and_fits_page():
+    ns = {"os": os, "SlidingWindowSpec": type("SlidingWindowSpec", (), {})}
     exec(patch.COMPACT_BLOCK_HELPER, ns)
     choose = ns["_glm53_draft_block_size"]
     # Sweep non-power-of-two MLA pages and different TP-local draft widths.
@@ -70,28 +69,55 @@ def test_compact_block_preserves_alignment_and_fits_page(monkeypatch):
             assert block == max(legal)
     assert choose(3584, 3584 * 656, 2048, True) == 896
     assert choose(4608, 4608 * 656, 2048, True) == 1152
-
-
-def test_opt_out_and_invalid_configuration(monkeypatch):
-    ns = {"os": os}
-    exec(patch.COMPACT_BLOCK_HELPER, ns)
-    choose = ns["_glm53_draft_block_size"]
-    monkeypatch.delenv(ENV, raising=False)
-    assert choose(3584, 3584 * 656, 2048, True) == 64
-    # Off never needs the drafter identification.
+    # Off keeps the 64-token page whatever the geometry.
     assert choose(3584, 3584 * 656, 2048, False) == 64
-    for bad in ("", "auto", "true", "01"):
-        monkeypatch.setenv(ENV, bad)
-        with pytest.raises(ValueError):
-            choose(3584, 3584 * 656, 2048, True)
-    monkeypatch.setenv(ENV, "1")
-    # Compact pages are DFlash-only: the coordinator's boundary lookup
-    # depends on DFlash's per-position context KV.
-    with pytest.raises(ValueError, match="DFlash"):
-        choose(3584, 3584 * 656, 2048, False)
     for geometry in ((65, 65536, 512), (0, 65536, 512), (64, 65536, 0)):
         with pytest.raises(ValueError):
             choose(*geometry, True)
+        assert choose(*geometry, False) == 64
+
+
+def speculative(method, draft_layers=5):
+    simple = types.SimpleNamespace
+    return None if method is None else simple(
+        use_dflash=lambda: method == "dflash",
+        draft_model_config=simple(hf_config=simple(num_hidden_layers=draft_layers)),
+    )
+
+
+def test_compact_preflight_env_and_identity(monkeypatch):
+    swa = type("SlidingWindowSpec", (), {})
+    ns = {"os": os, "SlidingWindowSpec": swa}
+    exec(patch.COMPACT_BLOCK_HELPER, ns)
+    preflight = ns["_glm53_draft_kv_compact"]
+    dflash = types.SimpleNamespace(speculative_config=speculative("dflash"))
+    specs = {f"draft.{i}": swa() for i in range(5)}
+    monkeypatch.delenv(ENV, raising=False)
+    assert preflight(dflash, specs) is False
+    for bad in ("", "auto", "true", "01"):
+        monkeypatch.setenv(ENV, bad)
+        with pytest.raises(ValueError, match="0 or 1"):
+            preflight(dflash, specs)
+    monkeypatch.setenv(ENV, "1")
+    assert preflight(dflash, specs) is True
+    # Nothing to gate without sliding-window layers (e.g. a stage without
+    # the drafter); a KpoolTailSpec subclass is not an exact match.
+    assert preflight(types.SimpleNamespace(speculative_config=None), {}) is True
+    tail = type("KpoolTailSpec", (swa,), {})
+    assert preflight(types.SimpleNamespace(speculative_config=None), {"t": tail()}) is True
+    for config in (
+        types.SimpleNamespace(speculative_config=speculative("mtp")),
+        types.SimpleNamespace(speculative_config=None),
+        types.SimpleNamespace(speculative_config=speculative("dflash", 6)),
+    ):
+        with pytest.raises(ValueError, match="DFlash drafter"):
+            preflight(config, specs)
+    monkeypatch.setenv(ENV, "0")
+    for config in (
+        types.SimpleNamespace(speculative_config=speculative("mtp")),
+        types.SimpleNamespace(speculative_config=None),
+    ):
+        assert preflight(config, specs) is False
 
 
 @pytest.fixture
@@ -141,7 +167,10 @@ def allocator(sources, monkeypatch):
         get_uniform_type_base_spec=lambda spec: type(spec)
     )
     definitions(sources / "core/kv_cache_utils.py", ns, {
-        "_glm53_draft_block_size", "_get_kv_cache_groups_glm5_next",
+        "_glm53_draft_kv_compact", "_glm53_draft_block_size",
+        "get_kv_cache_groups", "is_kv_cache_type_attention_free",
+        "is_kv_cache_spec_uniform", "_get_kv_cache_groups_uniform_spec",
+        "group_and_unify_kv_cache_specs", "_get_kv_cache_groups_glm5_next",
         "_pp_balanced_mamba_group_count", "create_kv_cache_group_specs",
         "_glm5_next_tensor_layout", "_pool_bytes_per_block",
         "get_kv_cache_config_from_groups", "may_override_num_blocks",
@@ -152,20 +181,9 @@ def allocator(sources, monkeypatch):
     return ns
 
 
-def make_groups(ns, block=3584, draft_heads=4, method="dflash", draft_layers=5):
-    simple = types.SimpleNamespace
-    config = simple(
-        parallel_config=simple(pipeline_parallel_size=1),
-        cache_config=simple(num_gpu_blocks_override=None),
-        speculative_config=None if method is None else simple(
-            use_dflash=lambda: method == "dflash",
-            draft_model_config=simple(
-                hf_config=simple(num_hidden_layers=draft_layers)
-            ),
-        ),
-    )
+def make_specs(ns, block=3584, draft_heads=4, target=True):
     specs = {}
-    for i in range(11):
+    for i in range(11 if target else 0):
         specs[f"mla.{i}"] = ns["MLAAttentionSpec"](
             block_size=block, num_kv_heads=1, head_size=576,
             dtype=1, cache_dtype_str="fp8_ds_mla",
@@ -178,7 +196,7 @@ def make_groups(ns, block=3584, draft_heads=4, method="dflash", draft_layers=5):
             block_size=4, num_kv_heads=1, head_size=128,
             dtype=2, sliding_window=4,
         )
-    for i in range(34):
+    for i in range(34 if target else 0):
         specs[f"mamba.{i}"] = ns["MambaSpec"](
             block_size=block, shapes=((1024,),), dtypes=(2,),
         )
@@ -187,7 +205,19 @@ def make_groups(ns, block=3584, draft_heads=4, method="dflash", draft_layers=5):
             block_size=64, num_kv_heads=draft_heads, head_size=128,
             dtype=2, sliding_window=2048,
         )
-    groups = ns["_get_kv_cache_groups_glm5_next"](config, specs)
+    return specs
+
+
+def make_groups(ns, block=3584, draft_heads=4, method="dflash", draft_layers=5):
+    """The allocator entry point (every grouping path) on the GLM-5-Next layout."""
+    simple = types.SimpleNamespace
+    config = simple(
+        parallel_config=simple(pipeline_parallel_size=1),
+        cache_config=simple(num_gpu_blocks_override=None),
+        scheduler_config=simple(disable_hybrid_kv_cache_manager=False),
+        speculative_config=speculative(method, draft_layers),
+    )
+    groups = ns["get_kv_cache_groups"](config, make_specs(ns, block, draft_heads))
     cache = ns["get_kv_cache_config_from_groups"](config, groups, 16 * 1024**3)
     draft = next(iter(groups[-1].kv_cache_spec.kv_cache_specs.values()))
     return groups, cache, draft
@@ -212,15 +242,51 @@ def test_reservation_reduction_without_extra_allocation(allocator, monkeypatch):
     assert allocator["_glm5_next_tensor_layout"](groups) is None
 
 
+# Exact fit: MLA page 4096 * 656 = 2,686,976 bytes; 41 heads * 128 * 2 * 2 =
+# 20,992 draft bytes/token -> 128-token page, no padding (SIX finding 1).
+EXACT_FIT = dict(block=4096, draft_heads=41)
+NOT_DFLASH = (("mtp", 5), (None, 5), ("dflash", 6))
+
+
 def test_compact_pages_require_positively_identified_dflash(allocator, monkeypatch):
     monkeypatch.setenv(ENV, "1")
-    for method, draft_layers in (("mtp", 5), (None, 5), ("dflash", 6)):
-        with pytest.raises(ValueError, match="DFlash drafter"):
-            make_groups(allocator, method=method, draft_layers=draft_layers)
-    # Off keeps the 64-token padded pages for every drafter.
+    # Padded (deployed) and exact-fit geometries fail closed alike: the
+    # preflight runs before either branch is chosen.
+    for geometry in ({}, EXACT_FIT):
+        for method, draft_layers in NOT_DFLASH:
+            with pytest.raises(ValueError, match="DFlash drafter"):
+                make_groups(allocator, method=method, draft_layers=draft_layers, **geometry)
+    assert make_groups(allocator)[2].block_size == 896
+    exact = make_groups(allocator, **EXACT_FIT)[2]
+    assert exact.block_size == 128 and exact.page_size_padded is None
+    # Off never gates: padded geometry keeps the 64-token page and an exact
+    # fit keeps its pre-existing contiguous page (the coordinator's boundary
+    # lookup stays off for both).
     monkeypatch.setenv(ENV, "0")
-    for method, draft_layers in (("mtp", 5), (None, 5), ("dflash", 6)):
+    for method, draft_layers in NOT_DFLASH + (("dflash", 5),):
         assert make_groups(allocator, method=method, draft_layers=draft_layers)[2].block_size == 64
+        exact = make_groups(allocator, method=method, draft_layers=draft_layers, **EXACT_FIT)[2]
+        assert exact.block_size == 128 and exact.page_size_padded is None
+
+
+def test_compact_preflight_covers_non_glm_grouping_paths(allocator, monkeypatch):
+    """A drafter-only spec takes the generic uniform path, not the GLM-5-Next
+    fast path; the flag must still fail closed there."""
+    simple = types.SimpleNamespace
+    specs = make_specs(allocator, target=False)
+    for method, draft_layers in (("dflash", 5),) + NOT_DFLASH:
+        config = simple(
+            scheduler_config=simple(disable_hybrid_kv_cache_manager=False),
+            speculative_config=speculative(method, draft_layers),
+        )
+        monkeypatch.setenv(ENV, "0")
+        assert len(allocator["get_kv_cache_groups"](config, dict(specs))) == 1
+        monkeypatch.setenv(ENV, "1")
+        if method == "dflash" and draft_layers == 5:
+            assert len(allocator["get_kv_cache_groups"](config, dict(specs))) == 1
+        else:
+            with pytest.raises(ValueError, match="DFlash drafter"):
+                allocator["get_kv_cache_groups"](config, dict(specs))
 
 
 def test_backend_split_guard_and_unpadded_exception(allocator, monkeypatch):
@@ -475,20 +541,29 @@ def test_live_reuse_regression_is_the_missing_lookahead_block(prefix_hits, monke
 @pytest.mark.parametrize("swa_retention", [None, 0])
 def test_boundary_lookup_hits_at_every_alignment_offset(prefix_hits, monkeypatch, swa_retention):
     compact = layout(prefix_hits, monkeypatch, True, swa_retention)
-    baseline = layout(prefix_hits, monkeypatch, False, swa_retention)
     base = 8 * MLA_BLOCK
-    # Every tail length past the aligned boundary: 1 .. one full page, plus
+    # Every tail length past the aligned boundary across one full page, plus
     # tails longer than the draft window (no replay clamp at all).
-    for offset in [*range(1, MLA_BLOCK + 1, 7), MLA_BLOCK, 2049, 3000]:
+    for offset in [*range(1, MLA_BLOCK + 1), 2049, 3000]:
         prompt = tokens(base + offset, seed=offset)
         aligned = (base + offset - 1) // MLA_BLOCK * MLA_BLOCK
         compact.prefill(prompt)
         blocks, hit = compact.lookup(prompt)
         assert hit == aligned and compact.uncached == 0, offset
-        assert len(blocks[compact.draft_gid]) == aligned // 896
-        assert not blocks[compact.draft_gid][-1].is_null
-        # The EAGLE path only verifies when a complete draft block follows
-        # the boundary; otherwise the replay clamp costs one MLA page.
+        assert len(blocks[compact.draft_gid]) == aligned // 896, offset
+        assert not blocks[compact.draft_gid][-1].is_null, offset
+
+
+@pytest.mark.parametrize("swa_retention", [None, 0])
+def test_eagle_lookup_needs_a_complete_lookahead_block(prefix_hits, monkeypatch, swa_retention):
+    """The default 64-token layout: the EAGLE path only verifies when a
+    complete draft block follows the boundary; otherwise the replay clamp
+    costs one MLA page. Exhaustive around that threshold."""
+    baseline = layout(prefix_hits, monkeypatch, False, swa_retention)
+    base = 8 * MLA_BLOCK
+    for offset in [*range(1, 129), 896, 2048, 2049, MLA_BLOCK]:
+        prompt = tokens(base + offset, seed=offset)
+        aligned = (base + offset - 1) // MLA_BLOCK * MLA_BLOCK
         baseline.prefill(prompt)
         _, hit = baseline.lookup(prompt)
         lookahead = offset - 1 >= 64

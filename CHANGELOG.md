@@ -15,8 +15,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   `0`): derive a page-fitting divisor of the MLA block to reduce draft
   block-ID demand without changing precision or backing allocations.
   Reject padded-page kernel splitting during backend setup. DFlash-only:
-  the allocator and the TP2/TP3/TP4 launchers refuse `1` for any other
-  speculative method. Under `1`, `overlay/patch_hybrid_prefix_hit.py` looks
+  an allocator preflight on every grouping path (before exact-fit or padded
+  selection) and the TP2/TP3/TP4 launchers refuse `1` unless every
+  sliding-window layer is the DFlash drafter's. Under `1`,
+  `overlay/patch_hybrid_prefix_hit.py` looks
   the DFlash drafter group up ending exactly at the reconciled prefix
   boundary instead of requiring one complete draft block past it
   (`# [glm53-dflash-boundary-lookup-v1]`), so a same-prompt reuse whose tail
