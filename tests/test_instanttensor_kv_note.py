@@ -48,6 +48,8 @@ def test_note_fires_for_the_measured_failing_combination() -> None:
     assert "NOTE:" in _run("instanttensor", "850000", "0.80", "")[1]
     # an unrelated EXTRA_ARGS entry does not count as a KV size
     assert "NOTE:" in _run("instanttensor", "850000", "0.85", "--no-async-scheduling")[1]
+    # a flag that merely starts with the KV flag's name is not the KV flag
+    assert "NOTE:" in _run("instanttensor", "850000", "0.85", "--kv-cache-memory-bytes-invalid 1")[1]
 
 
 def test_note_is_silent_when_the_combination_is_not_the_failing_one() -> None:
@@ -58,6 +60,8 @@ def test_note_is_silent_when_the_combination_is_not_the_failing_one() -> None:
         ("instanttensor", "850000", "0.85", "--kv-cache-memory-bytes 15032385536"),
         ("instanttensor", "850000", "0.85", "--kv-cache-memory-bytes=15032385536"),
         ("instanttensor", "850000", "0.85", "--foo --kv-cache-memory-bytes 1 --bar"),
+        ("instanttensor", "850000", "0.85", "--foo\t--kv-cache-memory-bytes 1"),     # tab-separated
+        ("instanttensor", "850000", "0.85", "--foo\n--kv-cache-memory-bytes=1"),    # newline-separated
         ("instanttensor", "not-a-number", "0.85", ""),   # malformed input must not fire or fail
         ("instanttensor", "850000", "", ""),             # unset share (a sliced harness) must not fire or fail
         ("instanttensor", "850000", "abc", ""),          # malformed share likewise
@@ -89,9 +93,22 @@ def test_note_is_wired_into_preflight() -> None:
     assert source.count("preflight_instanttensor_kv_note ") == 1, "called exactly once"
 
 
+def test_topology_examples_clear_the_tp2_kv_cap() -> None:
+    """The shared .env ships a 14 GiB cap sized for TP=2 at 850k. start-tp3/tp4 source .env
+    first and then their own file, so each topology example must reset EXTRA_ARGS or a fresh
+    multi-Spark install inherits a cap that cannot hold one 1M-token request."""
+    shared = (ROOT / ".env.example").read_text()
+    assert 'EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"' in shared.splitlines()
+    for name in (".env.tp3.example", ".env.tp4.example"):
+        lines = (ROOT / name).read_text().splitlines()
+        assert "EXTRA_ARGS=" in lines, f"{name} must clear the inherited TP=2 cap"
+        assert not any(l.startswith("EXTRA_ARGS=") and "kv-cache-memory-bytes" in l for l in lines), name
+
+
 if __name__ == "__main__":
     test_note_fires_for_the_measured_failing_combination()
     test_note_is_silent_when_the_combination_is_not_the_failing_one()
     test_note_lives_inside_the_memory_guard_block()
     test_note_is_wired_into_preflight()
+    test_topology_examples_clear_the_tp2_kv_cap()
     print("instanttensor kv-fit note OK")

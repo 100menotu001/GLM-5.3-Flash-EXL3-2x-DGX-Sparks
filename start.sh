@@ -1035,7 +1035,10 @@ preflight_instanttensor_kv_note() {
     [[ "$max_model_len" =~ ^[0-9]+$ ]] && [ "$max_model_len" -ge 850000 ] || return 0
     [[ "$util" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] || return 0
     awk -v u="$util" 'BEGIN { exit !(u <= 0.85) }' || return 0
-    case " $extra_args " in *" --kv-cache-memory-bytes"*) return 0 ;; esac
+    local _tok
+    for _tok in $extra_args; do
+        case "$_tok" in --kv-cache-memory-bytes|--kv-cache-memory-bytes=*) return 0 ;; esac
+    done
     warn "NOTE: LOAD_FORMAT=instanttensor at MAX_MODEL_LEN=${max_model_len} with GPU_MEM_UTIL=${util} has been measured NOT to boot on 2x GB10 (KV needs 13.46 GiB, ~12.4 available); set EXTRA_ARGS=\"--kv-cache-memory-bytes 15032385536\" (see .env.example) or LOAD_FORMAT= (slower load). #204"
 }
 # GLM53 InstantTensor KV-fit note (end)

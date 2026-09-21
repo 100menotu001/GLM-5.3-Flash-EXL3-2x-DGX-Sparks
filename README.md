@@ -633,7 +633,7 @@ Three ways to run it, in the order we recommend (the first is the shipped defaul
 | setting | KV pool | boots on 2x GB10 | notes |
 |---|---|---|---|
 | `EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"` (14 GiB), share 0.85 | 883,552 tok, 1.04x | 3/3 | explicit reservation, bypasses profiling; idle host headroom same as loader-off (~5 GiB) |
-| `LOAD_FORMAT=` (vLLM auto), share 0.85 | ~1.07–1.14M tok | 3/3 | ~4x slower cold load; biggest pool |
+| `LOAD_FORMAT=` **and** `EXTRA_ARGS=` (clear the shipped cap), share 0.85 | ~1.07–1.14M tok | 3/3 | ~4x slower cold load; biggest pool. Keep any other `EXTRA_ARGS` you had. |
 | `GPU_MEM_UTIL=0.88`, no explicit pool | 1,017,763 tok when it boots | 1/4 | 0.88 × 121.69 = 107.09 GiB, right at the worker's CUDA-free at check time (105.8–107.1); `preflight_memory` reads `MemAvailable` and passes anyway; ~2.4 GB less host headroom when it does boot |
 
 `start.sh` prints a `NOTE` at preflight when it sees the failing combination (loader on,
