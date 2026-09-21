@@ -45,6 +45,8 @@ unchanged. Default ``0`` keeps the EAGLE lookahead lookup.
 Installation states: pristine source; the legacy hybrid-apc form shipped in
 the stock image (with or without the replay stage), which is migrated to the
 v3 verification form first; already-current source, a byte-identical no-op.
+Before writing, every owned stage must be present exactly once in its
+supported form; a stage marker alone never counts as an installation.
 Fail closed if the vLLM coordinator anchors drift.
 """
 from __future__ import annotations
@@ -448,6 +450,56 @@ BOUNDARY_VERIFY_NEW = """                _glm53_draft_swa = _glm53_is_draft_swa_
 
 
 
+# Owned stage content that a complete installation carries exactly once, and
+# superseded forms it must not carry. A stage marker only selects the
+# migration path; this table is what decides whether the result is written.
+# Helper blobs are compared stripped: the per-group overlay inserts the
+# identical base helper and may separate blobs with different whitespace.
+# The boundary stage rewrites the verification preamble inside the v3
+# hybrid-min block, so the complete form of that block is MIN_NEW with the
+# boundary verification applied.
+assert MIN_NEW.count(BOUNDARY_VERIFY_OLD) == 1
+MIN_FINAL = MIN_NEW.replace(BOUNDARY_VERIFY_OLD, BOUNDARY_VERIFY_NEW, 1)
+REQUIRED_ONCE = (
+    ("hybrid-apc helpers", BASE_HELPER.strip()),
+    ("eagle-fallback", EAGLE_NEW),
+    ("hybrid-min", MIN_FINAL),
+    ("group-log", LOG_NEW),
+    ("dflash-replay helpers", DFLASH_REPLAY_HELPER.strip()),
+    ("dflash-replay-init", INIT_NEW),
+    ("dflash-replay-clamp", CONVERGE_FINAL),
+    ("dflash-boundary helper", DFLASH_BOUNDARY_HELPER.strip()),
+    ("dflash-boundary-init", BOUNDARY_INIT_NEW),
+    ("dflash-boundary-lookup", BOUNDARY_LOOKUP_NEW),
+    ("dflash-boundary-verify", BOUNDARY_VERIFY_NEW),
+)
+SUPERSEDED = (
+    ("eagle-fallback", EAGLE_OLD),
+    ("hybrid-min", MIN_OLD),
+    ("legacy-hybrid-min", LEGACY_MIN),
+    ("dflash-replay-clamp", CONVERGE_OLD),
+    ("dflash-boundary-lookup", BOUNDARY_LOOKUP_OLD),
+    ("dflash-boundary-verify", BOUNDARY_VERIFY_OLD),
+)
+
+
+def verify_complete(text: str) -> list[str]:
+    """Names of stages whose owned content is missing, duplicated, or stale."""
+    problems = [
+        f"{label}: expected exactly one owned block, found {n}"
+        for label, block in REQUIRED_ONCE
+        if (n := text.count(block)) != 1
+    ]
+    problems += [
+        f"{label}: superseded form still present"
+        for label, block in SUPERSEDED
+        if block in text
+    ]
+    if sum(line.startswith("import os") for line in text.splitlines()) != 1:
+        problems.append("os-import: expected exactly one module-level import")
+    return problems
+
+
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     n = text.count(old)
     if n != 1:
@@ -516,6 +568,11 @@ def main() -> int:
         text = replace_once(
             text, BOUNDARY_VERIFY_OLD, BOUNDARY_VERIFY_NEW, "dflash-boundary-verify"
         )
+    # A marker only chose the path above; the written result must carry every
+    # owned stage exactly as supported (stale markers, partial stages, edited
+    # verification logic and duplicated stages all stop here, unwritten).
+    if problems := verify_complete(text):
+        raise SystemExit(f"{P}: incomplete or drifted overlay state: " + "; ".join(problems))
     P.write_text(text)
     print(
         f"patched {P.name} (hybrid APC + versioned DFlash SWA replay clamp "

@@ -33,8 +33,13 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   The prefix overlay migrates the stock image's legacy hybrid-apc
   coordinator form (with or without the published replay stage) to the
   current verification form before installing the boundary lookup; the
-  result is byte-identical to a pristine install for either flag value,
-  and unrecognized legacy drift still fails before any write.
+  result is byte-identical to a pristine install for either flag value.
+  Before writing, the overlay verifies that every owned stage (helpers,
+  EAGLE narrowing, v3 hybrid-min verification, replay init/clamp, boundary
+  init/lookup/verification) is present exactly once in its supported form;
+  a stale stage marker, a partial stage, edited verification logic, a
+  duplicated stage, or unrecognized legacy drift exits non-zero with the
+  file untouched.
   Default remains off; TP3/TP4 GPU and higher-concurrency behavior remain
   unqualified. See README for measurements, receipt hash, and limitations.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path

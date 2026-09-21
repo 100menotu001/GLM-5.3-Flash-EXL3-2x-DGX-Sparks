@@ -380,6 +380,70 @@ def test_hybrid_overlay_rejects_unrecognized_legacy_drift(sources, tmp_path):
         assert target.read_text() == text
 
 
+def rejected_unchanged(target, text, flag, expect):
+    target.write_text(text)
+    run = apply_hybrid(target, flag)
+    assert run.returncode != 0 and expect in run.stderr, (flag, run.stderr)
+    assert target.read_text() == text
+
+
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_hybrid_overlay_rejects_stale_markers_and_partial_stages(sources, tmp_path, flag):
+    """A stage marker alone is not an installation: the stock form with an
+    appended boundary (or replay) marker must not be written as a
+    boundary-less result that would keep the compact-prefix regression."""
+    pristine = (sources / "core/kv_cache_coordinator.py").read_text()
+    stock = coordinator_state(pristine, "stock")
+    target = tmp_path / "coordinator.py"
+    # A stale boundary marker skips that stage and fails the pre-write
+    # completeness check; a stale replay marker leaves the boundary stage
+    # without its init anchor. Both exit non-zero with the file untouched.
+    rejected_unchanged(
+        target, stock + f"\n{hybrid.DFLASH_BOUNDARY_MARK}\n", flag, "incomplete or drifted"
+    )
+    rejected_unchanged(
+        target, stock + f"\n{hybrid.DFLASH_REPLAY_MARK}\n", flag, "dflash-boundary-init"
+    )
+    # A partial boundary stage: helper and init present, lookup edits missing.
+    current = coordinator_state(pristine, "pristine")
+    target.write_text(current)
+    assert apply_hybrid(target, flag).returncode == 0
+    current = target.read_text()
+    partial = current.replace(hybrid.BOUNDARY_LOOKUP_NEW, hybrid.BOUNDARY_LOOKUP_OLD, 1)
+    assert partial != current
+    rejected_unchanged(target, partial, flag, "dflash-boundary-lookup")
+
+
+@pytest.mark.parametrize("flag", ["0", "1"])
+def test_hybrid_overlay_rejects_edited_or_duplicated_owned_stages(sources, tmp_path, flag):
+    target = tmp_path / "coordinator.py"
+    target.write_text((sources / "core/kv_cache_coordinator.py").read_text())
+    assert apply_hybrid(target, flag).returncode == 0
+    current = target.read_text()
+    predicate = "if _glm53_draft_swa and _new_hit_length < curr_hit_length:"
+    assert current.count(predicate) == 1
+    cases = {
+        "hybrid-min": current.replace(predicate, predicate.replace("<", ">")),
+        "dflash-boundary helper": current.replace(
+            hybrid.DFLASH_BOUNDARY_HELPER.strip(), "", 1
+        ),
+        "dflash-boundary-init": current.replace(
+            hybrid.BOUNDARY_INIT_NEW, hybrid.BOUNDARY_INIT_NEW * 2, 1
+        ),
+        "dflash-replay-clamp": current.replace(
+            "    return max(0, hit_length - pages * alignment_tokens)",
+            "    return hit_length",
+            1,
+        ).replace(hybrid.CONVERGE_FINAL, hybrid.CONVERGE_OLD, 1),
+    }
+    for label, text in cases.items():
+        assert text != current, label
+        rejected_unchanged(target, text, flag, label)
+    # The unmodified current file is still accepted byte-identically.
+    target.write_text(current)
+    assert apply_hybrid(target, flag).returncode == 0 and target.read_text() == current
+
+
 # ---------------------------------------------------------------------------
 # Prefix-cache lookup: the pinned HybridKVCacheCoordinator (with
 # overlay/patch_hybrid_prefix_hit.py applied) and the pinned single-type
