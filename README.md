@@ -518,10 +518,10 @@ option. Unpadded exact-fit pages retain their existing behavior.
 
 **Prefix reuse with larger draft blocks.** The drafter group is looked up
 with the EAGLE rule: a hit needs one complete, cached draft block *after*
-the reconciled 3,584-token boundary, which is then dropped. With 64-token
-blocks that block exists whenever at least 64 prompt tokens follow the
-boundary; with 896-token blocks it needs 896, so a same-prompt reuse whose
-tail is shorter (the live 100,701-token prompt has 349) lost one MLA page
+the reconciled 3,584-token boundary, which is then dropped. Lookup excludes
+the final prompt token, so a 64-token block needs at least 65 prompt tokens
+past the boundary; an 896-token block needs 897. A shorter same-prompt tail
+(the live 100,701-token prompt has 349) therefore lost one MLA page
 to the replay clamp (96,768 instead of 100,352 cached tokens). DFlash
 context KV at a position is a per-position projection of the target
 hidden state at that position (`precompute_and_store_context_kv`: row-wise
@@ -537,9 +537,41 @@ before any exact-fit or padded page is chosen: every sliding-window layer
 must belong to the DFlash drafter (speculative method and one layer per
 draft decoder layer), else boot fails. Default `0` never gates and keeps
 the EAGLE lookup and its 64-token rule.
-GPU correctness, draft acceptance, prefix reuse, and throughput remain
-unqualified at this head. Do not increase concurrency or batching based on
-the admission bound alone.
+**Scoped live qualification (2026-09-21).** The two runtime overlays from
+`6d5dd89` were tested on one existing TP2/DFlash2 deployment with unchanged
+precision and serving settings apart from this flag, using fresh baseline,
+candidate, and restored-baseline boots. The 51 request hashes matched across
+all three phases: 153 requests completed, 90/90 reference values were correct,
+and all three 3,200-token rollover sequence checks passed. Reference checking
+accepted the sorted-list answer's JSON wrapper; this is not a formatting or
+general model-quality claim. There were no runtime errors or preemptions.
+
+| Measurement | Baseline | Compact + boundary lookup | Restored baseline |
+|---|---:|---:|---:|
+| Reservation IDs per maximum-length request | 176 | 117 | 176 |
+| Cached tokens on the 100,701-token repeat | 100,352 | 100,352 | 100,352 |
+| Repeat time to first token (s) | 1.040 | 0.706 | 1.033 |
+| Cold 100,701-token time to first token (s) | 83.458 | 86.880 | 85.186 |
+| Two-request code aggregate throughput (tokens/s, median of 3) | 80.20 | 76.56 | 74.60 |
+| 3,200-token rollover decode (tokens/s) | 72.48 | 75.89 | 73.81 |
+
+The candidate retained all 28,672 prefix tokens at each tested tail length
+(64, 65, 349, 896, 897, and 2,048); both baselines lost one page at tail 64.
+Concurrent changed-suffix answers and the subsequent original-prompt answer
+were correct. Two near-243k requests and follow-ups also passed, but cold
+prefills were effectively serialized; this does not qualify higher concurrency.
+The 33.5% reservation reduction is **not a reduction in backing tensor memory**.
+Cold 100k prefill was 2.0–4.1% slower than the bracketing baselines, and
+single-request code/prose decode medians were lower by 0.6–2.3% and 1.8–5.7%,
+respectively. Freeform output
+sequences varied, so these rates are not an identical-output kernel benchmark.
+This is not a universal speedup; default remains `0`.
+
+TP3/TP4 GPU behavior, higher concurrency, other backends/architectures, and
+tensor-level numerical parity remain unqualified. Do not increase concurrency
+or batching based on the admission bound alone. Neutralized result receipt
+SHA-256 (retained privately):
+`35fd5ef14b9e9502116311c5706e0ae874056369f90e38ba2184f2be3257e7e2`.
 
 CPU verification, using pristine
 [vLLM `487ecf187`](https://github.com/vllm-project/vllm/tree/487ecf187d3dfe74d2cf6119a92881dba403c219)

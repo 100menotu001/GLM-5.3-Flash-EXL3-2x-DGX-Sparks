@@ -15,9 +15,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   `0`): derive a page-fitting divisor of the MLA block to reduce draft
   block-ID demand without changing precision or backing allocations.
   Reject padded-page kernel splitting during backend setup. DFlash-only:
-  an allocator preflight on every grouping path (before exact-fit or padded
-  selection) and the TP2/TP3/TP4 launchers refuse `1` unless every
-  sliding-window layer is the DFlash drafter's. Under `1`,
+  an allocator preflight on every grouping path verifies the method and
+  matching draft-layer count before exact-fit or padded selection.
+  TP2/TP3/TP4 launchers independently reject `1` unless `SPEC_METHOD=dflash`.
+  Under `1`,
   `overlay/patch_hybrid_prefix_hit.py` looks
   the DFlash drafter group up ending exactly at the reconciled prefix
   boundary instead of requiring one complete draft block past it
@@ -25,7 +26,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   is shorter than the draft block no longer loses one MLA page to the replay
   clamp; DFlash context KV is a per-position projection of the target hidden
   state, so no lookahead block is needed. CPU allocator, coordinator, and
-  launcher verification only; GPU behavior and performance remain unqualified.
+  launcher checks plus scoped TP2 live baseline/candidate/restored-baseline
+  qualification pass: 153 requests, 90 correct reference values, three
+  rollover checks, and no preemptions. The measured 100k prefix-reuse loss is
+  fixed while reservation demand remains lower; cold prefill can be slower.
+  Default remains off; TP3/TP4 GPU and higher-concurrency behavior remain
+  unqualified. See README for measurements, receipt hash, and limitations.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
   weights for scheduled M > 512, with approximately 3.26 GiB extra retained
