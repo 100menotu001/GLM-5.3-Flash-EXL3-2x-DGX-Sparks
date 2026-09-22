@@ -1131,6 +1131,44 @@ MAMBA_PROGRESS_PAIRS = (
     (MAMBA_STATE_STOP_OLD, MAMBA_STATE_STOP_NEW, "Mamba private-state stop"),
 )
 
+MAMBA_EAGLE_MARK = "# [glm53-mamba-eagle-backoff-v1]"
+MAMBA_EAGLE_INIT_OLD = MAMBA_STATE_INIT_OLD
+MAMBA_EAGLE_INIT_NEW = MAMBA_EAGLE_INIT_OLD + """        # [glm53-mamba-eagle-backoff-v1] SWA-only draft lookahead does not
+        # prune a target checkpoint. Preserve upstream backoff for non-SWA
+        # EAGLE participants (including MTP's no-SWA all-groups fallback).
+        self._glm53_mamba_eagle_backoff = self.use_eagle and any(
+            i in self.kv_cache_manager.coordinator.eagle_group_ids
+            and group.kv_cache_spec.participates_in_prefix_caching
+            and type(group.kv_cache_spec).__name__ != "SlidingWindowSpec"
+            for i, group in enumerate(kv_cache_config.kv_cache_groups)
+        )
+"""
+MAMBA_EAGLE_STOP_OLD = """        if self.use_eagle:
+            last_cache_position = max(last_cache_position - block_size, 0)
+"""
+MAMBA_EAGLE_STOP_NEW = MAMBA_EAGLE_STOP_OLD.replace(
+    "self.use_eagle", "self._glm53_mamba_eagle_backoff"
+)
+MAMBA_EAGLE_PAIRS = (
+    (MAMBA_EAGLE_INIT_OLD, MAMBA_EAGLE_INIT_NEW, "Mamba EAGLE initialization"),
+    (MAMBA_EAGLE_STOP_OLD, MAMBA_EAGLE_STOP_NEW, "Mamba EAGLE checkpoint"),
+)
+
+
+def unpatch_mamba_eagle(text: str) -> str:
+    if MAMBA_EAGLE_MARK in text:
+        for old, new, label in MAMBA_EAGLE_PAIRS:
+            text = replace_once(text, new, old, label)
+    elif "_glm53_mamba_eagle_backoff" in text:
+        raise SystemExit(f"{P}: Mamba EAGLE marker drifted")
+    return text
+
+
+def patch_mamba_eagle(text: str) -> str:
+    for old, new, label in MAMBA_EAGLE_PAIRS:
+        text = replace_once(text, old, new, label)
+    return text
+
 
 def unpatch_mamba_progress(text: str) -> str:
     if MAMBA_PROGRESS_MARK not in text:
@@ -1162,6 +1200,7 @@ def main() -> int:
         raise SystemExit(f"missing {P}")
     text = P.read_text()
     original = text
+    text = unpatch_mamba_eagle(text)
     text = patch_mamba_alignment(text)
     if MARK_V5 in text:
         # Validate existing anchors/helper instead of trusting the marker alone.
@@ -1172,6 +1211,7 @@ def main() -> int:
         # relocate the helper and fail a byte-compare on a healthy file.
         unpatch_v5(unpatch_mamba_progress(text))
         text = patch_mamba_progress(text)
+        text = patch_mamba_eagle(text)
         # The import edit is part of the applied state; the byte-compare used
         # to cover it implicitly.
         if "import os\n" not in text.split("import time\n", 1)[0]:
@@ -1191,6 +1231,7 @@ def main() -> int:
         text = unpatch_v1(text)
     text = apply_v5(text)
     text = patch_mamba_progress(text)
+    text = patch_mamba_eagle(text)
     compile(text, str(P), "exec")
     if MARK_V2 in text or MARK_V3 in text or MARK_V4 in text:
         raise SystemExit(f"{P}: older marker left after migration")

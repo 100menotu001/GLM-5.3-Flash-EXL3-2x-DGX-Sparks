@@ -13,9 +13,10 @@ Two coordinator bugs then throw the extra block away:
    scheduler page (block=64, align=3584), which can wipe a longer MLA hit.
 
 KpoolTail already opts out of prefix caching (1-block circular scratch).
-Mamba align-mode state *does* materialize at 896-token chunk ends, and
-3584 is a multiple of 896, so mamba must stay in the min — skipping a
-mamba miss is a correctness hole (vLLM #47491 / #43090).
+Mamba align-mode state materializes only at actual chunk ends; the shipped
+Mamba page is 3584 tokens (896-token layouts are synthetic probe cases).
+Mamba must stay in the min — skipping a miss is a correctness hole
+(vLLM #47491 / #43090).
 
 This patch: flag only exact SlidingWindowSpec groups as EAGLE, and do not
 let that drafter group shrink ``curr_hit_length``. If the drafter window
@@ -23,12 +24,11 @@ does not cover the MLA/mamba hit, leave its blocks empty so a fresh
 window is allocated (zeros / new pages).
 
 KpoolTail is deliberately per-request scratch and cannot prefix-cache. A
-resumed request therefore starts with an empty indexer-tail ring. Replaying
-fewer than one complete kpool leaves the ring incomplete and changes sparse
-attention selection. Clamp the shared hit back to an earlier scheduler
-boundary when necessary so at least one complete kpool is rebuilt before
-decode. This preserves the older MLA/Mamba prefix hit while making the
-non-shareable target state deterministic.
+resumed request therefore starts with an empty indexer-tail ring. Conservatively
+retain at least one complete four-token kpool of fresh replay before decode.
+The necessity of that floor has not been proved against the indexer kernel.
+In coarse-only mode it can discard a whole scheduler page for a query ending
+one to three tokens past its boundary; do not relax it without kernel proof.
 
 Fail closed if the vLLM coordinator anchors drift.
 """

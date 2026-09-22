@@ -72,6 +72,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 - Correct hybrid APC checkpoint alignment to use the resolved scheduler LCM
   (3584 in the tested layout), rather than the minimum group's 64-token size,
   while retaining bounded small-step progress and the hash-grain prompt tail.
+  Apply the scheduler EAGLE backoff only when a participating non-SWA group
+  needs it: SWA-only drafting preserves the last full target checkpoint under
+  production 7168-token grants; no-SWA MTP retains upstream behavior. The
+  extra prefill step versus improved short-suffix hits has unmeasured GPU cost.
 - Limit the partial-hit capability veto to prefix-participating groups:
   nonparticipating KpoolTail scratch no longer blocks compatible target states.
   No unsafe SWA exemption is introduced; incompatible participating SWA still vetoes.
@@ -82,6 +86,8 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   checks are not GPU state/logit parity or TTFT measurements; GPU qualification
   remains outstanding. Reproduction uses the Dockerfile-pinned source probe
   described in [README](README.md#reproduce-the-pinned-source-cpu-probe).
+  The four-token Kpool replay floor remains conservative and kernel-unverified;
+  coarse-only lookup can lose a whole page within three tokens of a boundary.
 - TP3/TP4 now preserve an explicitly exported `LOAD_FORMAT=` through shared and
   topology env files, so callers can select auto without changing loader defaults.
 - Repinned the cooperative-MoE profile generators' `overlay/exl3.py` digest

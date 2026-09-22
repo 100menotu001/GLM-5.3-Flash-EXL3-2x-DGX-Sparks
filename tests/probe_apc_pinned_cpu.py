@@ -115,6 +115,12 @@ def stage_sources(source, manifest_path, stage):
         ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
          "for state_block in self._glm53_mamba_sub_block_sizes:",
          "for state_block in ():"),
+        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
+         "if self._glm53_mamba_eagle_backoff:",
+         "if self.use_eagle:"),
+        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
+         "and group.kv_cache_spec.participates_in_prefix_caching",
+         "and True"),
         ("patch_hybrid_prefix_hit.py", TARGETS["GLM53_KV_COORDINATOR_PY"],
          "if group.kv_cache_spec.participates_in_prefix_caching\n                and not",
          "if True\n                and not"),
@@ -138,7 +144,8 @@ def stage_sources(source, manifest_path, stage):
     # Migrate the pre-fix overlays on an otherwise fully composed image.
     for name, rel, prefixes in (
         ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
-         ("MAMBA_ALIGNMENT", "MAMBA_PROGRESS", "MAMBA_STATE_INIT", "MAMBA_STATE_STOP")),
+         ("MAMBA_EAGLE_INIT", "MAMBA_EAGLE_STOP", "MAMBA_ALIGNMENT",
+          "MAMBA_PROGRESS", "MAMBA_STATE_INIT", "MAMBA_STATE_STOP")),
         ("patch_hybrid_prefix_hit.py", TARGETS["GLM53_KV_COORDINATOR_PY"],
          ("CAPABILITY", "KPOOL_INIT", "KPOOL_HIT", "COARSE_RETRY")),
     ):
@@ -307,9 +314,9 @@ def layout(runtime, *, scratch=True, draft=64, mamba=(3584,) * 4):
     return s.KVCacheConfig(num_blocks=4096, kv_cache_tensors=[], kv_cache_groups=groups)
 
 
-def geometry(runtime, stage, cfg):
+def geometry(runtime, stage, cfg, prefix_match_unit=None):
     config = types.SimpleNamespace(cache_config=types.SimpleNamespace(
-        block_size=3584, enable_prefix_caching=True, prefix_match_unit=64),
+        block_size=3584, enable_prefix_caching=True, prefix_match_unit=prefix_match_unit),
         parallel_config=types.SimpleNamespace(decode_context_parallel_size=1),
         kv_transfer_config=None)
     # Execute the exact engine assignments which set the post-grouping global
@@ -339,35 +346,46 @@ def new_manager(runtime, cfg, scheduler, global_retention=None, swa=None):
         use_eagle=True, max_in_flight_tokens=4096)
 
 
+def scheduler_state(stage, cfg, manager, global_block, scheduler, hash_size=64):
+    """Execute the actual init assignments, including optional older revisions."""
+    sched = types.SimpleNamespace(cache_config=types.SimpleNamespace(block_size=global_block),
+        block_size=scheduler, hash_block_size=hash_size, max_num_scheduled_tokens=7168,
+        scheduler_config=types.SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True, kv_cache_manager=manager, _glm53_align_prefill_limit=None,
+        mamba_partial_cache_hit=manager.coordinator.enable_partial_hash_hits)
+    path = stage / "v1/core/sched/scheduler.py"
+    tree = ast.parse(path.read_text())
+    names = {"_glm53_mamba_sub_block_sizes", "_glm53_mamba_eagle_backoff"}
+    assignments = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Attribute) and t.attr in names for t in n.targets)]
+    exec(compile(ast.Module(body=assignments, type_ignores=[]), str(path), "exec"),
+         {"self": sched, "kv_cache_config": cfg})
+    return sched
+
 def alignment_probe(runtime, stage):
     split = method(stage / "v1/core/sched/scheduler.py", "Scheduler",
                    "_mamba_block_aligned_split")
-    scheduler_tree = ast.parse((stage / "v1/core/sched/scheduler.py").read_text())
-    state_init = next(n for n in ast.walk(scheduler_tree) if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Attribute) and t.attr == "_glm53_mamba_sub_block_sizes"
-                for t in n.targets))
-    state_init_code = compile(ast.Module(body=[state_init], type_ignores=[]),
-                              str(stage / "v1/core/sched/scheduler.py"), "exec")
+    cfg = layout(runtime)
+    check(geometry(runtime, stage, cfg) == geometry(runtime, stage, cfg, 64),
+          "empty prefix unit resolves gcd64 identically to explicit64")
     examples = []
     for blocks in ((3584,) * 4, (896, 1792, 3584, 896)):
         cfg = layout(runtime, mamba=blocks)
         global_block, scheduler, hash_size = geometry(runtime, stage, cfg)
         check((global_block, scheduler, hash_size) == (64, 3584, 64),
               "real engine and resolver produce min64/LCM3584/hash64", mamba=blocks)
-        for budget in (2048, 4096):
+        manager = new_manager(runtime, cfg, scheduler)
+        for budget in (2048, 4096, 7168, 8192):
             for start, count in (
                 (start, count)
-                for start in (0, 2048, 3520, 3584, 5632, 7104)
-                for count in (128, 256, 512, 1024, 2048)
+                for start in (0, 100, 2048, 3520, 3584, 5632, 7104)
+                for count in (128, 256, 512, 1024, 2048, 4000, 5000, 7168, 8000)
             ):
-                req = request(runtime, "align", range(12033))
+                req = request(runtime, "align", range(32000))
                 req.num_computed_tokens = start
-                sched = types.SimpleNamespace(cache_config=types.SimpleNamespace(
-                    block_size=global_block), block_size=scheduler,
-                    hash_block_size=64, max_num_scheduled_tokens=budget,
-                    scheduler_config=types.SimpleNamespace(long_prefill_token_threshold=0),
-                    use_eagle=True, mamba_partial_cache_hit=False)
-                exec(state_init_code, {"self": sched, "kv_cache_config": cfg})
+                sched = scheduler_state(stage, cfg, manager, global_block, scheduler)
+                sched.max_num_scheduled_tokens = budget
+                sched.mamba_partial_cache_hit = False
                 got = split(sched, req, count)
                 end = start + got
                 # A positive current grant can advance private state, regardless
@@ -375,7 +393,11 @@ def alignment_probe(runtime, stage):
                 # be left behind while crossing its own state-page boundary.
                 crossed = any(
                     start % b and start < (start // b + 1) * b < end for b in blocks)
-                legal = not crossed
+                legal = not crossed and (
+                    end % scheduler == 0 or
+                    (start % scheduler != 0 and
+                     end <= (start // scheduler + 1) * scheduler) or
+                    (start % scheduler == 0 and got < scheduler))
                 row = dict(global_block=global_block, scheduler_block=scheduler,
                            mamba_blocks=blocks, budget=budget, start=start,
                            proposed=count, returned=got, end=end, legal=legal,
@@ -383,6 +405,9 @@ def alignment_probe(runtime, stage):
                 examples.append(row)
                 check(0 < got <= count, "positive grant makes bounded progress", **row)
                 check(legal, "intermediate chunks respect shared state checkpoints", **row)
+                if start % scheduler == 0 and count >= scheduler:
+                    check(end % scheduler == 0,
+                          "aligned start with above-page grant ends on checkpoint", **row)
                 if not legal:
                     REPORT["defects"].append({"claim": "A", **row})
         # Decode and cached/external offsets must not accidentally become prefill.
@@ -444,7 +469,7 @@ def capability_probe(runtime, stage):
     rows = []
     for scratch, draft in ((False, 64), (True, 64), (False, 128), (True, 128)):
         cfg = layout(runtime, scratch=scratch, draft=draft)
-        global_block, scheduler, hash_size = geometry(runtime, stage, cfg)
+        global_block, scheduler, hash_size = geometry(runtime, stage, cfg, 64)
         manager = new_manager(runtime, cfg, scheduler)
         coord = manager.coordinator
         facts = [dict(manager=type(m).__name__, block=m.block_size,
@@ -611,7 +636,7 @@ def partial_tail_probe(runtime, stage):
     tokens = list(range(7745))
     for draft in (0, 64):
         cfg = layout(runtime, draft=draft)
-        _, scheduler, _ = geometry(runtime, stage, cfg)
+        _, scheduler, _ = geometry(runtime, stage, cfg, 64)
         runtime.envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL = None
         os.environ.pop("VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA", None)
         manager = runtime.manager.KVCacheManager(
@@ -662,6 +687,71 @@ def partial_tail_probe(runtime, stage):
             observe("partial-tail-reuse", draft=draft, query_length=length, hit=hit)
 
 
+def production_probe(runtime, stage):
+    """Real production-grant splitter -> allocator -> free -> short-suffix hit."""
+    split = method(stage / "v1/core/sched/scheduler.py", "Scheduler",
+                   "_mamba_block_aligned_split")
+    for prefix_unit in (None, 64):
+        for retention in (None, 14336):
+            cfg = layout(runtime)
+            global_block, scheduler, hash_size = geometry(runtime, stage, cfg, prefix_unit)
+            for length in range(3600, 32001, 448):
+                cache = new_manager(runtime, cfg, scheduler, retention, retention)
+                sched = scheduler_state(stage, cfg, cache, global_block, scheduler, hash_size)
+                tokens = list(range(10000, 10000 + length))
+                seed = request(runtime, "production-prime", tokens)
+                trace = []
+                while seed.num_computed_tokens < length:
+                    grant = min(7168, length - seed.num_computed_tokens)
+                    got = split(sched, seed, grant)
+                    assert 0 < got <= grant
+                    cache.coordinator.new_step_starts()
+                    assert cache.allocate_slots(seed, got) is not None
+                    seed.num_computed_tokens += got
+                    trace.append(seed.num_computed_tokens)
+                cache.coordinator.new_step_starts()
+                cache.free(seed)
+                cache.coordinator.new_step_starts()
+                _, hit, _ = cache.get_computed_blocks(request(runtime, "production-followup",
+                    tokens + list(range(500000, 500300))))
+                checkpoint = (length - 1) // scheduler * scheduler
+                check(checkpoint in trace,
+                      "production grant preserves last full target checkpoint",
+                      length=length, trace=trace, prefix_unit=prefix_unit, retention=retention)
+                # Large grants can skip intermediate states; sparse retention
+                # can then push draft replay to the preceding retained interval.
+                # Exact comparison to main is an external A/B run.
+                guard = max(7168, retention or 0)
+                check(hit >= max(0, checkpoint - guard),
+                      "production short suffix retains replay-safe checkpoint",
+                      length=length, hit=hit, checkpoint=checkpoint)
+                observe("production-short-suffix", length=length, trace=trace, hit=hit,
+                        prefix_unit=prefix_unit, retention=retention)
+
+    # No-SWA MTP must keep the upstream one-page scheduler backoff.
+    cfg = layout(runtime, draft=0)
+    global_block, scheduler, hash_size = geometry(runtime, stage, cfg, 64)
+    cache = new_manager(runtime, cfg, scheduler)
+    sched = scheduler_state(stage, cfg, cache, global_block, scheduler, hash_size)
+    req = request(runtime, "mtp", range(12033))
+    req.num_computed_tokens = 3584
+    check(split(sched, req, 8449) == 3584,
+          "no-SWA EAGLE preserves upstream mandatory backoff checkpoint")
+    # Explicit group annotations take precedence over the SWA fallback.
+    # Scratch never requires a target backoff; an EAGLE MLA or Mamba does.
+    for group_id, expected_end in ((1, 10752), (0, 7168), (2, 7168)):
+        cfg = layout(runtime)
+        cfg.kv_cache_groups[group_id].is_eagle_group = True
+        global_block, scheduler, hash_size = geometry(runtime, stage, cfg)
+        cache = new_manager(runtime, cfg, scheduler)
+        sched = scheduler_state(stage, cfg, cache, global_block, scheduler, hash_size)
+        req = request(runtime, "annotated-eagle", range(12033))
+        req.num_computed_tokens = 3584
+        check(3584 + split(sched, req, 8449) == expected_end,
+              "only participating non-SWA EAGLE needs target checkpoint backoff",
+              eagle_group=group_id, expected_end=expected_end)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
@@ -687,7 +777,8 @@ def main():
             for label, probe in (("alignment", alignment_probe),
                                  ("capability", capability_probe),
                                  ("cache_contract", cache_contract_probe),
-                                 ("partial_tail", partial_tail_probe)):
+                                 ("partial_tail", partial_tail_probe),
+                                 ("production", production_probe)):
                 try:
                     probe(runtime, stage)
                 except Exception:

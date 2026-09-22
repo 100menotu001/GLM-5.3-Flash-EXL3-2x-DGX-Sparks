@@ -571,6 +571,12 @@ and capability defects, without a new retention policy or serving default:
   Unequal Mamba layouts additionally stop at the next necessary smaller private
   page boundary, preserving incomplete recurrent state before crossing that page.
   Shared-LCM checkpoints and the final hash-grain prompt-tail stop remain enforced.
+  When only SWA drafter groups use EAGLE, the mandatory last full target
+  checkpoint is not backed off by a page. Non-SWA EAGLE participants, including
+  no-SWA MTP, retain upstream backoff. This preserves production solo-prefill
+  checkpoints with 7168-token grants and short (300-token) follow-ups; it may
+  add a prefill step when that checkpoint is not a natural chunk end. The
+  GPU cost of this extra-step/cache-hit tradeoff is unmeasured.
   More small mixed steps may affect throughput and decode latency; those GPU
   effects have not been measured.
 - **Capability gate:** only prefix-participating groups may veto partial hits.
@@ -580,7 +586,8 @@ and capability defects, without a new retention policy or serving default:
 
 `PREFIX_MATCH_UNIT` remains **empty by default**, letting vLLM resolve the hash
 grain. Explicit `PREFIX_MATCH_UNIT=64` is supported for the tested geometry and
-forwarded by TP2/TP3/TP4; 512 remains invalid for this hybrid stack. The fixes can
+forwarded by TP2/TP3/TP4; 512 is invalid because the participating drafter SWA
+block is 64, not because of a KDA64 block. The fixes can
 activate the already-present fine-grained machinery when its conditions are met,
 even without changing the empty default. A smaller hash grain is not a promise
 that every boundary is stored or reusable.
@@ -590,8 +597,12 @@ required complete DFlash/EAGLE draft window, lookup first retries the preceding
 shared scheduler checkpoint, rechecking all participating target groups and
 draft-window coverage, before the larger replay backoff. It never treats an
 incomplete or ordinary undropped draft window as reusable. The request-local
-Kpool scratch also requires **four fresh prompt tokens**; a fine hit cannot
-consume that tail, and draft replay may require more fresh tokens.
+Kpool scratch conservatively retains **four fresh prompt tokens**; a fine hit
+cannot consume that tail, and draft replay may require more fresh tokens.
+Its necessity remains unverified against the indexer kernel, so the safety
+floor is not relaxed. With fine hits disabled (for example DCP > 1 or an
+incompatible participating SWA128 group), a query ending one to three tokens
+past a scheduler boundary can lose a whole 3584-token cache page to this floor.
 
 Existing SWA retention and `GLM53_APC_RETENTION_INTERVAL_SWA` behavior are retained,
 not widened to every hash64 boundary. Some fine target states therefore still
