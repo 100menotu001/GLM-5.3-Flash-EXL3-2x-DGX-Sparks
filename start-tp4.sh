@@ -87,10 +87,16 @@ _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_sparse_slice_set="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS+1}"
 _cli_sparse_slice="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS-}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
+# Caller EXTRA_ARGS is captured here (setness + value, explicit empty included) and restored
+# verbatim after the topology overlay, so the TP2-cap strip below acts on the file-derived
+# value only. #204 / PR #242 review.
+_cli_extra_args_set="${EXTRA_ARGS+1}"
+_cli_extra_args="${EXTRA_ARGS-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 # TP=4 does not inherit the 2-node KV cap from .env (#204): .env.example ships
+# (file-derived value only: the caller's EXTRA_ARGS was captured above and is restored below)
 # EXTRA_ARGS="--kv-cache-memory-bytes 15032385536", sized for TP=2 at 850k, and 14 GiB does
 # not hold one 1,000,000-token request. Drop that token (either spelling) and keep the rest;
 # set a TP=4 value in .env.tp4 if you want to pin the pool.
@@ -135,6 +141,7 @@ set +a
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
 [ -n "${_cli_sparse_slice_set}" ] && VLLM_SM120_SPARSE_MLA_SLICE_TOKENS="$_cli_sparse_slice"
+[ -n "${_cli_extra_args_set}" ] && EXTRA_ARGS="$_cli_extra_args"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"

@@ -662,11 +662,13 @@ IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
 LOAD_FORMAT=instanttensor
 ```
 
-   **TP=2 only**, also add to `.env` (it is now the default in `.env.example`; an existing
-   `.env` predates it):
+   **TP=2 only**, also make sure `.env`'s `EXTRA_ARGS` contains the reservation (it is the
+   default in `.env.example`; an existing `.env` predates it). If you already have
+   `EXTRA_ARGS`, append to it rather than replacing it:
 
 ```
-EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"
+EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"                          # no other flags yet
+EXTRA_ARGS="--your-existing-flags --kv-cache-memory-bytes 15032385536"   # keep what you had
 ```
 
    TP=3 / TP=4 do not need it and must not rely on it: `start-tp3.sh` and `start-tp4.sh` drop

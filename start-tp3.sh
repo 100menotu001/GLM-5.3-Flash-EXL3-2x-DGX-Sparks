@@ -111,12 +111,18 @@ _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 _cli_overlay="${EXL3_OVERLAY_HOST-}"
+# Caller EXTRA_ARGS is captured here (setness + value, explicit empty included) and restored
+# verbatim after the topology overlay, so the TP2-cap strip below acts on the file-derived
+# value only. #204 / PR #242 review.
+_cli_extra_args_set="${EXTRA_ARGS+1}"
+_cli_extra_args="${EXTRA_ARGS-}"
 _cli_dense_fp8="${GLM53_DENSE_FP8-}"
 _cli_kda_bf16="${GLM53_KDA_BF16_LARGE_M-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 # TP=3 does not inherit the 2-node KV cap from .env (#204): .env.example ships
+# (file-derived value only: the caller's EXTRA_ARGS was captured above and is restored below)
 # EXTRA_ARGS="--kv-cache-memory-bytes 15032385536", sized for TP=2 at 850k, and 14 GiB does
 # not hold one 1,000,000-token request. Drop that token (either spelling) and keep the rest;
 # set a TP=3 value in .env.tp3 if you want to pin the pool.
@@ -178,6 +184,7 @@ set +a
 [ -n "${_cli_overlay}" ] && EXL3_OVERLAY_HOST="$_cli_overlay"
 [ -n "${_cli_dense_fp8}" ] && GLM53_DENSE_FP8="$_cli_dense_fp8"
 [ -n "${_cli_kda_bf16}" ] && GLM53_KDA_BF16_LARGE_M="$_cli_kda_bf16"
+[ -n "${_cli_extra_args_set}" ] && EXTRA_ARGS="$_cli_extra_args"
 
 # ----------------------------- configuration -------------------------------
 MODEL="${MODEL:-Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw}"

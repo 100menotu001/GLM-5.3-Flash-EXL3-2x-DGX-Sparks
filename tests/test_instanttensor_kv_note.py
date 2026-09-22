@@ -8,7 +8,10 @@ silent otherwise, and never return non-zero, so it can never abort a boot under 
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 START = ROOT / "start.sh"
@@ -42,7 +45,8 @@ def test_note_fires_for_the_measured_failing_combination() -> None:
     rc, err = _run("instanttensor", "850000", "0.85", "")
     assert rc == 0
     assert "NOTE:" in err and "#204" in err
-    assert "--kv-cache-memory-bytes 15032385536" in err, "must point at the .env.example line"
+    assert "--kv-cache-memory-bytes 15032385536" in err, "must name the flag"
+    assert "keeping any flags" in err, "must say to append, not replace (#242 review)"
     # larger context and lower share are the same failure or worse
     assert "NOTE:" in _run("instanttensor", "900000", "0.85", "")[1]
     assert "NOTE:" in _run("instanttensor", "850000", "0.80", "")[1]
@@ -93,34 +97,54 @@ def test_note_is_wired_into_preflight() -> None:
     assert source.count("preflight_instanttensor_kv_note ") == 1, "called exactly once"
 
 
-def _tp_strip_block(launcher: str) -> str:
+def _tp_precedence_path(launcher: str) -> str:
+    """start-tp3/tp4 from the first _cli_ capture through the EXTRA_ARGS restore: the whole
+    caller -> .env -> TP2-cap strip -> topology overlay -> caller-restore path, matched by
+    text so it survives edits around it. That region is captures, sources and assignments."""
     source = (ROOT / launcher).read_text()
-    begin = source.index("# TP=") ; begin = source.index("does not inherit the 2-node KV cap", begin)
-    begin = source.rfind("\n", 0, begin) + 1
-    end = source.index('EXTRA_ARGS="$_kept"; unset _kept _skip _tok\nfi\n', begin) + len('EXTRA_ARGS="$_kept"; unset _kept _skip _tok\nfi\n')
+    begin = source.index('_cli_mtp="${MTP_TOKENS-}"\n')
+    end_line = '[ -n "${_cli_extra_args_set}" ] && EXTRA_ARGS="$_cli_extra_args"\n'
+    end = source.index(end_line) + len(end_line)
     return source[begin:end]
 
 
-def test_tp3_tp4_drop_the_inherited_tp2_kv_cap_and_keep_other_flags() -> None:
-    """start-tp3/tp4 source .env (which now ships the 14 GiB cap) and then their own file.
-    They must drop that token — bare or =value, with its value — and keep every other flag,
-    so a user's unrelated EXTRA_ARGS survive and 1M-token topologies are not capped at 14 GiB."""
-    shipped = next(l for l in (ROOT / ".env.example").read_text().splitlines() if l.startswith("EXTRA_ARGS="))
-    assert "--kv-cache-memory-bytes 15032385536" in shipped
-    for launcher in ("start-tp3.sh", "start-tp4.sh"):
-        block = _tp_strip_block(launcher)
-        for given, want in (
-            ("--kv-cache-memory-bytes 15032385536", ""),
-            ("--kv-cache-memory-bytes 15032385536 --no-async-scheduling", "--no-async-scheduling"),
-            ("--no-async-scheduling --kv-cache-memory-bytes 15032385536 --foo bar", "--no-async-scheduling --foo bar"),
-            ("--kv-cache-memory-bytes=15032385536 --no-async-scheduling", "--no-async-scheduling"),
-            ("--no-async-scheduling", "--no-async-scheduling"),
-            ("", ""),
-        ):
-            r = subprocess.run(["bash", "-c", "set -euo pipefail\nEXTRA_ARGS=\"$1\"\n" + block + 'printf "%s" "${EXTRA_ARGS-}"', "_", given],
-                               capture_output=True, text=True, timeout=30)
-            assert r.returncode == 0, (launcher, given, r.stderr)
-            assert r.stdout == want, (launcher, given, r.stdout)
+def _run_tp_precedence(launcher: str, n: str, dotenv: str, tpenv: str, caller: dict[str, str]) -> str:
+    script = 'set -euo pipefail\nSCRIPT_DIR="$PWD"\n' + _tp_precedence_path(launcher) + '\nprintf "%s" "${EXTRA_ARGS-<unset>}"\n'
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        (tmp / ".env").write_text(dotenv)
+        (tmp / f".env.tp{n}").write_text(tpenv)
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp)}
+        env.update(caller)
+        r = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True, env=env, timeout=30)
+        assert r.returncode == 0, (launcher, r.stderr)
+        return r.stdout
+
+
+CAP = 'EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"\n'
+CALLER = "--kv-cache-memory-bytes 21474836480 --max-log-len 7"
+
+
+@pytest.mark.parametrize("launcher,n", [("start-tp3.sh", "3"), ("start-tp4.sh", "4")])
+def test_tp3_tp4_extra_args_precedence_end_to_end(launcher: str, n: str) -> None:
+    """#204 / PR #242 review: the shared .env ships a 14 GiB cap sized for TP=2. start-tp3/tp4
+    must drop that token from the FILE-derived value (keeping other flags) while preserving
+    caller precedence verbatim — including an explicit empty — and topology-file overrides.
+    Runs the real launcher preamble, not the extracted strip loop."""
+    cases = [
+        # (.env, .env.tpN, caller env, expected EXTRA_ARGS)
+        (CAP, "", {}, ""),                                                                    # inherited cap dropped
+        ('EXTRA_ARGS="--kv-cache-memory-bytes 15032385536 --no-async-scheduling"\n', "", {}, "--no-async-scheduling"),
+        (CAP, "", {"EXTRA_ARGS": CALLER}, CALLER),                                            # reviewer case 1
+        ("", "", {"EXTRA_ARGS": CALLER}, CALLER),                                             # reviewer case 2
+        (CAP, 'EXTRA_ARGS="--foo"\n', {"EXTRA_ARGS": ""}, ""),                               # explicit empty caller wins
+        (CAP, 'EXTRA_ARGS="--foo"\n', {}, "--foo"),                                          # topology override kept
+        (CAP, 'EXTRA_ARGS="--foo"\n', {"EXTRA_ARGS": "--bar"}, "--bar"),                     # caller beats topology
+        (CAP, "", {"EXTRA_ARGS": "--kv-cache-memory-bytes=1 --x"}, "--kv-cache-memory-bytes=1 --x"),  # caller's own cap kept
+    ]
+    for dotenv, tpenv, caller, want in cases:
+        got = _run_tp_precedence(launcher, n, dotenv, tpenv, caller)
+        assert got == want, (launcher, dotenv, tpenv, caller, got)
 
 
 
@@ -129,5 +153,6 @@ if __name__ == "__main__":
     test_note_is_silent_when_the_combination_is_not_the_failing_one()
     test_note_lives_inside_the_memory_guard_block()
     test_note_is_wired_into_preflight()
-    test_tp3_tp4_drop_the_inherited_tp2_kv_cap_and_keep_other_flags()
+    for launcher, n in (("start-tp3.sh", "3"), ("start-tp4.sh", "4")):
+        test_tp3_tp4_extra_args_precedence_end_to_end(launcher, n)
     print("instanttensor kv-fit note OK")
