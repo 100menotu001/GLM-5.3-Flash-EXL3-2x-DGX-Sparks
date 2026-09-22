@@ -637,8 +637,19 @@ Three ways to run it, in the order we recommend (the first is the shipped defaul
 | `GPU_MEM_UTIL=0.88`, no explicit pool | 1,017,763 tok when it boots | 1/4 | 0.88 × 121.69 = 107.09 GiB, right at the worker's CUDA-free at check time (105.8–107.1); `preflight_memory` reads `MemAvailable` and passes anyway; ~2.4 GB less host headroom when it does boot |
 
 `start.sh` prints a `NOTE` at preflight when it sees the failing combination (loader on,
-`MAX_MODEL_LEN` ≥ 850k, `GPU_MEM_UTIL` ≤ 0.85, no `--kv-cache-memory-bytes`). It changes
-nothing; vLLM still makes the real decision.
+`MAX_MODEL_LEN` ≥ 850k, `GPU_MEM_UTIL` ≤ 0.85, no `--kv-cache-memory-bytes`). It is advisory
+only: it changes no value, does not fix an undersized KV pool, and does not prevent the boot
+failure — the operator still has to change the config (add the reservation, or set
+`LOAD_FORMAT=` to have vLLM auto profile the pool), and vLLM still makes the real decision.
+The check is locale-independent: the caller's `LC_NUMERIC` cannot silence it.
+
+TP=3 / TP=4 need the opposite treatment: `start-tp3.sh` / `start-tp4.sh` drop a
+`--kv-cache-memory-bytes` that comes from the shared `.env` (keeping any other flags, and
+reporting the drop), so an existing install whose reservation lives in the shared `.env` loses
+it. Pin a topology-sized value in `.env.tp3` / `.env.tp4` instead — a topology pin is not
+stripped — or pass `EXTRA_ARGS` on the command line; a caller value, including an explicit
+empty, wins over both files. Details in
+[Existing installs](#existing-installs-pull-the-instanttensor-image).
 
 ## Existing installs: pull the InstantTensor image
 
@@ -671,10 +682,14 @@ EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"                          # no o
 EXTRA_ARGS="--your-existing-flags --kv-cache-memory-bytes 15032385536"   # keep what you had
 ```
 
-   TP=3 / TP=4 do not need it and must not rely on it: `start-tp3.sh` and `start-tp4.sh` drop
-   that token from the inherited `EXTRA_ARGS` (keeping any other flags), because 14 GiB does
-   not hold one 1,000,000-token request and those topologies were not measured. Pin a
-   topology-specific value in `.env.tp3` / `.env.tp4` if you want one.
+   TP=3 / TP=4 do not need it and must not rely on it, and the topology templates do not clear
+   it: `start-tp3.sh` / `start-tp4.sh` strip a `--kv-cache-memory-bytes` out of the shared
+   `.env` `EXTRA_ARGS` before the topology overlay, keeping every other flag and reporting the
+   removal — 14 GiB is sized for TP=2 at 850k and neither topology was measured with it.
+   **Existing TP=3 / TP=4 installs: if that flag is in your shared `.env`, the launcher drops
+   the reservation on the next start.** Pin a topology-sized value in `.env.tp3` / `.env.tp4`
+   instead (a topology pin is not stripped), or pass `EXTRA_ARGS` on the command line — a
+   caller value, including an explicit empty, wins over both files.
 
    The cap is required for TP=2 at `MAX_MODEL_LEN=850000` / `GPU_MEM_UTIL=0.85`: the
    InstantTensor loader leaves ~4.4–5.6 GiB less for the KV pool than vLLM auto, and

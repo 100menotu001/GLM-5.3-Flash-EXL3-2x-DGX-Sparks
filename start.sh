@@ -1034,7 +1034,9 @@ preflight_instanttensor_kv_note() {
     [ "$load_format" = "instanttensor" ] || return 0
     [[ "$max_model_len" =~ ^[0-9]+$ ]] && [ "$max_model_len" -ge 850000 ] || return 0
     [[ "$util" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] || return 0
-    awk -v u="$util" 'BEGIN { exit !(u <= 0.85) }' || return 0
+    # Portability hardening (#242): pin C for this comparison so an ambient comma-decimal
+    # LC_NUMERIC cannot move the cut, whatever the installed awk does with `-v` numbers.
+    LC_ALL=C awk -v u="$util" 'BEGIN { exit !(u <= 0.85) }' || return 0
     local _tok
     # shellcheck disable=SC2086
     for _tok in $extra_args; do
