@@ -299,6 +299,87 @@ CONVERGE_FINAL = """            if curr_hit_length >= hit_length:
 """
 
 
+# Independent, versioned edits also migrate an already-composed replay-v2 image.
+# Keep the older anchors above unchanged so both fresh and mounted overlays work.
+FINE_GRAIN_MARK = "# [glm53-participating-fine-hits-v1]"
+CAPABILITY_OLD = """                for manager in self.single_type_managers
+                if not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != hash_block_size"""
+CAPABILITY_NEW = """                for manager, group in zip(  # [glm53-participating-fine-hits-v1]
+                    self.single_type_managers, kv_cache_config.kv_cache_groups
+                )
+                if group.kv_cache_spec.participates_in_prefix_caching
+                and not manager.supports_fine_grained_hash_lookup
+                and manager.block_size != hash_block_size"""
+
+KPOOL_INIT_OLD = """        self.dflash_swa_replay_tokens = _glm53_dflash_swa_replay_tokens(
+            kv_cache_config.kv_cache_groups
+        )
+"""
+KPOOL_INIT_NEW = KPOOL_INIT_OLD + """        # [glm53-kpool-replay-floor-v1] The circular scratch is never a hit.
+        # Even a retained draft window cannot replace the target's fresh pool.
+        self.kpool_replay_tokens = max(
+            (
+                _glm53_inner_kv_spec(group.kv_cache_spec).block_size
+                for group in kv_cache_config.kv_cache_groups
+                if not group.kv_cache_spec.participates_in_prefix_caching
+                and type(_glm53_inner_kv_spec(group.kv_cache_spec)).__name__
+                == "KpoolTailSpec"
+            ),
+            default=0,
+        )
+"""
+KPOOL_HIT_OLD = """        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        hit_length = max_cache_hit_length
+"""
+KPOOL_HIT_NEW = """        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        # [glm53-kpool-replay-floor-v1] Keep the true prompt/logits limit for
+        # EAGLE lookahead and SWA replay accounting; bound only the candidate.
+        hit_length = max(0, min(
+            max_cache_hit_length,
+            max_cache_hit_length + 1 - self.kpool_replay_tokens,
+        ))
+"""
+
+COARSE_RETRY_OLD = """                    self._cache_hit_alignment_tokens,
+                )
+                if replay_safe_hit < curr_hit_length:
+"""
+COARSE_RETRY_NEW = """                    self._cache_hit_alignment_tokens,
+                )
+                # [glm53-partial-replay-fallback-v1] A fine Mamba tail can
+                # outrun the draft's EAGLE lookahead. Before backing up a full
+                # replay window, retry the preceding shared checkpoint: its
+                # retained draft window may already be complete. This keeps
+                # enabling fine hits from discarding an otherwise valid coarse
+                # hit. The normal loop still verifies every group's state.
+                if curr_hit_length % self.scheduler_block_size:
+                    replay_safe_hit = max(
+                        replay_safe_hit,
+                        curr_hit_length // self.scheduler_block_size
+                        * self.scheduler_block_size,
+                    )
+                if replay_safe_hit < curr_hit_length:
+"""
+
+
+def patch_fine_grained_replay(text: str) -> str:
+    pairs = (
+        (CAPABILITY_OLD, CAPABILITY_NEW, "participating capability"),
+        (KPOOL_INIT_OLD, KPOOL_INIT_NEW, "Kpool replay init"),
+        (KPOOL_HIT_OLD, KPOOL_HIT_NEW, "Kpool replay candidate"),
+        (COARSE_RETRY_OLD, COARSE_RETRY_NEW, "partial replay fallback"),
+    )
+    if FINE_GRAIN_MARK in text:
+        for _, new, label in pairs:
+            if text.count(new) != 1:
+                raise SystemExit(f"{P}: {label} drifted")
+        return text
+    for old, new, label in pairs:
+        text = replace_once(text, old, new, label)
+    return text
+
+
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     n = text.count(old)
@@ -338,6 +419,8 @@ def main() -> int:
         text = replace_once(
             text, CONVERGE_OLD, CONVERGE_FINAL, "dflash-replay-clamp"
         )
+    text = patch_fine_grained_replay(text)
+    compile(text, str(P), "exec")
     P.write_text(text)
     print(
         f"patched {P.name} (hybrid APC + versioned DFlash SWA replay clamp)"

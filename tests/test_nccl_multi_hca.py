@@ -135,7 +135,7 @@ def run_preflight(tmp_path, head_count=2, worker_count=2, broken=None):
                 "KVCAP_PATCH_HOST", "TOOLCHOICE_PATCH_HOST", "XGRAMMAR_PATCH_HOST",
                 "CACHE_RESET_PATCH_HOST", "KPOOL_TAIL_PATCH_HOST",
                 "SPINWAIT_PATCH_HOST", "ADAPTIVE_K_PATCH_HOST",
-                "DENSE_FP8_PATCH_HOST", "DEFAULT_TOKENS_PATCH_HOST",
+                "DENSE_FP8_PATCH_HOST", "LOADCLONE_PATCH_HOST", "DEFAULT_TOKENS_PATCH_HOST",
                 "EXL3_OVERLAY_HOST"):
         env[key] = str(placeholder)
     return subprocess.run(

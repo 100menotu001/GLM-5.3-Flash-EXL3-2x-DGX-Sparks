@@ -826,7 +826,112 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+# [glm53-loadclone:v1]
+def _glm53_load_options():
+    import os
+
+    clone = os.environ.get("GLM53_LOAD_CLONE", "1")
+    raw_depth = os.environ.get("GLM53_LOAD_PREFETCH", "0")
+    if clone not in ("0", "1"):
+        raise ValueError("GLM53_LOAD_CLONE must be 0 or 1")
+    if not raw_depth.isascii() or not raw_depth.isdecimal():
+        raise ValueError("GLM53_LOAD_PREFETCH must be an integer in [0, 16]")
+    depth = int(raw_depth)
+    if not 0 <= depth <= 16:
+        raise ValueError("GLM53_LOAD_PREFETCH must be an integer in [0, 16]")
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        page_size = 4096
+    safety = page_size != 4096 and os.environ.get("GLM53_COLD_LOAD_STAGE_MMAP", "1") == "1"
+    return clone == "1", safety, depth
+
+
+class _Glm53ShardPrefetch:
+    """One bounded shard window, owned and joined by the public iterator."""
+
+    def __init__(self, depth):
+        import threading
+
+        self.depth = depth
+        self.stop = threading.Event()
+        self.pool = None
+        self.pending = {}
+
+    def read(self, path):
+        # One reusable 1 MiB buffer per active worker, not per queued shard.
+        # Cancellation is cooperative between reads. A kernel-blocked read cannot
+        # be interrupted by Python: close waits for it rather than leaking threads.
+        if self.stop.is_set():
+            return
+        with open(path, "rb", buffering=0) as stream:
+            buffer = bytearray(1 << 20)
+            while not self.stop.is_set() and stream.readinto(buffer):
+                pass
+
+    def files(self, files, strategy, is_net_fs):
+        if not self.depth or strategy not in (None, "lazy") or is_net_fs or not files:
+            yield from files
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.pool = ThreadPoolExecutor(
+            max_workers=min(self.depth, len(files)), thread_name_prefix="glm53-load-prefetch"
+        )
+        next_index = 0
+        for index, path in enumerate(files):
+            # Includes the current shard: outstanding reads/futures never exceed
+            # depth. Advance only after the consumer finishes the previous shard.
+            while next_index < min(index + self.depth, len(files)):
+                self.pending[next_index] = self.pool.submit(self.read, files[next_index])
+                next_index += 1
+            self.pending.pop(index).result()  # deterministic error and yield order
+            yield path
+
+    def close(self):
+        self.stop.set()
+        for future in self.pending.values():
+            future.cancel()
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+        self.pending.clear()
+
+
 def safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    safetensors_load_strategy: str | None = None,
+    local_expert_ids: set[int] | None = None,
+    *,
+    safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+    safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Stage mmap tensors and optionally prefetch bounded local shards."""
+    clone, safety, depth = _glm53_load_options()
+    prefetcher = _Glm53ShardPrefetch(depth)
+    iterator = _glm53_original_safetensors_weights_iterator(
+        prefetcher, hf_weights_files, use_tqdm_on_load, safetensors_load_strategy,
+        local_expert_ids,
+        safetensors_prefetch_num_threads=safetensors_prefetch_num_threads,
+        safetensors_prefetch_block_size=safetensors_prefetch_block_size,
+    )
+    try:
+        # PR #230 owns staging when its module-level flag is true. Do not clone
+        # again, nor weaken its non-4KiB safety when optional clone is disabled.
+        stage = ((safety or (clone and safetensors_load_strategy in (None, "lazy")))
+                 and safetensors_load_strategy not in ("eager", "torchao")
+                 and not globals().get("_GLM53_UMA_STAGE_MMAP", False))
+        for name, param in iterator:
+            yield name, param.clone() if stage else param
+    finally:
+        try:
+            iterator.close()
+        finally:
+            prefetcher.close()
+
+
+def _glm53_original_safetensors_weights_iterator(
+    _glm53_prefetcher,
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
@@ -913,7 +1018,8 @@ def safetensors_weights_iterator(
 
     leftover_state_dict: dict[str, torch.Tensor] = {}
     for st_file in tqdm(
-        sorted_files,
+        _glm53_prefetcher.files(sorted_files, safetensors_load_strategy, is_net_fs),
+        total=len(sorted_files),
         desc=loading_desc,
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,

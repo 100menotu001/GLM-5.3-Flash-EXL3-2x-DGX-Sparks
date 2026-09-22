@@ -497,9 +497,10 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
 resends the full history each turn; vLLM hashes that prefix. Concurrent chats
 do **not** mix activations. `--max-num-seqs 4` is four **in-flight** generations,
-not four parked sessions. MLA `KpoolTailManager` disables **fine-grained**
-hits — only **block-aligned** tokens count (3584-token hybrid align).
-`KpoolTail` already opts out of the hybrid min (1-block circular scratch).
+not four parked sessions. Historically the nonparticipating `KpoolTailManager`
+incorrectly vetoed fine-grained hits, leaving only the 3584-token hybrid checkpoints.
+The current overlay excludes nonparticipating scratch groups from that capability
+gate, while preserving their replay requirements; see [fine-grained APC](#fine-grained-hybrid-apc-alignment-and-replay).
 
 `dflash` is `use_eagle()`. GLM never sets `is_eagle_group` (that annotator is
 DeepseekV4-only), so stock HybridKVCacheCoordinator flagged **every** group.
@@ -545,13 +546,118 @@ Re-measure (see also `tests/bench_prefix_cache.py`):
 python3 tests/bench_prefix_cache.py --runs 3
 ```
 
-Note the page math: hits are **block-aligned to the 3584-token hybrid MLA
-page**, so a warm prompt only ever reuses `floor(tokens / 3584) × 3584`
-tokens — the 7168 / 10752 / 14336 hit rows above are exactly 2 / 3 / 4 full
-pages. The bench POSTs `/reset_prefix_cache` between colds when that route is
+The historical receipts above used **3584-token hybrid MLA checkpoints**:
+the 7168 / 10752 / 14336 hit rows are 2 / 3 / 4 complete pages. This is not
+an upper bound for the corrected fine-grained path, whose eligibility also depends
+on state checkpoints and replay coverage. The bench POSTs `/reset_prefix_cache` between colds when that route is
 enabled (`GLM53_EXPOSE_CACHE_RESET=1`; opt-in, see the API surface notes
 below) and salts its filler content per invocation on top — repeated runs
 stay genuinely cold even with the reset route off.
+
+### Fine-grained hybrid APC: alignment and replay
+
+The existing scheduler and hybrid-prefix overlays correct alignment, grant-progress
+and capability defects, without a new retention policy or serving default:
+
+- **Checkpoint alignment:** the splitter now uses the resolved scheduler LCM
+  (`self.block_size`, 3584 tokens in the tested hybrid geometry), not the minimum
+  group's `cache_config.block_size` (64 with the draft group). A small scheduling
+  step must not cross a shared state checkpoint without producing that checkpoint.
+  This does not require every step to be 3584 tokens: the splitter clamps its
+  alignment capacity to the actual `num_new_tokens` grant as well as configured,
+  threshold and fair limits. A repeatedly small leftover budget can therefore
+  make sub-block progress rather than repeatedly rounding a positive grant to
+  zero. Grants are never enlarged, and fairness/admission policy is unchanged.
+  Unequal Mamba layouts additionally stop at the next necessary smaller private
+  page boundary, preserving incomplete recurrent state before crossing that page.
+  Shared-LCM checkpoints and the final hash-grain prompt-tail stop remain enforced.
+  More small mixed steps may affect throughput and decode latency; those GPU
+  effects have not been measured.
+- **Capability gate:** only prefix-participating groups may veto partial hits.
+  The demonstrated unwanted veto came from the non-cacheable, four-token
+  `KpoolTailSpec` scratch group, **not** from a compatible SWA64 group. There is
+  no SWA-class exemption: participating SWA128 with hash64 remains incompatible.
+
+`PREFIX_MATCH_UNIT` remains **empty by default**, letting vLLM resolve the hash
+grain. Explicit `PREFIX_MATCH_UNIT=64` is supported for the tested geometry and
+forwarded by TP2/TP3/TP4; 512 remains invalid for this hybrid stack. The fixes can
+activate the already-present fine-grained machinery when its conditions are met,
+even without changing the empty default. A smaller hash grain is not a promise
+that every boundary is stored or reusable.
+
+Replay safety still limits a hit. If a fine target state cannot supply the
+required complete DFlash/EAGLE draft window, lookup first retries the preceding
+shared scheduler checkpoint, rechecking all participating target groups and
+draft-window coverage, before the larger replay backoff. It never treats an
+incomplete or ordinary undropped draft window as reusable. The request-local
+Kpool scratch also requires **four fresh prompt tokens**; a fine hit cannot
+consume that tail, and draft replay may require more fresh tokens.
+
+Existing SWA retention and `GLM53_APC_RETENTION_INTERVAL_SWA` behavior are retained,
+not widened to every hash64 boundary. Some fine target states therefore still
+need a full fresh draft replay window or an older valid coarse hit. CPU fixtures
+exercise these boundaries, actual partial-entry/allocator metadata, and no-store
+composition. They do **not** compute GPU state values or model outputs, and do not
+establish GPU copy-on-write/state/logit parity, TTFT, or distributed serving safety.
+
+#### Reproduce the pinned-source CPU probe
+
+Run from this checkout with Python and Docker available. Choose a **new absolute
+directory outside the repository** for `SNAPSHOT`; keep its source, manifest and
+result JSON outside git. Extract the pristine **Dockerfile base-image digest**,
+not a mutable tag, installed runtime or already-patched serving container.
+The container below is created only for `docker cp` and is never started:
+
+```bash
+(
+    set -eu
+    SNAPSHOT=/absolute/path/outside-the-checkout/apc-snapshot
+    test ! -e "$SNAPSHOT"
+    mkdir -p "$SNAPSHOT/vllm"
+    IMAGE="$(sed -n 's/^ARG BASE=//p' Dockerfile)"
+    case "$IMAGE" in *@sha256:*) ;; *) echo "Dockerfile base must be digest-pinned" >&2; exit 1 ;; esac
+    docker pull "$IMAGE"
+    CID="$(docker create "$IMAGE")"
+    trap 'docker rm "$CID" >/dev/null' EXIT
+    docker cp "$CID:/usr/local/lib/python3.12/dist-packages/vllm/." "$SNAPSHOT/vllm/"
+    docker rm "$CID" >/dev/null
+    trap - EXIT
+
+    python3 - "$SNAPSHOT" "$IMAGE" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+snapshot = Path(sys.argv[1])
+source = snapshot / "vllm"
+files = {
+    path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(source.rglob("*.py"))
+}
+if not files:
+    raise SystemExit("No Python sources extracted")
+(snapshot / "manifest.json").write_text(
+    json.dumps({"image": sys.argv[2], "files": files}, indent=2) + "\n"
+)
+PY
+    python3 tests/probe_apc_pinned_cpu.py \
+        --source-root "$SNAPSHOT/vllm" \
+        --manifest "$SNAPSHOT/manifest.json" \
+        --output "$SNAPSHOT/result.json"
+)
+```
+
+The manifest covers every extracted Python source. The probe checks the image
+against its explicit pin and the Dockerfile, verifies the recorded file hashes,
+and applies the overlay composition to temporary copies. Keep the original
+snapshot and manifest unchanged; do not regenerate hashes to bless edited inputs.
+Only `--source-root`, `--manifest` and `--output` are probe options; acquisition
+and manifest creation above are separate Docker/stdlib steps. Do not use Python
+`-O`, which disables upstream assertions. Exit status is `0` for passed contracts,
+`1` for an observed defect/contract failure, and `2` for a harness error; inspect
+the JSON's checks, observations, defects, errors and limitations, not a check count
+alone. GPU qualification remains outstanding.
 
 ## API surface notes (this build, 2026-08-29)
 
@@ -617,11 +723,60 @@ a separate configuration; the all-zero results do not qualify it. See the
 [protocol, raw measurements, and limitations](docs/apc-retention-qualification.md)
 before selecting a policy or a cache budget for another kit.
 
+## Auto safetensors staging and read-ahead
+
+`LOAD_FORMAT=` selects vLLM auto without changing the launcher's default loader.
+On TP=2, TP=3 and TP=4, the auto/lazy safetensors iterator stages mmap tensors
+into anonymous CPU memory before yielding them (`GLM53_LOAD_CLONE=1`, default).
+Optional local shard read-ahead is off by default (`GLM53_LOAD_PREFETCH=0`).
+To enable a six-shard window, choose **one** command for your existing topology:
+
+```bash
+LOAD_FORMAT= GLM53_LOAD_PREFETCH=6 ./start.sh restart
+LOAD_FORMAT= GLM53_LOAD_PREFETCH=6 ./start-tp3.sh restart
+LOAD_FORMAT= GLM53_LOAD_PREFETCH=6 ./start-tp4.sh restart
+```
+
+Keep your existing context, memory-utilization and topology-specific KV settings;
+these commands do not size or guarantee a KV pool. Exported controls, including
+`LOAD_FORMAT=`, override the shared and topology env files. Clone accepts exactly
+`0` or `1`; prefetch accepts decimal `0..16`, with leading zeros normalized.
+An explicitly empty clone/prefetch value is rejected before restart stops ranks.
+
+The window includes the **current** shard, not that many additional shards.
+Each active reader uses a reusable 1 MiB buffer; staging also needs a transient
+tensor-sized anonymous allocation. Read-ahead populates reclaimable OS page cache:
+the shard bound is **not** a hard bound on total cache residency or host RAM.
+`GLM53_LOAD_PREFETCH=0` disables only this added reader. Recognized NFS, NFS4 and
+Lustre filesystems retain their stock prefetch policy; unknown filesystem types
+are treated as local. Explicit `eager`, `torchao` and `prefetch` strategies retain
+stock loading, apart from the existing non-4KiB mmap safety requirement.
+InstantTensor and the separately selected multithread loader are untouched;
+a draft that falls back to the auto/lazy iterator can use these controls.
+
+`GLM53_LOAD_CLONE=0` disables optional staging, not non-4KiB safety staging.
+The patch composes with PR #230's mmap staging at
+`bc97cbf1d5ab06df778b79b99efa92997bb4f153` without cloning twice or importing
+its separate InstantTensor/UMA budget changes. CPU probes pass both patch orders
+and repeated application. TP3's read-only vendored loader is generated by the same
+overlay; a stale custom `TP3_OVERLAY_HOST` is rejected before restart.
+
+Closing the iterator cancels queued reads and joins its workers. Cancellation is
+checked between reads; Python cannot interrupt a kernel-blocked read. Consumers
+retaining a partially consumed generator must explicitly close it.
+CPU tests verify exact tensor bytes, dtype/shape, auto/lazy yield order, error
+propagation and cleanup. They do **not** establish a GPU boot-speed, KV-capacity
+or model-quality result for this port.
+
+Motivated by [Alexbob0's mmap-load measurements at `bc3891a`](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md); this port uses a bounded, joined read-ahead window.
+
 ## InstantTensor and KV memory
 
-`LOAD_FORMAT=instanttensor` (the default on `:exl3-instanttensor`) loads the 164 GiB
-checkpoint in ~65–70 s cold and under 10 s when the files are still in page cache, versus
-~290–300 s for vLLM auto. The cost is KV pool: on a 2x GB10 kit at 850k / fp8 / rightsize it
+The following #204 measurements **predate the auto-loader staging above**; they
+are not speed or pool-sizing results for the new path. In those measurements,
+`LOAD_FORMAT=instanttensor` (the default on `:exl3-instanttensor`) loaded the 164 GiB
+checkpoint in ~65–70 s cold and under 10 s with files in page cache, versus
+~290–300 s for unstaged vLLM auto. The cost was KV pool: on a 2x GB10 kit at 850k / fp8 / rightsize it
 leaves **~12.4–12.5 GiB** available versus **~17–18 GiB** with the loader off (measured across
 three boots each; #204). One 850k request needs 13.46 GiB, so the stock `GPU_MEM_UTIL=0.85`
 does not boot with the loader on — the engine fails at KV allocation after the weights are
@@ -633,7 +788,7 @@ Three ways to run it, in the order we recommend (the first is the shipped defaul
 | setting | KV pool | boots on 2x GB10 | notes |
 |---|---|---|---|
 | `EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"` (14 GiB), share 0.85 | 883,552 tok, 1.04x | 3/3 | explicit reservation, bypasses profiling; idle host headroom same as loader-off (~5 GiB) |
-| `LOAD_FORMAT=` **and** `EXTRA_ARGS=` (clear the shipped cap), share 0.85 | ~1.07–1.14M tok | 3/3 | ~4x slower cold load; biggest pool. Keep any other `EXTRA_ARGS` you had. |
+| `LOAD_FORMAT=` **and** `EXTRA_ARGS=` (clear the shipped cap), share 0.85 | ~1.07–1.14M tok | 3/3 | Historical unstaged-auto result, not a pool guarantee for the new loader. Keep any other `EXTRA_ARGS` you had. |
 | `GPU_MEM_UTIL=0.88`, no explicit pool | 1,017,763 tok when it boots | 1/4 | 0.88 × 121.69 = 107.09 GiB, right at the worker's CUDA-free at check time (105.8–107.1); `preflight_memory` reads `MemAvailable` and passes anyway; ~2.4 GB less host headroom when it does boot |
 
 `start.sh` prints a `NOTE` at preflight when it sees the failing combination (loader on,
@@ -1090,6 +1245,8 @@ that are now documented/enforced:
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Existing kits must pull this tag — `git pull` does not replace a leftover `:exl3` or `SKIP_PULL=1` ([Existing installs](#existing-installs-pull-the-instanttensor-image)). Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3` |
 | `LOAD_FORMAT` | `instanttensor` when `IMAGE` contains `instanttensor`; else empty | `--load-format`. Direct-I/O safetensors. Explicit empty (`LOAD_FORMAT=`) restores vLLM auto. Required empty on the wheel-less `:exl3` tag |
+| `GLM53_LOAD_CLONE` | `1` | auto/lazy safetensors mmap staging on TP2/TP3/TP4; exact `0`/`1`. `0` disables optional staging, not non-4KiB safety. [Loader scope and limits](#auto-safetensors-staging-and-read-ahead) |
+| `GLM53_LOAD_PREFETCH` | `0` | optional auto/lazy local-shard read-ahead on all three topologies; decimal `0..16`, including current shard. Empty is invalid; `0` preserves stock prefetch policy without adding readers |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
@@ -1124,6 +1281,7 @@ that are now documented/enforced:
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` when unset | TP=2 `start.sh` passes the effective value to both ranks. An explicit empty value disables this option; caller exports, including empty, override `.env`. Changing allocator settings requires a restart and separate memory/connector qualification; TP=4 is unchanged |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
+| `PREFIX_MATCH_UNIT` | *(empty)* | let vLLM resolve the prefix hash grain. Explicit `64` is supported for the tested hybrid geometry on TP2/TP3/TP4; it does not force fine hits without valid target state and draft/scratch replay. `512` is invalid here. See [alignment and replay](#fine-grained-hybrid-apc-alignment-and-replay) |
 | `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | DFlash2 drafter retention on TP=2/3/4. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
 | `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
@@ -1197,9 +1355,9 @@ request then:
 Server-log receipts (each once per process): `[glm53-apc-no-store] first request resolved
 skip_writing_prefix_cache=1` (the flag reached the engine) and `[glm53-apc-no-store] suppressing
 prefix-cache store (full site)` / `(partial site)` (a store was actually cut; the partial site needs the
-runtime's fine-grained partial-tail producer, which the coordinator vetoes for this model's
-`KpoolTailManager` — see [Prefix caching](#prefix-caching-this-kit-2026-08-30) — so on this kit it is
-normally the full site that fires). If the first line never appears, the flag did not reach the
+runtime's fine-grained partial-tail producer, which can now be enabled when
+participating-group capabilities and replay requirements permit it — see
+[alignment and replay](#fine-grained-hybrid-apc-alignment-and-replay)). If the first line never appears, the flag did not reach the
 engine — do not trust an A/B measured without it. Not covered:
 KV connectors / CPU offload (none on this kit), pooling requests. Kill switch: `GLM53_APC_NO_STORE=0`.
 Design + receipts protocol: `docs/DESIGN-apc-no-store.md`.

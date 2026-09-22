@@ -472,6 +472,9 @@ COPY tests/test_spinwait_patch.py /opt/glm53/test_spinwait_patch.py
 COPY overlay/patch_indexer_workspace.py /opt/glm53/patch_indexer_workspace.py
 COPY tests/test_indexer_workspace.py /opt/glm53/test_indexer_workspace.py
 COPY overlay/patch_tool_choice_none.py /opt/glm53/patch_tool_choice_none.py
+COPY overlay/patch_loadclone.py /opt/glm53/patch_loadclone.py
+COPY tests/test_loadclone.py /opt/glm53/test_loadclone.py
+COPY tests/fixtures/loadclone_weight_utils.py.txt /opt/glm53/fixtures/loadclone_weight_utils.py.txt
 COPY tests/test_tool_choice_none.py /opt/glm53/test_tool_choice_none.py
 COPY overlay/ablit_runtime.py /opt/glm53/ablit_runtime.py
 COPY overlay/patch_ablit.py /opt/glm53/patch_ablit.py
@@ -513,6 +516,10 @@ RUN python3 /opt/glm53/patch_indexer_workspace.py
 RUN python3 /opt/glm53/patch_spinwait.py --preflight
 RUN python3 /opt/glm53/patch_cache_reset.py
 RUN python3 /opt/glm53/patch_tool_choice_none.py
+# Auto/lazy safetensors only; InstantTensor and LOAD_FORMAT defaults stay unchanged.
+RUN GLM53_LOADCLONE_SOURCE=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py \
+    python3 /opt/glm53/test_loadclone.py
+RUN python3 /opt/glm53/patch_loadclone.py
 RUN python3 /opt/glm53/patch_ablit.py
 
 RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \

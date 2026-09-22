@@ -83,6 +83,12 @@ _cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
 _cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
+_cli_load_clone_set="${GLM53_LOAD_CLONE+1}"
+_cli_load_clone="${GLM53_LOAD_CLONE-}"
+_cli_load_prefetch_set="${GLM53_LOAD_PREFETCH+1}"
+_cli_load_prefetch="${GLM53_LOAD_PREFETCH-}"
+_cli_load_format_set="${LOAD_FORMAT+1}"
+_cli_load_format="${LOAD_FORMAT-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
 _cli_sparse_slice_set="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS+1}"
 _cli_sparse_slice="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS-}"
@@ -146,6 +152,9 @@ set +a
 [ -n "${_cli_ablit_mtp}" ] && ABLIT_INCLUDE_MTP="$_cli_ablit_mtp"
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
+[ -n "${_cli_load_clone_set}" ] && GLM53_LOAD_CLONE="$_cli_load_clone"
+[ -n "${_cli_load_prefetch_set}" ] && GLM53_LOAD_PREFETCH="$_cli_load_prefetch"
+[ -n "${_cli_load_format_set}" ] && LOAD_FORMAT="$_cli_load_format"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
 [ -n "${_cli_sparse_slice_set}" ] && VLLM_SM120_SPARSE_MLA_SLICE_TOKENS="$_cli_sparse_slice"
 [ -n "${_cli_extra_args_set}" ] && EXTRA_ARGS="$_cli_extra_args"
@@ -261,6 +270,7 @@ PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_gr
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
+LOADCLONE_PATCH_HOST="${LOADCLONE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_loadclone.py}"
 SPARSE_SLICE_PATCH_HOST="${SPARSE_SLICE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_sparse_mla_slice.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
@@ -274,6 +284,8 @@ if [ -z "${LOAD_FORMAT+x}" ]; then
     esac
 fi
 PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
+GLM53_LOAD_CLONE="${GLM53_LOAD_CLONE-1}"
+GLM53_LOAD_PREFETCH="${GLM53_LOAD_PREFETCH-0}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
@@ -534,6 +546,14 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
+    _glm53_validate_enum GLM53_LOAD_CLONE "${GLM53_LOAD_CLONE-1}" 0 1 || return
+    local load_prefetch="${GLM53_LOAD_PREFETCH-0}"
+    if ! [[ "$load_prefetch" =~ ^0*([0-9]|1[0-6])$ ]]; then
+        echo "GLM53_LOAD_PREFETCH must be a base-10 integer between 0 and 16" >&2
+        return 2
+    fi
+    while [ "${load_prefetch#0}" != "$load_prefetch" ]; do load_prefetch="${load_prefetch#0}"; done
+    GLM53_LOAD_PREFETCH="${load_prefetch:-0}"
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-stock}" \
         stock rightsize || return
     _glm53_validate_spinwait_ms || return
@@ -547,6 +567,21 @@ validate_numeric_config() {
     fi
 }
 # GLM53 numeric config guard (end)
+
+validate_loadclone_artifacts() {
+    [ -s "$LOADCLONE_PATCH_HOST" ] || { echo "loader patch missing: $LOADCLONE_PATCH_HOST" >&2; return 2; }
+    command -v python3 >/dev/null 2>&1 || { echo "python3 is required for loader artifact validation" >&2; return 2; }
+    python3 - "$LOADCLONE_PATCH_HOST" <<'PY' || return 2
+import ast
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+source = path.read_text()
+if "[glm53-loadclone:v1]" not in source or source.rstrip().splitlines()[-1] != "    main()":
+    raise SystemExit("loader overlay identity/footer missing")
+ast.parse(source, filename=str(path))
+PY
+}
 
 banner() {
     local label="${1:-start-tp4.sh}"
@@ -791,6 +826,7 @@ preflight() {
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
+    [ -f "$LOADCLONE_PATCH_HOST" ] || die "$LOADCLONE_PATCH_HOST missing"
     [ -f "$SPARSE_SLICE_PATCH_HOST" ] || die "$SPARSE_SLICE_PATCH_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
@@ -1336,6 +1372,9 @@ fi
 if [ -f /opt/glm53/patch_spinwait.py ]; then
     python3 /opt/glm53/patch_spinwait.py
 fi
+if [ -f /opt/glm53/patch_loadclone.py ]; then
+    python3 /opt/glm53/patch_loadclone.py
+fi
 if [ -f /opt/glm53/patch_sparse_mla_slice.py ]; then
     python3 /opt/glm53/patch_sparse_mla_slice.py
 fi
@@ -1440,6 +1479,9 @@ fi
 if [ -f /opt/glm53/patch_spinwait.py ]; then
     python3 /opt/glm53/patch_spinwait.py
 fi
+if [ -f /opt/glm53/patch_loadclone.py ]; then
+    python3 /opt/glm53/patch_loadclone.py
+fi
 if [ -f /opt/glm53/patch_sparse_mla_slice.py ]; then
     python3 /opt/glm53/patch_sparse_mla_slice.py
 fi
@@ -1476,6 +1518,7 @@ _tp4_scp_runtime() {
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${ssh_t}:/tmp/patch_xgrammar_termination.py"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${ssh_t}:/tmp/patch_kpool_tail_slotmap.py"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${ssh_t}:/tmp/patch_spinwait.py"
+    scp -q -o BatchMode=yes "$LOADCLONE_PATCH_HOST" "${ssh_t}:/tmp/patch_loadclone.py"
     scp -q -o BatchMode=yes "$SPARSE_SLICE_PATCH_HOST" "${ssh_t}:/tmp/patch_sparse_mla_slice.py"
     worker_ssh_n "$r" "rm -rf /tmp/glm53-ablit"
     scp -q -r -o BatchMode=yes "$SCRIPT_DIR/ablit" "${ssh_t}:/tmp/glm53-ablit"
@@ -1517,6 +1560,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "missing $SPINWAIT_PATCH_HOST"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_spinwait.py"
+    [ -f "$LOADCLONE_PATCH_HOST" ] || die "missing $LOADCLONE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$LOADCLONE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_loadclone.py"
     [ -f "$SPARSE_SLICE_PATCH_HOST" ] || die "missing $SPARSE_SLICE_PATCH_HOST"
     scp -q -o BatchMode=yes "$SPARSE_SLICE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_sparse_mla_slice.py"
 
@@ -1602,6 +1647,7 @@ TP4_SKIP_OLD_SCP
     for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
              KV_CACHE_DTYPE LOAD_FORMAT PREFIX_MATCH_UNIT MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
+             GLM53_LOAD_CLONE GLM53_LOAD_PREFETCH \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
@@ -1649,6 +1695,7 @@ TP4_SKIP_OLD_SCP
             -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
             -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
             -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
+            -v '/tmp/patch_loadclone.py:/opt/glm53/patch_loadclone.py:ro' \
             -v '/tmp/patch_sparse_mla_slice.py:/opt/glm53/patch_sparse_mla_slice.py:ro' \
             -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
             -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
@@ -1685,6 +1732,7 @@ TP4_SKIP_OLD_SCP
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
+        -v "$LOADCLONE_PATCH_HOST:/opt/glm53/patch_loadclone.py:ro" \
         -v "$SPARSE_SLICE_PATCH_HOST:/opt/glm53/patch_sparse_mla_slice.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
@@ -1705,6 +1753,8 @@ TP4_SKIP_OLD_SCP
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
         -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" \
         -e LOAD_FORMAT="${LOAD_FORMAT:-}" \
+        -e GLM53_LOAD_CLONE="$GLM53_LOAD_CLONE" \
+        -e GLM53_LOAD_PREFETCH="$GLM53_LOAD_PREFETCH" \
         -e PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}" \
         -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
@@ -1951,7 +2001,7 @@ logs() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) validate_numeric_config ;;
+        start|restart) validate_numeric_config; validate_loadclone_artifacts ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;

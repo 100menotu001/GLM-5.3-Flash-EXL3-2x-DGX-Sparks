@@ -284,13 +284,18 @@ def part_f() -> None:
 class Harness:
     """A throwaway copy of the launcher checkout plus a stub PATH."""
 
-    def __init__(self, tmp: Path) -> None:
+    def __init__(self, tmp: Path, launcher: str = "start.sh") -> None:
         self.tmp = tmp
         self.repo = tmp / "repo"
         self.repo.mkdir()
-        shutil.copy2(START, self.repo / "start.sh")
+        shutil.copy2(ROOT / launcher, self.repo / "start.sh")
         shutil.copy2(ROOT / ".env.example", self.repo / ".env.example")
         (self.repo / ".env").write_text((ROOT / ".env.example").read_text())
+        if launcher != "start.sh":
+            topology = launcher.removeprefix("start-").removesuffix(".sh")
+            template = ROOT / f".env.{topology}.example"
+            shutil.copy2(template, self.repo / template.name)
+            shutil.copy2(template, self.repo / f".env.{topology}")
         for sub in ("overlay", "files", "ablit"):
             if (ROOT / sub).is_dir():
                 shutil.copytree(ROOT / sub, self.repo / sub)
@@ -850,6 +855,78 @@ def part_e(h: Harness) -> None:
         CHAT_TEMPLATE_HOST=str(loop_template),
     )
 
+def loader_all_rank_wiring() -> None:
+    """Exercise real launch functions against the existing recording PATH."""
+    weight_dest = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py"
+    patch_dest = "/opt/glm53/patch_loadclone.py"
+    for launcher, count in (("start.sh", 2), ("start-tp3.sh", 3), ("start-tp4.sh", 4)):
+        with tempfile.TemporaryDirectory() as raw:
+            h = Harness(Path(raw), launcher=launcher)
+            fn = h.repo / "start.fn.sh"
+            fn.write_text(fn.read_text().rsplit('"$@"', 1)[0] + '''
+launch_loader() {
+    validate_numeric_config || return
+    launch_cluster
+}
+"$@"
+''')
+            result = h.run("launch_loader", entry="start.fn.sh",
+                           MODEL_DIR="/root/.cache/huggingface/x",
+                           LOAD_FORMAT="", GLM53_LOAD_CLONE="0", GLM53_LOAD_PREFETCH="0006")
+            assert result.returncode == 0, (launcher, result.stderr)
+            runs = []
+            copies = {}
+            for call in h.calls():
+                if call[:2] == ["docker", "run"]:
+                    runs.append((None, call[2:]))
+                elif call[0] == "ssh" and call[-1].lstrip().startswith("docker run"):
+                    runs.append((call[-2], shlex.split(call[-1])[2:]))
+                elif call[0] == "scp" and ":" in call[-1]:
+                    host, dest = call[-1].split(":", 1)
+                    copies[(host, dest)] = call[-2]
+            assert len(runs) == count, (launcher, runs)
+            for host, argv in runs:
+                rank = Rank(argv)
+                assert rank.env["GLM53_LOAD_CLONE"] == "0"
+                assert rank.env["GLM53_LOAD_PREFETCH"] == "6"
+                assert rank.env["LOAD_FORMAT"] == ""
+                if launcher == "start-tp3.sh":
+                    mounts = dict(argv[i + 1].split(":")[:2][::-1]
+                                  for i, arg in enumerate(argv[:-1]) if arg == "-v")
+                    expected_root = str(h.repo / "overlay/tp3")
+                    if host is None:
+                        assert mounts[weight_dest] == expected_root + "/vllm/model_executor/model_loader/weight_utils.py"
+                    else:
+                        assert mounts[weight_dest] == "/tmp/glm53-tp3/vllm/model_executor/model_loader/weight_utils.py"
+                        assert copies[(host, "/tmp/glm53-tp3")] == expected_root
+                else:
+                    expected_patch = str(h.repo / "overlay/patch_loadclone.py")
+                    if host is None:
+                        assert rank.mounts[patch_dest] == expected_patch
+                    else:
+                        assert copies[(host, rank.mounts[patch_dest])] == expected_patch
+
+
+def loader_artifacts_fail_before_restart_stop() -> None:
+    for launcher in ("start.sh", "start-tp3.sh", "start-tp4.sh"):
+        with tempfile.TemporaryDirectory() as raw:
+            h = Harness(Path(raw), launcher=launcher)
+            # Positive control: the loader gate itself accepts the shipped tree.
+            gate = "validate_overlay_artifacts" if launcher == "start.sh" else "validate_loadclone_artifacts"
+            result = h.run(gate, entry="start.fn.sh")
+            assert result.returncode == 0, (launcher, result.stderr)
+            assert not h.host_touching_calls()
+            result = h.run("restart", LOADCLONE_PATCH_HOST=str(h.tmp / "missing.py"))
+            assert result.returncode == 2, (launcher, result.stderr)
+            assert not h.host_touching_calls()
+            if launcher == "start-tp3.sh":
+                target = h.repo / "overlay/tp3/vllm/model_executor/model_loader/weight_utils.py"
+                target.write_text(target.read_text().replace("def _glm53_load_options():", "def broken_options():"))
+                result = h.run("restart")
+                assert result.returncode == 2, result.stderr
+                assert not h.host_touching_calls()
+
+
 # ------------------------------------------------------------------- main --
 
 
@@ -868,6 +945,8 @@ def main() -> int:
         allocator_overrides(h)
     with tempfile.TemporaryDirectory() as raw:
         part_e(Harness(Path(raw)))
+    loader_all_rank_wiring()
+    loader_artifacts_fail_before_restart_stop()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + "; ".join(FAILURES))
