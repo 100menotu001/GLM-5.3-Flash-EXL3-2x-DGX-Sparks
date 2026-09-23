@@ -11,6 +11,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
+  (262k context, two sequences, 1,024-token prefill batches) with each
+  default-off option it enables, its measured benefit, and its cost. Not
+  sourced automatically; defaults are unchanged.
 - Experimental compact DFlash2 KV pages (`GLM53_DRAFT_KV_COMPACT`, default
   `0`): derive a page-fitting divisor of the MLA block to reduce draft
   block-ID demand without changing precision or backing allocations.

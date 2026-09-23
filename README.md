@@ -24,6 +24,11 @@ FlashKDA and combined-profile measurements](docs/tp3-throughput-results.md).
 Historical measurements and pending validation of the upstream-based branch
 are documented separately; existing defaults are unchanged.
 
+Reference TP=2 profile for long coding sessions (262k context, two active
+requests, selected default-off options with their tradeoffs):
+[`examples/tp2-long-coding.env`](examples/tp2-long-coding.env). Append it to a
+configured `.env`; defaults are unchanged.
+
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
 The Hub card on brandonmusic (TP2/EP2/DCP2 + calibrated NVFP4 MLA KV) is the SM120 B12X
 image (`verdictai/glm53-flash-exl3-k4:…-v84-dflash2`), not this overlay. Target KV
