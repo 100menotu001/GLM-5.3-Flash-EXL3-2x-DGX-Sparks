@@ -958,6 +958,12 @@ EXTRA_ARGS="--your-existing-flags --kv-cache-memory-bytes 15032385536"   # keep 
 SKIP_BUILD=1 ./start.sh restart
 ```
 
+A plain `./start.sh` / `start-tp3.sh` / `start-tp4.sh` restart still pulls, but it
+holds a local image whose recipe stamp already matches this repo. The pull is
+adopted only when the published stamp matches too. A different published stamp
+is discarded and the local tag is restored, with no rebuild. `SKIP_BUILD=1`
+still replaces the local tag with GHCR on purpose.
+
 If `.env` has `SKIP_PULL=1`, override it for this restart:
 
 ```bash
