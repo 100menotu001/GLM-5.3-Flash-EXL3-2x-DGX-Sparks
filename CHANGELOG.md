@@ -50,7 +50,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   recorded two preemptions in that group; the repeat was not completed.
   A separate fixed-14-GiB comparison hit preemption, memory-floor
   and OFF sequence-reference stops; failed runs are retained. Default remains
-  off. TP3/TP4 GPU and tensor-level numerical parity remain unqualified.
+  off. TP=4 GPU execution and tensor-level numerical parity remain
+  unqualified. A 2026-09-23 TP=3 boot on this kit, with the flag set on all
+  three ranks, selected the derived 640-token padded page (MLA block 2560,
+  not the TP=2 896) and logged boundary lookup on drafter group 6. That is
+  geometry confirmation, not the TP=2 reservation or repeat-TTFT result.
+  `.env.tp3.example` documents the opt-in and leaves it commented.
   See README for both profiles, receipt hash, baseline drift and limitations.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
