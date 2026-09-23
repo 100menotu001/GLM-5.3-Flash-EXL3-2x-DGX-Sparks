@@ -152,7 +152,7 @@ query lengths (`k + 1`, bounded by `DFLASH_TOKENS + 1`), including the full draf
 length, through `MAX_NUM_SEQS`. Explicit `--cudagraph-capture-sizes` in `EXTRA_ARGS`
 always wins; eager mode and non-DFlash capture defaults are unchanged.
 
-then `./start.sh restart`. The capture-size list is required for adaptive-k (multiples of 3, 5 and 8 up to 4 requests; the stock `1 2 4 8 16 24 32` misses the 3- and 5-token shapes). The KV cap turns FP8's freed GPU memory into host headroom instead of a bigger pool: uncapped, the head dropped to ~1.5 GiB MemAvailable at 850k. 14 GiB leaves an 883,552-token pool (1.04x of 850k) and ~5 GiB free; 15 GiB buys 1.11x but measured only 0.8-2.2 GiB free under load, which is not enough margin on this UMA. Do not go much lower at 850k either — the boot refuses a pool that cannot hold one max-length request (13 GiB is ~820k tokens). Verify after boot: `docker logs glm53-exl3-head | grep -a "adaptive-k\|dense fp8"` should show `uniform decode graph query lens: [3, 5, 8]` and `dense fp8 groups: dense,kda`, and with `ABLIT=1` the line `ABLIT_METHOD=auto -> transplant` (a missing `ablit/transplant/` silently falls back to the projection edit, which garbles sampled output). A running server can be retuned without a reboot through `~/.cache/vllm-glm53-flash/glm53_adaptive_k.json` (`{"mode":"ema","set":"2,4,7","margin":1.0}`; `{"mode":"off"}` restores k=7). Live sparkDash prose numbers with both on are in the table above.
+then `./start.sh restart`. The capture-size list is required for adaptive-k (multiples of 3, 5 and 8 up to 4 requests; the stock `1 2 4 8 16 24 32` misses the 3- and 5-token shapes). The KV cap turns FP8's freed GPU memory into host headroom instead of a bigger pool: uncapped, the head dropped to ~1.5 GiB MemAvailable at 850k. 14 GiB leaves an 876,958-token pool (1.03x of 850k) and ~5 GiB free; 15 GiB buys 1.11x but measured only 0.8-2.2 GiB free under load, which is not enough margin on this UMA. Do not go much lower at 850k either — the boot refuses a pool that cannot hold one max-length request (13 GiB is ~820k tokens). Verify after boot: `docker logs glm53-exl3-head | grep -a "adaptive-k\|dense fp8"` should show `uniform decode graph query lens: [3, 5, 8]` and `dense fp8 groups: dense,kda`, and with `ABLIT=1` the line `ABLIT_METHOD=auto -> transplant` (a missing `ablit/transplant/` silently falls back to the projection edit, which garbles sampled output). A running server can be retuned without a reboot through `~/.cache/vllm-glm53-flash/glm53_adaptive_k.json` (`{"mode":"ema","set":"2,4,7","margin":1.0}`; `{"mode":"off"}` restores k=7). Live sparkDash prose numbers with both on are in the table above.
 
 Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, 2026-08-30 C4, `DFLASH_DRAFT_TP=2`): Structured **65.1** tok/s (0.959 accept / 6.71 per step); Prose (hash-map) **27.1** (0.341 / 2.39). Prior TP=1 lab: 61.7 / 26.9. Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
 
@@ -869,7 +869,7 @@ before selecting a policy or a cache budget for another kit.
 checkpoint in ~65–70 s cold and under 10 s when the files are still in page cache, versus
 ~290–300 s for vLLM auto. The cost is KV pool: on a 2x GB10 kit at 850k / fp8 / rightsize it
 leaves **~12.4–12.5 GiB** available versus **~17–18 GiB** with the loader off (measured across
-three boots each; #204). One 850k request needs 13.46 GiB, so the stock `GPU_MEM_UTIL=0.85`
+three boots each; #204). One 850k request needs 13.56 GiB, so the stock `GPU_MEM_UTIL=0.85`
 does not boot with the loader on — the engine fails at KV allocation after the weights are
 already loaded. `Model loading took 79.65 GiB` is identical either way; the difference shows
 up only in `Available KV cache memory`.
@@ -939,7 +939,7 @@ EXTRA_ARGS="--your-existing-flags --kv-cache-memory-bytes 15032385536"   # keep 
 
    The cap is required for TP=2 at `MAX_MODEL_LEN=850000` / `GPU_MEM_UTIL=0.85`: the
    InstantTensor loader leaves ~4.4–5.6 GiB less for the KV pool than vLLM auto, and
-   without an explicit pool size the engine refuses to boot (needs 13.46 GiB, ~12.4 GiB
+   without an explicit pool size the engine refuses to boot (needs 13.56 GiB, ~12.4 GiB
    available). Raising `GPU_MEM_UTIL` to 0.88 instead is marginal on 2x GB10 — it booted
    1 of 4 attempts here, failing vLLM's startup free-memory check on the worker even though
    `start.sh`'s preflight passed. Details in [InstantTensor and KV memory](#instanttensor-and-kv-memory).

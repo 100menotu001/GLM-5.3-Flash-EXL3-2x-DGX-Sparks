@@ -1039,7 +1039,7 @@ preflight_memory() {
 }
 # GLM53 InstantTensor KV-fit note (begin)
 # The direct-I/O loader leaves ~4.4-5.6 GiB less for the KV pool than vLLM auto on a 2x GB10
-# kit (measured 12.4-12.5 GiB available vs 13.46 GiB needed for one 850k request; #204). At the
+# kit (measured 12.4-12.5 GiB available vs 13.56 GiB needed for one 850k request; #204). At the
 # stock share with no explicit pool size the engine refuses to boot, ~5-9 minutes in. Say so up
 # front. Diagnostic only: nothing here changes a value, and vLLM still makes the real decision.
 preflight_instanttensor_kv_note() {
@@ -1055,7 +1055,7 @@ preflight_instanttensor_kv_note() {
     for _tok in $extra_args; do
         case "$_tok" in --kv-cache-memory-bytes|--kv-cache-memory-bytes=*) return 0 ;; esac
     done
-    warn "NOTE: LOAD_FORMAT=instanttensor at MAX_MODEL_LEN=${max_model_len} with GPU_MEM_UTIL=${util} has been measured NOT to boot on 2x GB10 (KV needs 13.46 GiB, ~12.4 available); add --kv-cache-memory-bytes 15032385536 to EXTRA_ARGS, keeping any flags already there (see .env.example), or set LOAD_FORMAT= (slower load). #204"
+    warn "NOTE: LOAD_FORMAT=instanttensor at MAX_MODEL_LEN=${max_model_len} with GPU_MEM_UTIL=${util} has been measured NOT to boot on 2x GB10 (KV needs 13.56 GiB, ~12.4 available); add --kv-cache-memory-bytes 15032385536 to EXTRA_ARGS, keeping any flags already there (see .env.example), or set LOAD_FORMAT= (slower load). #204"
 }
 # GLM53 InstantTensor KV-fit note (end)
 # GLM53 preflight memory guard (end)
