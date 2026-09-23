@@ -249,6 +249,8 @@ TOOLCHOICE_PATCH_HOST="${TOOLCHOICE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_tool_c
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cache_reset.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
+MAMBA_STATE_PATCH_HOST="${MAMBA_STATE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_state_free.py}"
+MAMBA_CHUNK_PATCH_HOST="${MAMBA_CHUNK_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_chunking.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
@@ -437,6 +439,8 @@ GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"
 # explicitly empty value is an operator error and validate_numeric_config
 # rejects it rather than guessing a serving mode.
 GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-rightsize}"
+# Opt-in larger draft KV pages; no weight or cache precision changes.
+GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
@@ -673,6 +677,13 @@ validate_numeric_config() {
     fi
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-rightsize}" \
         stock rightsize || return
+    _glm53_validate_bool_flag GLM53_DRAFT_KV_COMPACT "${GLM53_DRAFT_KV_COMPACT-0}" || return
+    if [ "${GLM53_DRAFT_KV_COMPACT-0}" = "1" ] && [ "$SPEC_METHOD" != "dflash" ]; then
+        # Compact draft pages switch the prefix-cache coordinator to a
+        # DFlash-only boundary lookup; the allocator also refuses them in-container.
+        echo "GLM53_DRAFT_KV_COMPACT=1 requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
+        return 2
+    fi
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
     _glm53_validate_spinwait_ms || return
@@ -748,6 +759,8 @@ validate_overlay_artifacts() {
         "$TOOLCHOICE_PATCH_HOST|[glm53-tool-choice-none]|$main_guard"
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
+        "$MAMBA_STATE_PATCH_HOST|[glm53-mamba-align-state-free-v1]|$main_guard"
+        "$MAMBA_CHUNK_PATCH_HOST|[glm53-mamba-align-chunking-v1]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
@@ -1026,7 +1039,7 @@ preflight_memory() {
 }
 # GLM53 InstantTensor KV-fit note (begin)
 # The direct-I/O loader leaves ~4.4-5.6 GiB less for the KV pool than vLLM auto on a 2x GB10
-# kit (measured 12.4-12.5 GiB available vs 13.46 GiB needed for one 850k request; #204). At the
+# kit (measured 12.4-12.5 GiB available vs 13.56 GiB needed for one 850k request; #204). At the
 # stock share with no explicit pool size the engine refuses to boot, ~5-9 minutes in. Say so up
 # front. Diagnostic only: nothing here changes a value, and vLLM still makes the real decision.
 preflight_instanttensor_kv_note() {
@@ -1042,7 +1055,7 @@ preflight_instanttensor_kv_note() {
     for _tok in $extra_args; do
         case "$_tok" in --kv-cache-memory-bytes|--kv-cache-memory-bytes=*) return 0 ;; esac
     done
-    warn "NOTE: LOAD_FORMAT=instanttensor at MAX_MODEL_LEN=${max_model_len} with GPU_MEM_UTIL=${util} has been measured NOT to boot on 2x GB10 (KV needs 13.46 GiB, ~12.4 available); add --kv-cache-memory-bytes 15032385536 to EXTRA_ARGS, keeping any flags already there (see .env.example), or set LOAD_FORMAT= (slower load). #204"
+    warn "NOTE: LOAD_FORMAT=instanttensor at MAX_MODEL_LEN=${max_model_len} with GPU_MEM_UTIL=${util} has been measured NOT to boot on 2x GB10 (KV needs 13.56 GiB, ~12.4 available); add --kv-cache-memory-bytes 15032385536 to EXTRA_ARGS, keeping any flags already there (see .env.example), or set LOAD_FORMAT= (slower load). #204"
 }
 # GLM53 InstantTensor KV-fit note (end)
 # GLM53 preflight memory guard (end)
@@ -1140,6 +1153,8 @@ preflight() {
     [ -f "$XGRAMMAR_PATCH_HOST" ] || die "$XGRAMMAR_PATCH_HOST missing"
     [ -f "$CACHE_RESET_PATCH_HOST" ] || die "$CACHE_RESET_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
+    [ -f "$MAMBA_STATE_PATCH_HOST" ] || die "$MAMBA_STATE_PATCH_HOST missing"
+    [ -f "$MAMBA_CHUNK_PATCH_HOST" ] || die "$MAMBA_CHUNK_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
@@ -1633,10 +1648,12 @@ GLM53_OVERLAY_ORDER=(
     patch_glm_video_placeholders.py
     patch_suppress_stops_in_reasoning.py
     patch_scheduler_decode_floor.py
+    patch_mamba_align_chunking.py
     patch_glm5_drafter_group.py
     patch_hybrid_prefix_hit.py
     patch_apc_per_group_retention.py
     patch_apc_no_store.py
+    patch_mamba_align_state_free.py
     patch_kv_capacity_log.py
     patch_tool_choice_none.py
     patch_xgrammar_termination.py
@@ -1892,6 +1909,10 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$CACHE_RESET_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_cache_reset.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
+    [ -f "$MAMBA_STATE_PATCH_HOST" ] || die "missing $MAMBA_STATE_PATCH_HOST"
+    scp -q -o BatchMode=yes "$MAMBA_STATE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_mamba_align_state_free.py"
+    [ -f "$MAMBA_CHUNK_PATCH_HOST" ] || die "missing $MAMBA_CHUNK_PATCH_HOST"
+    scp -q -o BatchMode=yes "$MAMBA_CHUNK_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_mamba_align_chunking.py"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "missing $SPINWAIT_PATCH_HOST"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_spinwait.py"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "missing $ADAPTIVE_K_PATCH_HOST"
@@ -1936,6 +1957,7 @@ launch_cluster() {
         -e "GLM53_EXPOSE_CACHE_RESET=$GLM53_EXPOSE_CACHE_RESET"
         -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
+        -e "GLM53_DRAFT_KV_COMPACT=$GLM53_DRAFT_KV_COMPACT"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
@@ -2091,6 +2113,8 @@ launch_cluster() {
         -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
         -v '/tmp/patch_cache_reset.py:/opt/glm53/patch_cache_reset.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
+        -v '/tmp/patch_mamba_align_state_free.py:/opt/glm53/patch_mamba_align_state_free.py:ro' \
+        -v '/tmp/patch_mamba_align_chunking.py:/opt/glm53/patch_mamba_align_chunking.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
@@ -2132,6 +2156,8 @@ launch_cluster() {
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$CACHE_RESET_PATCH_HOST:/opt/glm53/patch_cache_reset.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
+        -v "$MAMBA_STATE_PATCH_HOST:/opt/glm53/patch_mamba_align_state_free.py:ro" \
+        -v "$MAMBA_CHUNK_PATCH_HOST:/opt/glm53/patch_mamba_align_chunking.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \

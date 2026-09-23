@@ -81,6 +81,8 @@ _cli_ablit_mtp="${ABLIT_INCLUDE_MTP-}"
 # must reach validate_numeric_config, not be swallowed by a .env value.
 _cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
 _cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
+_cli_draft_kv_compact_set="${GLM53_DRAFT_KV_COMPACT+1}"
+_cli_draft_kv_compact="${GLM53_DRAFT_KV_COMPACT-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
 _cli_apc_swa_set="${GLM53_APC_RETENTION_INTERVAL_SWA+1}"
@@ -145,6 +147,7 @@ set +a
 [ -n "${_cli_ablit_alpha}" ] && ABLIT_ALPHA="$_cli_ablit_alpha"
 [ -n "${_cli_ablit_mtp}" ] && ABLIT_INCLUDE_MTP="$_cli_ablit_mtp"
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
+[ -n "${_cli_draft_kv_compact_set}" ] && GLM53_DRAFT_KV_COMPACT="$_cli_draft_kv_compact"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_apc_swa_set}" ] && GLM53_APC_RETENTION_INTERVAL_SWA="$_cli_apc_swa"
 [ -n "${_cli_sparse_slice_set}" ] && VLLM_SM120_SPARSE_MLA_SLICE_TOKENS="$_cli_sparse_slice"
@@ -255,9 +258,11 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-/opt/glm53/chat_template.jinja}"
 VIDEO_PATCH_HOST="${VIDEO_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_video_placeholders.py}"
 STOP_PATCH_HOST="${STOP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_suppress_stops_in_reasoning.py}"
 SCHED_PATCH_HOST="${SCHED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_scheduler_decode_floor.py}"
+MAMBA_CHUNK_PATCH_HOST="${MAMBA_CHUNK_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_chunking.py}"
 DRAFTER_PATCH_HOST="${DRAFTER_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm5_drafter_group.py}"
 APC_PATCH_HOST="${APC_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_hybrid_prefix_hit.py}"
 PERGROUP_PATCH_HOST="${PERGROUP_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_apc_per_group_retention.py}"
+MAMBA_STATE_PATCH_HOST="${MAMBA_STATE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_state_free.py}"
 XGRAMMAR_PATCH_HOST="${XGRAMMAR_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_xgrammar_termination.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
@@ -346,6 +351,8 @@ GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
 # when UNSET: an explicitly empty value is an operator error and
 # validate_numeric_config rejects it rather than guessing a serving mode.
 GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-stock}"
+# Opt-in larger draft KV pages; no weight or cache precision changes.
+GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
@@ -536,6 +543,13 @@ validate_numeric_config() {
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
     _glm53_validate_enum GLM53_INDEXER_WORKSPACE "${GLM53_INDEXER_WORKSPACE-stock}" \
         stock rightsize || return
+    _glm53_validate_enum GLM53_DRAFT_KV_COMPACT "${GLM53_DRAFT_KV_COMPACT-0}" 0 1 || return
+    if [ "${GLM53_DRAFT_KV_COMPACT-0}" = "1" ] && [ "$SPEC_METHOD" != "dflash" ]; then
+        # Compact draft pages switch the prefix-cache coordinator to a
+        # DFlash-only boundary lookup; the allocator also refuses them in-container.
+        echo "GLM53_DRAFT_KV_COMPACT=1 requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
+        return 2
+    fi
     _glm53_validate_spinwait_ms || return
     _glm53_validate_sparse_slice || return
     _glm53_validate_mixed_prefill || return
@@ -1318,6 +1332,9 @@ fi
 if [ -f /opt/glm53/patch_scheduler_decode_floor.py ]; then
     python3 /opt/glm53/patch_scheduler_decode_floor.py
 fi
+if [ -f /opt/glm53/patch_mamba_align_chunking.py ]; then
+    python3 /opt/glm53/patch_mamba_align_chunking.py
+fi
 if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
     python3 /opt/glm53/patch_glm5_drafter_group.py
 fi
@@ -1326,6 +1343,9 @@ if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
 fi
 if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
     python3 /opt/glm53/patch_apc_per_group_retention.py
+fi
+if [ -f /opt/glm53/patch_mamba_align_state_free.py ]; then
+    python3 /opt/glm53/patch_mamba_align_state_free.py
 fi
 if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
     python3 /opt/glm53/patch_xgrammar_termination.py
@@ -1422,6 +1442,9 @@ fi
 if [ -f /opt/glm53/patch_scheduler_decode_floor.py ]; then
     python3 /opt/glm53/patch_scheduler_decode_floor.py
 fi
+if [ -f /opt/glm53/patch_mamba_align_chunking.py ]; then
+    python3 /opt/glm53/patch_mamba_align_chunking.py
+fi
 if [ -f /opt/glm53/patch_glm5_drafter_group.py ]; then
     python3 /opt/glm53/patch_glm5_drafter_group.py
 fi
@@ -1430,6 +1453,9 @@ if [ -f /opt/glm53/patch_hybrid_prefix_hit.py ]; then
 fi
 if [ -f /opt/glm53/patch_apc_per_group_retention.py ]; then
     python3 /opt/glm53/patch_apc_per_group_retention.py
+fi
+if [ -f /opt/glm53/patch_mamba_align_state_free.py ]; then
+    python3 /opt/glm53/patch_mamba_align_state_free.py
 fi
 if [ -f /opt/glm53/patch_xgrammar_termination.py ]; then
     python3 /opt/glm53/patch_xgrammar_termination.py
@@ -1470,9 +1496,11 @@ _tp4_scp_runtime() {
     scp -q -o BatchMode=yes "$VIDEO_PATCH_HOST" "${ssh_t}:/tmp/patch_glm_video_placeholders.py"
     scp -q -o BatchMode=yes "$STOP_PATCH_HOST" "${ssh_t}:/tmp/patch_suppress_stops_in_reasoning.py"
     scp -q -o BatchMode=yes "$SCHED_PATCH_HOST" "${ssh_t}:/tmp/patch_scheduler_decode_floor.py"
+    scp -q -o BatchMode=yes "$MAMBA_CHUNK_PATCH_HOST" "${ssh_t}:/tmp/patch_mamba_align_chunking.py"
     scp -q -o BatchMode=yes "$DRAFTER_PATCH_HOST" "${ssh_t}:/tmp/patch_glm5_drafter_group.py"
     scp -q -o BatchMode=yes "$APC_PATCH_HOST" "${ssh_t}:/tmp/patch_hybrid_prefix_hit.py"
     scp -q -o BatchMode=yes "$PERGROUP_PATCH_HOST" "${ssh_t}:/tmp/patch_apc_per_group_retention.py"
+    scp -q -o BatchMode=yes "$MAMBA_STATE_PATCH_HOST" "${ssh_t}:/tmp/patch_mamba_align_state_free.py"
     scp -q -o BatchMode=yes "$XGRAMMAR_PATCH_HOST" "${ssh_t}:/tmp/patch_xgrammar_termination.py"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${ssh_t}:/tmp/patch_kpool_tail_slotmap.py"
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${ssh_t}:/tmp/patch_spinwait.py"
@@ -1549,6 +1577,7 @@ TP4_SKIP_OLD_SCP
         -e "GLM53_FAIR_PREFILL_MAX_STEP_MS=$GLM53_FAIR_PREFILL_MAX_STEP_MS"
         -e "GLM53_FAIR_PREFILL_MAX_CHUNKS=$GLM53_FAIR_PREFILL_MAX_CHUNKS"
         -e "GLM53_INDEXER_WORKSPACE=$GLM53_INDEXER_WORKSPACE"
+        -e "GLM53_DRAFT_KV_COMPACT=$GLM53_DRAFT_KV_COMPACT"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "VLLM_SM120_SPARSE_MLA_SLICE_TOKENS=$VLLM_SM120_SPARSE_MLA_SLICE_TOKENS"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
@@ -1643,9 +1672,11 @@ TP4_SKIP_OLD_SCP
             -v '/tmp/patch_glm_video_placeholders.py:/opt/glm53/patch_glm_video_placeholders.py:ro' \
             -v '/tmp/patch_suppress_stops_in_reasoning.py:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro' \
             -v '/tmp/patch_scheduler_decode_floor.py:/opt/glm53/patch_scheduler_decode_floor.py:ro' \
+            -v '/tmp/patch_mamba_align_chunking.py:/opt/glm53/patch_mamba_align_chunking.py:ro' \
             -v '/tmp/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro' \
             -v '/tmp/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro' \
             -v '/tmp/patch_apc_per_group_retention.py:/opt/glm53/patch_apc_per_group_retention.py:ro' \
+            -v '/tmp/patch_mamba_align_state_free.py:/opt/glm53/patch_mamba_align_state_free.py:ro' \
             -v '/tmp/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro' \
             -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
             -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
@@ -1679,9 +1710,11 @@ TP4_SKIP_OLD_SCP
         -v "$VIDEO_PATCH_HOST:/opt/glm53/patch_glm_video_placeholders.py:ro" \
         -v "$STOP_PATCH_HOST:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro" \
         -v "$SCHED_PATCH_HOST:/opt/glm53/patch_scheduler_decode_floor.py:ro" \
+        -v "$MAMBA_CHUNK_PATCH_HOST:/opt/glm53/patch_mamba_align_chunking.py:ro" \
         -v "$DRAFTER_PATCH_HOST:/opt/glm53/patch_glm5_drafter_group.py:ro" \
         -v "$APC_PATCH_HOST:/opt/glm53/patch_hybrid_prefix_hit.py:ro" \
         -v "$PERGROUP_PATCH_HOST:/opt/glm53/patch_apc_per_group_retention.py:ro" \
+        -v "$MAMBA_STATE_PATCH_HOST:/opt/glm53/patch_mamba_align_state_free.py:ro" \
         -v "$XGRAMMAR_PATCH_HOST:/opt/glm53/patch_xgrammar_termination.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
