@@ -511,6 +511,13 @@ multiple of 64 that divides the MLA block and fits inside its physical
 page. Divisibility preserves prefix-cache alignment. For example, a
 3,584-token MLA block at 656 bytes/token and a 2,048-byte/token draft
 selects 896 tokens, not a fixed size borrowed from another deployment.
+TP=3 with the 66-head pad uses a different MLA block. On this kit
+(2026-09-23, `GLM53_DRAFT_KV_COMPACT=1`, `DFLASH_DRAFT_TP=1`, 1,000,000-token
+context) the engine logged a padded slot-share block of **640**
+(`mla_page=1679360`, draft 1536 bytes/token, MLA `block_size=2560`) and
+`[glm53-dflash-boundary-lookup-v1] boundary_group_ids=[6]`. The flag was
+set on the head and both workers. That boot is geometry confirmation, not
+the TP=2 reservation or repeat-TTFT result, and not tensor-level parity.
 With a 2,048-token window and 2,048 in-flight tokens, the pinned allocator's
 draft admission bound drops from **65 to 6 block IDs per request**.
 This is a **CPU allocator result, not a serving benchmark**: at a fixed
@@ -630,10 +637,12 @@ image source sets passed the Mamba/capacity tests, ordered composition,
 compilation and byte-identical reapplication. Installer/test CLI smoke
 passed inside both images with GPU and network access disabled. All 75
 native BF16 draft-cache write/attention probe cases were exact against
-64-token pages. TP3/TP4 launcher checks passed, but TP3/TP4 GPU execution,
+64-token pages. TP3/TP4 launcher checks passed. TP=4 GPU execution,
 other architectures/backends, a full image rebuild and full-model bitwise
 equivalence remain unqualified. Cached model revisions were reused.
-**Default remains `0`.**
+**Default remains `0`.** A later TP=3 boot on this kit confirmed the
+derived page and boundary lookup; see the geometry paragraph above.
+`.env.tp3.example` leaves the flag commented.
 
 Neutralized follow-up receipt SHA-256 (raw evidence retained privately):
 `abee1ec2b2783620a5f42cd397d29c92ce33add653f8dc106ea0103420e4b671`.
@@ -1388,7 +1397,7 @@ that are now documented/enforced:
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_DEFAULT_REASONING_EFFORT` | *(empty)* | `low` / `high` / `max` via `--default-chat-template-kwargs` on both ranks. Empty sends no flag, so omitted effort renders Max. Per-request `chat_template_kwargs.reasoning_effort` overrides the default; `medium` is rejected because the template maps it to Max |
 | `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
-| `GLM53_DRAFT_KV_COMPACT` | `0` | Experimental geometry-derived DFlash2 cache blocks; no additional quantization. Reduces shared block-ID demand, not allocated tensor bytes. Requires an unsplit padded page; CPU-verified only. See [compact draft pages](#experimental-compact-dflash2-cache-pages) |
+| `GLM53_DRAFT_KV_COMPACT` | `0` | Experimental geometry-derived DFlash2 cache blocks; no additional quantization. Reduces shared block-ID demand, not allocated tensor bytes. Requires an unsplit padded page. TP=2 qualification is in [compact draft pages](#experimental-compact-dflash2-cache-pages). A 2026-09-23 TP=3 boot selected the derived 640-token page and boundary lookup; tensor-level parity and TP=4 GPU remain unqualified. `.env.tp3.example` ships the flag commented |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
 | `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal) |
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
