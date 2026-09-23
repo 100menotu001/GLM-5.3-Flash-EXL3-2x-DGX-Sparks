@@ -1194,6 +1194,49 @@ ship_image_to_worker() {
     docker save "$IMAGE" | worker_ssh_n "$r" docker load
 }
 
+# Pull $IMAGE without letting a different published recipe replace a local
+# image whose stamp already matches this repo. The local tag is held, the
+# pull is adopted only when its stamp matches too (same recipe, newer
+# layers), and a mismatch restores the hold. No rebuild. SKIP_BUILD=1 and a
+# missing or already-different local stamp keep the plain pull.
+# Sets PULL_KEPT_LOCAL=1 when the local tag was restored.
+pull_image_keeping_repo_stamp() {
+    local wanted="$1"
+    local have="${2-}"
+    PULL_KEPT_LOCAL=0
+    if [ "${SKIP_BUILD:-0}" = "1" ] || [ -z "$have" ] || [ "$have" != "$wanted" ]; then
+        pull_image
+        return 0
+    fi
+    local hold="glm53-recipe-hold-$$-${RANDOM}"
+    local keep_id="" pulled_id="" pulled_stamp=""
+    docker tag "$IMAGE" "$hold" || die "could not hold ${IMAGE} before pull"
+    keep_id="$(docker image inspect -f '{{.Id}}' "$hold" 2>/dev/null || true)"
+    login_ghcr_if_token
+    log "pulling ${IMAGE} (local recipe ${have:0:12} held until the pulled stamp is checked) ..."
+    if ! docker pull "$IMAGE"; then
+        docker tag "$hold" "$IMAGE" >/dev/null 2>&1 || true
+        docker rmi "$hold" >/dev/null 2>&1 || true
+        die "docker pull ${IMAGE} failed.
+  :exl3-instanttensor is a public GHCR package — check network / disk.
+  If you still get 401/403: echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+  Overlay rebuild: BUILD=1 ./start.sh. Recipe-stamp drift also rebuilds; SKIP_BUILD=1 keeps GHCR."
+    fi
+    pulled_stamp="$(image_recipe_stamp)"
+    pulled_id="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+    if [ "$pulled_stamp" = "$wanted" ]; then
+        docker rmi "$hold" >/dev/null 2>&1 || true
+        return 0
+    fi
+    docker tag "$hold" "$IMAGE" || die "could not restore ${IMAGE} after rejecting a mismatched pull"
+    docker rmi "$hold" >/dev/null 2>&1 || true
+    if [ -n "$pulled_id" ] && [ "$pulled_id" != "$keep_id" ]; then
+        docker rmi "$pulled_id" >/dev/null 2>&1 || true
+    fi
+    PULL_KEPT_LOCAL=1
+    warn "pulled ${IMAGE} recipe ${pulled_stamp:0:12} != repo ${wanted:0:12} — kept the local image"
+}
+
 ensure_image() {
     mkdir -p "$LOGDIR"
     local head_ok=0 worker_ok=0 head_key="" worker_key=""
@@ -1237,7 +1280,7 @@ ensure_image() {
         worker_ok=0
     elif image_from_registry && [ "$skip_pull" != "1" ]; then
         local before_key="$head_key"
-        pull_image
+        pull_image_keeping_repo_stamp "$wanted_stamp" "$have_stamp"
         head_key="$(local_image_key || true)"
         head_ok=1
         if [ "$head_key" != "$before_key" ]; then
@@ -1268,7 +1311,7 @@ ensure_image() {
             if images_match "$head_key" "$worker_key"; then
                 continue
             fi
-            if image_from_registry && [ "$skip_pull" != "1" ] && [ "${BUILD:-0}" != "1" ]; then
+            if image_from_registry && [ "$skip_pull" != "1" ] && [ "${BUILD:-0}" != "1" ] && [ "${PULL_KEPT_LOCAL:-0}" != "1" ]; then
                 if pull_image_on_worker "$r"; then
                     worker_key="$(worker_image_key "$r" || true)"
                     if images_match "$head_key" "$worker_key"; then

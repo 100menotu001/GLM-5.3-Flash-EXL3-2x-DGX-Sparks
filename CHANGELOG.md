@@ -121,6 +121,15 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start.sh`, `start-tp3.sh`, and `start-tp4.sh`: a GHCR pull could replace a
+  local image whose recipe stamp already matched the repo, then launch the
+  published image (no locally compiled artifacts; `GLM53_EXL3_MOE_FAST=1`
+  then fails closed at load). The pull is now held aside and adopted only
+  when its stamp matches too. A mismatch restores the local tag and does not
+  rebuild, so a later restart does not build on every boot. Workers are
+  shipped that local image instead of pulling the mismatched GHCR tag.
+  `SKIP_BUILD=1` still keeps GHCR. Supersedes the rebuild-after-pull approach
+  in #248.
 - `overlay/patch_mamba_align_state_free.py`: release every superseded
   Mamba "align" state block. The manager tracked one superseded block per
   request and released it only once the processed prefix (computed minus
