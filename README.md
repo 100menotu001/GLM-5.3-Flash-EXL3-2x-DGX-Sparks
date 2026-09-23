@@ -517,8 +517,8 @@ rejects that combination; use a backend supporting the full derived block
 (the pinned `FLASH_ATTN` backend declares multiples of 16), or disable the
 option. Unpadded exact-fit pages retain their existing behavior.
 
-**Prefix reuse with larger draft blocks.** The drafter group is looked up
-with the EAGLE rule: a hit needs one complete, cached draft block *after*
+**Prefix reuse with larger draft blocks.** Without the compact option, the
+drafter uses the EAGLE lookup rule: a hit needs a complete cached draft block *after*
 the reconciled 3,584-token boundary, which is then dropped. Lookup excludes
 the final prompt token, so a 64-token block needs at least 65 prompt tokens
 past the boundary; an 896-token block needs 897. A shorter same-prompt tail
@@ -530,14 +530,25 @@ RMSNorm, fused KV GEMM, K-norm, RoPE), so unlike EAGLE, whose draft KV at
 position p embeds token p+1, no block past the boundary is needed. Under
 `GLM53_DRAFT_KV_COMPACT=1` `overlay/patch_hybrid_prefix_hit.py` therefore
 looks the DFlash drafter group up ending exactly at the boundary
-(`# [glm53-dflash-boundary-lookup-v1]`); the complete-window check, replay
-clamp, EAGLE flag, retention, and caching are unchanged, and the result is
-identical to the EAGLE lookup whenever that one succeeds. Under the flag
+(`# [glm53-dflash-boundary-lookup-v1]`). Its manager is non-EAGLE, removing
+the extra lookahead block from each retained window and its cache hashes.
+The complete-window check and replay clamp remain intact. Under the flag
 the allocator preflights every grouping path at `get_kv_cache_groups`,
 before any exact-fit or padded page is chosen: every sliding-window layer
 must belong to the DFlash drafter (speculative method and one layer per
 draft decoder layer), else boot fails. Default `0` never gates and keeps
 the EAGLE lookup and its 64-token rule.
+
+**Mamba correctness, with either flag value.** Two overlays fix the target
+state independently of compact draft pages. `patch_mamba_align_state_free.py`
+tracks every superseded state until committed progress makes release safe,
+instead of overwriting an unreleased state index during async prefill.
+Align-mode admission reserves the running state, speculative states, and
+one superseded state per concurrent batch. `patch_mamba_align_chunking.py`
+uses the Mamba group's actual block for checkpoint alignment, not the
+drafter's smaller block, and applies EAGLE back-off only when the full-attention
+group needs it. Sub-block token caps still make progress. The launchers apply
+the chunking overlay after decode-floor v5.
 
 **Installer compatibility.** The public InstantTensor image carries a legacy
 `glm53-hybrid-apc` coordinator without the current v3 verification form.
@@ -548,8 +559,82 @@ duplicate stages, and competing helper bindings fail with the file untouched.
 Supported stock-derived output is byte-identical to a pristine installation.
 This is source-shape validation, not a sandbox for arbitrary Python.
 
-**Custom live qualification (2026-09-21).** Runtime source `9a3aca4` was
-tested with fresh OFF / ON / OFF boots and the existing custom TP2/DFlash2
+**Follow-up qualification (2026-09-21, source-pinned receipt below).** The
+Mamba fixes were present in both OFF and ON arms; these comparisons isolate
+the additional compact-page tradeoff, not the total effect of all fixes.
+The unchanged custom configuration completed fresh OFF / ON / OFF boots
+with 81 requests each. Decode cells had nine trials per arm.
+
+| Custom measurement | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Reservation IDs per maximum-length request | 180 | 121 | 180 | −32.78% |
+| Structured decode (tokens/s) | 78.589 | 78.380 | 76.390 | +1.15% |
+| Code decode (tokens/s) | 53.493 | 52.048 | 49.361 | +1.21% |
+| Prose decode (tokens/s) | 33.188 | 31.131 | 31.200 | −3.30% |
+| C2 code aggregate (tokens/s) | 73.521 | 75.957 | 74.230 | +2.82% |
+| Cold 8k TTFT (s) | 7.042 | 7.107 | 7.125 | +0.34% |
+| Cold 32k TTFT (s) | 27.731 | 28.642 | 28.258 | +2.31% |
+| Cold 100,701-token TTFT (s) | 85.576 | 87.085 | 86.902 | +0.98% |
+| 100,701-token repeat TTFT (s) | 0.710 | 0.706 | 0.726 | −1.70% |
+| Two cold 242,628-token requests, pair wall time (s) | 419.578 | 433.644 | 420.289 | +3.26% |
+| Their follow-ups, pair wall time (s) | 5.486 | 5.718 | 6.357 | −3.43% |
+| 28,672-token prefix with a 64-token tail, repeat TTFT (s) | 2.623 | 0.302 | 3.434 | −90.02% |
+
+Positive throughput changes are faster; positive time changes are slower.
+The last row retained 28,672 tokens under ON versus 25,088 under both OFF
+arms. All six tested tails (64, 65, 349, 896, 897, 2,048) retained the full
+28,672-token prefix under ON. Automatic profiling selected 504 / 513 / 463
+usable pool IDs; reservation savings are **not a measured VRAM reduction**.
+OFF baselines drifted, including −7.73% for code and −5.99% for prose.
+
+The two approximately 3.3% regressions were followed by a **fixed,
+prespecified holdout**, not retries until a pass: three fresh OFF / ON / OFF
+boots, 45 prose trials and three independent cold long-C2 pairs per arm.
+All trials were retained:
+
+| Holdout median | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Prose decode (tokens/s) | 32.684 | 32.286 | 32.495 | −0.93% |
+| Cold long-C2 pair wall time (s) | 420.493 | 429.522 | 428.543 | +1.18% |
+
+Prose speculative acceptance varied; median time per draft changed by
+−0.30%. Greedy outputs differed even within each arm. The original
+nine-trial prose and single-pair long-C2 results above remain evidence,
+not discarded outliers. **There is no universal decode speedup.**
+
+The public image with **stock settings plus compact ON** completed all
+95 requests, including the 814,571-token cold prompt (633.711 s TTFT) and
+its repeat (2.748 s, 813,568 prefix-hit tokens), with zero preemptions.
+Context remained 850k, concurrency four, batching 7,168, utilization 0.85:
+no fixed-memory override. Stock OFF still failed startup: **13.56 GiB
+required versus 10.77 GiB available**, so a matched OFF inference comparison
+is unavailable. Cached-conversation residency is not guaranteed: the two
+243k follow-ups had TTFTs of 9.31 s and 170.08 s, with 240,128 aggregate
+prefix-hit tokens out of 485,306 queried.
+
+Across the completed full workloads and holdout: **500 requests, 140 correct
+reference answers, four successful 3,200-token rollover checks**, zero
+preemptions and no safety stops. The unchanged guards required at least
+2 GiB sampled available RAM and at most 256 MiB new swapout per node.
+Minimum sampled available RAM was 4.64 GiB in custom runs and 5.55 GiB in
+stock ON. Earlier failed runs remain preserved; the historical receipts
+below are byte-unchanged.
+
+Verification: **53 focused CPU tests passed without skips**; both immutable
+image source sets passed the Mamba/capacity tests, ordered composition,
+compilation and byte-identical reapplication. Installer/test CLI smoke
+passed inside both images with GPU and network access disabled. All 75
+native BF16 draft-cache write/attention probe cases were exact against
+64-token pages. TP3/TP4 launcher checks passed, but TP3/TP4 GPU execution,
+other architectures/backends, a full image rebuild and full-model bitwise
+equivalence remain unqualified. Cached model revisions were reused.
+**Default remains `0`.**
+
+Neutralized follow-up receipt SHA-256 (raw evidence retained privately):
+`abee1ec2b2783620a5f42cd397d29c92ce33add653f8dc106ea0103420e4b671`.
+
+**Historical custom qualification (`9a3aca4`, 2026-09-21).** That runtime
+source was tested with fresh OFF / ON / OFF boots and the existing custom TP2/DFlash2
 configuration otherwise unchanged. All **153 requests** completed; all
 **90 marker/reference answers** and three 3,200-token rollover sequence
 checks passed. The 51 prompt hashes matched across arms. No preemptions or
@@ -579,7 +664,7 @@ identical-output kernel timings or statistical significance claims.
 The repeat-TTFT benefit reproduced; **there is no universal decode speedup**.
 Reservation-ID reduction is **not a measured reduction in VRAM**.
 
-**Stock live qualification is incomplete.** The same source was tested on the
+**Historical stock qualification (`9a3aca4`): incomplete.** That source was tested on the
 public InstantTensor image with the stock 850k context, four sequences,
 7,168-token batching and GPU utilization 0.85. Cached public model revisions
 were reused; this was not a fresh model download.
@@ -589,8 +674,9 @@ were reused; this was not a fresh model download.
 * **Automatic budget, ON:** booted with 10.93 GiB; 64/65 requests completed,
   31/31 marker references and the rollover check passed. The 814,571-token
   cold prompt answered correctly (TTFT 634.510 s), with at least 5.15 GiB
-  sampled available RAM. Its repeat triggered the preemption guard
-  (two observed preemptions), so it was not completed.
+  sampled available RAM, but its completed group already recorded two
+  preemptions. The asynchronous guard caught them after cold completion,
+  as the repeat was admitted; the repeat was not completed.
 * **Adjusted stock, fixed 14 GiB:** a separate approved OFF / ON / OFF
   comparison added only `--kv-cache-memory-bytes 15032385536`. OFF 1
   completed 64/65 requests, then its near-limit repeat preempted. ON
@@ -608,15 +694,15 @@ were reused; this was not a fresh model download.
 
 The stock comparison has 48 matching completed prompt hashes, including the
 failed OFF rollover check; it is not a full workload pass. The 14 GiB override
-is **not a safe blanket recommendation**. The cause of near-limit reuse
-preemption remains undetermined. Smaller reservation bounds do not alone
-justify increasing context, concurrency or batching.
+is **not a safe blanket recommendation**. At that revision, the cause of
+the near-limit preemption had not yet been isolated. Smaller reservation
+bounds do not alone justify increasing context, concurrency or batching.
 
 At `9a3aca4`, 61 focused CPU tests passed without skips, plus the standalone
 hybrid smoke. SIX independently cleared the scoped source/CPU review.
-TP3/TP4 GPU behavior, other backends/architectures, tensor-level numerical
-parity and clean near-limit stock reuse remain unqualified. **Default stays
-`0`.** Neutralized result receipt SHA-256 (raw evidence retained privately):
+At that revision, TP3/TP4 GPU behavior, other backends/architectures,
+tensor-level numerical parity and clean near-limit stock reuse were
+unqualified. **Default stays `0`.** Neutralized historical result receipt SHA-256:
 `de9dc16deb0aafbbe60bc469d71cd250a988287c52e2f069f62537f6f4e79b46`.
 The earlier `6d5dd89` custom experiment remains separate and byte-frozen:
 `35fd5ef14b9e9502116311c5706e0ae874056369f90e38ba2184f2be3257e7e2`.
@@ -639,6 +725,15 @@ lengths across one page under dense and boundary-only retention, lookahead
 equivalence, changed suffixes and shared prefixes, evicted window blocks,
 the off-by-default gate, and the DFlash-only preflight on padded, exact-fit,
 and non-GLM grouping paths.
+
+The Mamba regressions are `tests/test_mamba_align_state_free.py` and
+`tests/test_mamba_align_chunking.py`. Point
+`GLM53_SINGLE_TYPE_KV_CACHE_MANAGER_PY`, `GLM53_KV_CACHE_INTERFACE_PY` and
+`GLM53_SCHEDULER_PY` at matching source files from a supported image, then
+run both with pytest. They exercise bounded async state ownership, safe
+release and request-ID reuse, checkpoint state positions, sub-block
+progress, installer idempotence and refusal of unsupported source.
+
 The direction was motivated by
 [Alexbob0's draft-page sizing work](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/9bf39c3e84194a57c630a42c0d79066159a5b787/overlay/patch_kv_drafter_group.py#L64-L83);
 the geometry-derived selection and backend guard here are specific to this recipe.

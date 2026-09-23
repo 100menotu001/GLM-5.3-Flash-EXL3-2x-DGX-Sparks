@@ -741,6 +741,9 @@ def test_eagle_lookup_needs_a_complete_lookahead_block(prefix_hits, monkeypatch,
 
 def test_boundary_lookup_equals_eagle_lookup_when_lookahead_exists(prefix_hits, monkeypatch):
     compact = layout(prefix_hits, monkeypatch, True, 0)
+    # The EAGLE lookup needs the lookahead block, which the boundary layout no
+    # longer retains; cache it here so both lookups see the same window.
+    compact.coordinator.single_type_managers[compact.draft_gid].use_eagle = True
     prompt = tokens(5 * MLA_BLOCK + 1000)
     compact.prefill(prompt)
     with_boundary = compact.lookup(prompt)
@@ -748,6 +751,50 @@ def test_boundary_lookup_equals_eagle_lookup_when_lookahead_exists(prefix_hits, 
     with_eagle = compact.lookup(prompt)
     assert with_boundary[1] == with_eagle[1] == 5 * MLA_BLOCK
     assert with_boundary[0] == with_eagle[0]
+
+
+@pytest.mark.parametrize("swa_retention", [None, 0])
+def test_boundary_layout_retains_only_the_consulted_window(prefix_hits, monkeypatch, swa_retention):
+    """Under the boundary lookup the drafter manager is not EAGLE: neither the
+    lookahead block past an aligned boundary nor the extra shifted tail block
+    is hashed. Dense retention keeps cdiv(2047, 896) = 3 of the 4 blocks per
+    3584-token segment; boundary-only retention keeps 3 per boundary. The
+    EAGLE form keeps 4 in both cases."""
+    window = math.ceil((WINDOW - 1) / 896)
+    # 1000 tokens past the boundary: the lookahead block [100352, 101248) is
+    # complete, so the EAGLE form would cache it.
+    prompt = tokens(LIVE_BOUNDARY + 1000)
+    segments = LIVE_BOUNDARY // MLA_BLOCK
+    per_segment = MLA_BLOCK // 896
+    counts = {}
+    for eagle in (False, True):
+        compact = layout(prefix_hits, monkeypatch, True, swa_retention)
+        if eagle:  # replay the EAGLE retention for comparison
+            compact.coordinator.single_type_managers[compact.draft_gid].use_eagle = True
+        request = compact.prefill(prompt)
+        cached = [
+            i for i, block in enumerate(compact.draft_blocks(request))
+            if block.block_hash is not None
+        ]
+        counts[eagle] = len(cached)
+        if not eagle:
+            # The lookahead block [100352, 101248) is complete but not cached.
+            assert LIVE_BOUNDARY // 896 not in cached
+            expected = (
+                {k * per_segment + j for k in range(segments) for j in range(1, per_segment)}
+                if swa_retention is None
+                else set(range(LIVE_BOUNDARY // 896 - window, LIVE_BOUNDARY // 896))
+            )
+            assert set(cached) == expected
+            blocks, hit = compact.lookup(prompt)
+            assert hit == LIVE_BOUNDARY and compact.uncached == 0
+            assert all(not b.is_null for b in blocks[compact.draft_gid][-window:])
+    # EAGLE form: every block of every segment plus the lookahead block, or
+    # the 4-block shifted tail; boundary form: one id fewer per retained tail.
+    if swa_retention is None:
+        assert counts == {True: segments * per_segment + 1, False: segments * window}
+    else:
+        assert counts == {True: window + 1, False: window}
 
 
 def test_changed_suffix_and_shared_prefix_reuse_the_window(prefix_hits, monkeypatch):
@@ -800,7 +847,6 @@ def test_boundary_lookup_is_off_by_default_and_dflash_only(prefix_hits, monkeypa
     compact = layout(prefix_hits, monkeypatch, True, 0)
     assert compact.coordinator.dflash_boundary_group_ids == frozenset({compact.draft_gid})
     assert compact.coordinator.eagle_group_ids == {compact.draft_gid}
-    assert compact.coordinator.single_type_managers[compact.draft_gid].use_eagle
     baseline = layout(prefix_hits, monkeypatch, False, 0)
     assert baseline.coordinator.dflash_boundary_group_ids == frozenset()
     # The coordinator validates the flag itself; the allocator runs earlier.

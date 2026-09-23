@@ -38,9 +38,13 @@ the target hidden state at p (``precompute_and_store_context_kv``: row-wise
 RMSNorm, fused KV GEMM, K-norm, RoPE at p), so no such block exists in its
 dataflow, and with a compact draft block B it cannot exist for any prompt
 whose tail past the boundary is shorter than B. The drafter group is then
-looked up ending exactly at the boundary (``drop_eagle_block=False``); the
-complete-window check, replay clamp, EAGLE flag, retention and caching are
-unchanged. Default ``0`` keeps the EAGLE lookahead lookup.
+looked up ending exactly at the boundary (``drop_eagle_block=False``), and
+its manager is kept non-EAGLE so the lookahead block is neither hashed
+(``cache_blocks``) nor reserved by ``reachable_block_mask``: the retained
+tail is exactly the ``cdiv(window - 1, B)`` blocks the lookup consults, one
+pool block id fewer per window than the EAGLE form. The complete-window
+check, replay clamp and EAGLE flag are unchanged. Default ``0`` keeps the
+EAGLE lookahead lookup and retention.
 
 Installation states: pristine source; the legacy hybrid-apc form shipped in
 the stock image (with or without the replay stage), which is migrated to the
@@ -398,8 +402,9 @@ BOUNDARY_INIT_NEW = """        logger.info(
         # p+1 in its dataflow), so the lookahead block adds nothing; with a
         # compact draft block B it cannot exist for prompts whose tail past
         # the boundary is shorter than B. Only the EAGLE-flagged drafter
-        # SlidingWindowSpec groups qualify; the flag, retention, caching and
-        # replay clamp are unchanged.
+        # SlidingWindowSpec groups qualify; the EAGLE flag itself (the group
+        # still cannot shrink the hybrid min) and the replay clamp are
+        # unchanged.
         self.dflash_boundary_group_ids: frozenset[int] = (
             frozenset(
                 i
@@ -410,6 +415,16 @@ BOUNDARY_INIT_NEW = """        logger.info(
             if _glm53_dflash_boundary_lookup_enabled()
             else frozenset()
         )
+        for boundary_group_id in self.dflash_boundary_group_ids:
+            # The boundary lookup consults exactly cdiv(window - 1, block)
+            # cached blocks ending on the boundary, never the EAGLE lookahead
+            # block. The manager's eagle bit only widens what is retained:
+            # cache_blocks hashes one block past each aligned boundary and
+            # SlidingWindowManager.reachable_block_mask keeps one more block
+            # per tail (shifted onto the boundary block). Neither is ever
+            # read back under the boundary lookup, so keep the manager
+            # non-EAGLE: one fewer pool block id per retained window.
+            self.single_type_managers[boundary_group_id].use_eagle = False
         logger.info(
             "[glm53-dflash-boundary-lookup-v1] boundary_group_ids=%s",
             sorted(self.dflash_boundary_group_ids),

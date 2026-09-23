@@ -714,7 +714,16 @@ def _glm53_draft_kv_compact(vllm_config, kv_cache_spec) -> bool:
 def _glm53_draft_block_size(
     mla_block: int, mla_page: int, bytes_per_token: int, compact: bool
 ) -> int:
-    """Fill a shared page without increasing the prefix-cache alignment."""
+    """Largest 64-token-multiple divisor of the MLA block whose page fits.
+
+    Dividing the MLA block keeps the prefix-cache alignment (the LCM) at the
+    MLA block; fitting the page keeps the padded strided view inside its own
+    slot; a 64-multiple satisfies every kernel block size the SWA backends
+    accept here (prepare_kernel_block_sizes rejects a split padded page). A
+    larger block cuts block-id demand: a request holds
+    cdiv(window - 1 + in_flight, block) + 1 live ids and a cached boundary
+    keeps cdiv(window - 1, block) ids. Off keeps the 64-token page.
+    """
     if not compact:
         return 64
     if (
