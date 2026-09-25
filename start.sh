@@ -2032,6 +2032,21 @@ launch_cluster() {
         nccl_common+=(-e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA=$GLM53_APC_RETENTION_INTERVAL_SWA")
         log "drafter (SWA) prefix-cache retention interval: ${GLM53_APC_RETENTION_INTERVAL_SWA} (both ranks)"
     fi
+    # UMA cold-load knobs (docs/cold-load-uma.md): optional overrides for the
+    # in-container InstantTensor budget and the mmap staging. Forward to both
+    # ranks only when set — an exported empty string would engage the
+    # GLM53_COLD_LOAD_UMA kill switch, disable the safety clone, and crash
+    # InstantTensor's int()/float() env readers.
+    local v
+    for v in GLM53_COLD_LOAD_UMA GLM53_COLD_LOAD_STAGE_MMAP \
+             INSTANTTENSOR_MAX_FREE_MEM_USAGE INSTANTTENSOR_BUFFER_SIZE \
+             INSTANTTENSOR_CHUNK_SIZE INSTANTTENSOR_CONCURRENCY \
+             INSTANTTENSOR_IO_DEPTH INSTANTTENSOR_BACKEND; do
+        if [ -n "${!v:-}" ]; then
+            nccl_common+=(-e "$v=${!v}")
+            log "$v=${!v} (both ranks)"
+        fi
+    done
 
     local -a head_preload=() worker_preload=""
     if [ "$USE_HOST_NCCL" = "1" ]; then

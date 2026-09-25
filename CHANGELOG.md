@@ -36,8 +36,9 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   file-backed 64 KiB mappings); byte-identical to stock on 4 KiB kernels and
   discrete GPUs. Launcher: `GLM53_HOST_MEM_HYGIENE=1` (default) drops page cache
   and waits for `MemAvailable` to clear the `GPU_MEM_UTIL` request
-  on both nodes before `docker run`. Kill switches `GLM53_COLD_LOAD_UMA=0`,
-  `GLM53_COLD_LOAD_STAGE_MMAP=0`.
+  on both nodes before `docker run`. Runtime kill switches
+  `GLM53_COLD_LOAD_UMA=0`, `GLM53_COLD_LOAD_STAGE_MMAP=0`, forwarded to both
+  ranks when set.
 - **Boot time 259 s → 122 s on `./start.sh restart`** (`/health` 230 → 99 s from
   `docker run`): the video-placeholder `.pth` no longer imports vLLM on every
   interpreter start (container → first log line 100 → 6 s); the NVIDIA JIT

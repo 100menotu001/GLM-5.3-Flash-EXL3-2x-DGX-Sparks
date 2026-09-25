@@ -240,6 +240,26 @@ def test_budget_math_env_overrides_win_on_uma():
     assert st["buffer_size"] == 2 << 30
 
 
+def test_budget_math_kill_switch():
+    """GLM53_COLD_LOAD_UMA=0 at runtime leaves InstantTensor on its own
+    defaults (the image is patched at build, so this is the runtime off)."""
+    free = 2 * 647100416
+    meminfo = {"MemFree": free // 1024, "MemAvailable": 100 << 20}
+    dropped = {"n": 0}
+
+    def drop():
+        dropped["n"] += 1
+        return True
+
+    ns = _budget_ns([], meminfo, [free], drop, env={"GLM53_COLD_LOAD_UMA": "0"})
+    try:
+        ns["_glm53_uma_prepare_instanttensor_budget"](["/dev/null"])
+    finally:
+        del sys.modules["torch"]
+    assert ns["_GLM53_UMA_STATE"] == {}
+    assert dropped["n"] == 0
+
+
 def test_env_number_parsing():
     out = _run(FIXTURE)
     helper_src = out[out.index("# [glm53-cold-load-uma:v1] helpers") : out.index("def instanttensor_weights_iterator(")]

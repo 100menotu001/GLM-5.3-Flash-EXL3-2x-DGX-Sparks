@@ -22,8 +22,8 @@ Two independent problems, both in ``model_executor/model_loader/weight_utils.py`
    backend default even with a full page cache. Containers cannot drop
    caches (``/proc/sys`` is read-only without ``CAP_SYS_ADMIN``); the
    in-container attempt is kept as a harmless no-op and the budget no longer
-   depends on it. The launcher forwards ``INSTANTTENSOR_*`` unchanged; this
-   patch only supplies defaults.
+   depends on it. The launcher forwards ``INSTANTTENSOR_*`` to both ranks
+   when set; this patch only supplies defaults.
 
 2. File-backed 64 KiB mmap sources (``safetensors_weights_iterator``).
    ``cuMemcpyHtoDAsync`` wedges on this GB10 driver when the source is a
@@ -147,9 +147,12 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
     fraction may exceed 1 relative to cuda free and dropping caches is not
     required.
     """
+    _GLM53_UMA_STATE.clear()
+    if os.environ.get("GLM53_COLD_LOAD_UMA", "1") != "1":
+        return  # runtime kill switch; the image is already patched at build
+
     import torch
 
-    _GLM53_UMA_STATE.clear()
     if not (torch.cuda.is_available() and current_platform.is_cuda()):
         return
     try:

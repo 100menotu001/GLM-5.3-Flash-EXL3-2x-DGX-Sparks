@@ -91,7 +91,11 @@ re-applied (idempotent) at boot from `GLM53_OVERLAY_ORDER`:
   slow stock file-backed read there is owned by #251's `GLM53_LOAD_CLONE`
   perf clone, not by this patch.
 
-Kill switch for the whole patch: `GLM53_COLD_LOAD_UMA=0`. Host-only tests:
+Kill switches, forwarded to both ranks when set, so they work from `.env`:
+`GLM53_COLD_LOAD_UMA=0` disables the InstantTensor budget half at runtime
+(the image is patched at build, so this is a runtime switch — both kwargs
+stay at InstantTensor's own defaults) and `GLM53_COLD_LOAD_STAGE_MMAP=0`
+disables the mmap staging. Host-only tests:
 `tests/test_cold_load_uma.py` (also run in the Dockerfile before the patch is
 applied).
 
@@ -152,7 +156,8 @@ checkpoint (~15–18 s); not in this PR.
 
 ## Rollback
 
-`GLM53_COLD_LOAD_UMA=0` and `GLM53_HOST_MEM_HYGIENE=0` return the stock paths
+`GLM53_COLD_LOAD_UMA=0` (budget half), `GLM53_COLD_LOAD_STAGE_MMAP=0` (mmap
+staging) and `GLM53_HOST_MEM_HYGIENE=0` return the stock runtime paths
 without a rebuild. The boot-time overlays are inert with `CG_ESTIMATE=1`
 (the dry-capture runs as before) and the `.pth` change only defers work the
 import hook already does.
