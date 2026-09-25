@@ -441,9 +441,10 @@ VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 # 164 GiB rsync or a previous serve, MemFree is ~2 GiB and the InstantTensor
 # loader either dies (buffer > budget) or shrinks io_depth to double digits.
 # 1 = drop clean page cache on BOTH nodes (needs passwordless
-# sudo; skipped with a warning otherwise), then wait until CUDA free memory
-# clears GPU_MEM_UTIL x total (the driver returns a torn-down context a few
-# GiB behind MemFree). Set 0 to leave the host alone.
+# sudo; skipped with a warning otherwise), then wait until MemAvailable
+# clears GPU_MEM_UTIL x total (the number vLLM's startup check reads on
+# integrated GPUs; the driver returns a torn-down context asynchronously).
+# Set 0 to leave the host alone.
 GLM53_HOST_MEM_HYGIENE="${GLM53_HOST_MEM_HYGIENE:-1}"
 # 1 = after /health, burn DFlash2 BLOCK / sampler / kpool shapes. Nonfatal.
 GLM53_BOOT_SHAPE_WARMUP="${GLM53_BOOT_SHAPE_WARMUP:-1}"
@@ -1871,20 +1872,32 @@ echo "MemFree=${free_gib}GiB"
 HYG
 )"
     # After a teardown the driver returns ~80 GiB of weights asynchronously;
-    # vLLM's startup check reads cuda free (== MemFree on UMA) against
-    # GPU_MEM_UTIL x total, so wait until MemFree clears that bar (+1 GiB).
-    # The gate has to be the number vLLM reads: cudaMemGetInfo free, which
-    # trails host MemFree by a few GiB while the previous context unwinds.
-    local need_mib i free_mib
+    # on integrated GPUs vLLM's startup check reads MemAvailable
+    # (vllm/utils/mem_utils.py, psutil.virtual_memory().available) against
+    # GPU_MEM_UTIL x total, so wait until MemAvailable clears that bar
+    # (+1.5 GiB). /proc/meminfo is the same number vLLM reads — a throwaway
+    # `docker run --gpus all` probe adds nothing. Without passwordless sudo
+    # there is nothing to actively free, so skip the wait with one warning
+    # instead of spinning 45 drop attempts.
+    local need_mib i avail_mib
     need_mib=$(awk -v u="$GPU_MEM_UTIL" '/MemTotal/{printf "%d", $2*u/1024 + 1536}' /proc/meminfo)
-    for i in $(seq 1 45); do
-        free_mib=$(docker run --rm --gpus all --entrypoint python3 "$IMAGE" -c 'import torch; print(torch.cuda.mem_get_info()[0]//1048576)' 2>/dev/null || awk '/MemFree/{print int($2/1024)}' /proc/meminfo)
-        [ "${free_mib:-0}" -ge "$need_mib" ] && break
-        [ "$i" = 1 ] && log "waiting for CUDA free ($((free_mib/1024)) GiB) to reach $((need_mib/1024)) GiB (GPU_MEM_UTIL x total + 1.5 GiB) ..."
-        sync; sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches' 2>/dev/null || true
-        sleep 2
-    done
-    log "cuda free before launch: $((free_mib/1024)) GiB (need $((need_mib/1024)))"
+    avail_mib=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    avail_mib="${avail_mib:-0}"
+    if [ "$avail_mib" -lt "$need_mib" ]; then
+        if sudo -n true 2>/dev/null; then
+            log "waiting for MemAvailable ($((avail_mib/1024)) GiB) to reach $((need_mib/1024)) GiB (GPU_MEM_UTIL x total + 1.5 GiB) ..."
+            for i in $(seq 1 45); do
+                sync; sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+                sleep 2
+                avail_mib=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+                avail_mib="${avail_mib:-0}"
+                [ "$avail_mib" -ge "$need_mib" ] && break
+            done
+        else
+            warn "head: passwordless sudo unavailable — skipping the pre-launch memory wait (MemAvailable $((avail_mib/1024)) GiB < $((need_mib/1024)) GiB needed)"
+        fi
+    fi
+    log "MemAvailable before launch: $((avail_mib/1024)) GiB (need $((need_mib/1024)))"
     local out
     if out="$(printf '%s\n' "$hygiene_script" | sudo -n sh -s 2>/dev/null)"; then
         log "host hygiene head: $out"

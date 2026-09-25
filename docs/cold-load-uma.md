@@ -61,7 +61,7 @@ Iterator-level on one rank's share (60 shards, 82.9 GiB, same container):
 clean cache stock 5.09 vs patched 5.11 GB/s; full cache stock raises, patched
 5.20 GB/s.
 
-The restart gate (`waiting for CUDA free … to reach …`) closes an intermittent
+The restart gate (`waiting for MemAvailable … to reach …`) closes an intermittent
 race: on this kit two consecutive restarts failed vLLM's startup check by
 < 0.5 GiB (`107.45/123.72 GiB … less than desired … 107.64 GiB`) while the
 driver was still returning the torn-down context; it did not reproduce in the
@@ -110,13 +110,17 @@ memory and the host's MemFree never track within that band.
 ## Launcher side (`GLM53_HOST_MEM_HYGIENE=1`, default)
 
 `start.sh` drops clean page cache on **both** nodes
-right before `docker run` (`sudo -n`; warns and continues without it), then
-waits until `torch.cuda.mem_get_info()` free in a throwaway container clears
-`GPU_MEM_UTIL × total + 1.5 GiB`. That second part matters on `restart`: the
-driver returns the torn-down context a few GiB behind `MemFree`, and vLLM's
-startup check failed twice on this kit by < 0.5 GiB (`Free memory on device
-cuda:0 (107.45/123.72 GiB) … less than desired … (0.87, 107.64 GiB)`). This is
-also the prevention step from `docs/uvm-livelock-gb10.md`.
+right before `docker run` (`sudo -n`; warns and continues without it — the
+in-container budget sizes against `MemAvailable` and does not depend on the
+drop), then waits until `MemAvailable` clears `GPU_MEM_UTIL × total + 1.5
+GiB`. That second part matters on `restart`: on integrated GPUs vLLM's
+startup check reads `MemAvailable` (not cuda free), and the driver returns
+the torn-down context asynchronously — the check failed twice on this kit by
+< 0.5 GiB (`Free memory on device cuda:0 (107.45/123.72 GiB) … less than
+desired … (0.87, 107.64 GiB)`). `/proc/meminfo` is the same number vLLM
+reads, so no container probe is involved; without passwordless sudo the wait
+is skipped with one warning instead of spinning. This is also the prevention
+step from `docs/uvm-livelock-gb10.md`.
 
 ## Boot time: 259 s → 122 s on `./start.sh restart` (measured 2026-09-19)
 
