@@ -495,8 +495,16 @@ GLM53_FAIR_PREFILL_MAX_CHUNKS="${GLM53_FAIR_PREFILL_MAX_CHUNKS:-1}"
 # when UNSET: an explicitly empty value is an operator error and
 # validate_numeric_config rejects it rather than guessing a serving mode.
 GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-stock}"
-# Opt-in larger draft KV pages; no weight or cache precision changes.
-GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
+# Larger draft KV pages; no weight or cache precision changes. Default ON for
+# the DFlash drafter (the default spec method), OFF for mtp/none. Like
+# GLM53_INDEXER_WORKSPACE, the default applies only when UNSET: an explicit 0
+# opts out, and an explicitly empty value is an operator error that
+# validate_numeric_config rejects rather than guessing a serving mode.
+if [ "$SPEC_METHOD" = "dflash" ]; then
+    GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-1}"
+else
+    GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
+fi
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
@@ -756,7 +764,7 @@ import pathlib
 import sys
 path = pathlib.Path(sys.argv[1])
 source = path.read_text()
-if "[glm53-loadclone:v1]" not in source or source.rstrip().splitlines()[-1] != "    main()":
+if "[glm53-loadclone:v2]" not in source or source.rstrip().splitlines()[-1] != "    main()":
     raise SystemExit("loader overlay identity/footer missing")
 ast.parse(source, filename=str(path))
 PY

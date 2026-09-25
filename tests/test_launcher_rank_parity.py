@@ -283,26 +283,47 @@ def part_f() -> None:
 COMPACT = "GLM53_DRAFT_KV_COMPACT"
 
 
-def run_compact_guard(value: str, spec_method: str) -> tuple[int, str, str]:
+def compact_default_block() -> str:
+    """The conditional GLM53_DRAFT_KV_COMPACT default, lifted from start.sh
+    (same technique as guard_source)."""
+    m = re.search(
+        r'(?ms)^if \[ "\$SPEC_METHOD" = "dflash" \]; then\n'
+        r"\s+GLM53_DRAFT_KV_COMPACT=.*?\nfi$",
+        source(),
+    )
+    assert m, "conditional GLM53_DRAFT_KV_COMPACT default not found in start.sh"
+    return m.group(0)
+
+
+def run_compact_guard(value: str | None, spec_method: str) -> tuple[int, str, str]:
     script = (
         guard_source()
         + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n"
         + "MAX_NUM_BATCHED_TOKENS=1024\n"
         + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n"
         + f"{NS}=1\n"
-        + "validate_numeric_config || exit $?\n"
+    )
+    env = base_env(SPEC_METHOD=spec_method)
+    if value is None:
+        # Unset: the launcher's own conditional default decides.
+        script += compact_default_block() + "\n"
+    else:
+        env[COMPACT] = value
+    script += (
+        "validate_numeric_config || exit $?\n"
         + f'printf "%s\\n" "${COMPACT}"\n'
     )
-    env = base_env(SPEC_METHOD=spec_method, **{COMPACT: value})
     r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
 def part_g() -> None:
-    """`GLM53_DRAFT_KV_COMPACT=1` is DFlash-only: the coordinator's boundary
-    lookup relies on DFlash's per-position context KV, so the launcher
-    rejects it before any host action unless SPEC_METHOD=dflash."""
-    print(f"Part G: {COMPACT} requires SPEC_METHOD=dflash")
+    """`GLM53_DRAFT_KV_COMPACT` defaults to 1 only for the DFlash drafter; an
+    explicit 0 opts out everywhere, an explicitly empty value is an operator
+    error, and 1 stays DFlash-only: the coordinator's boundary lookup relies
+    on DFlash's per-position context KV, so the launcher rejects it before
+    any host action unless SPEC_METHOD=dflash."""
+    print(f"Part G: {COMPACT} conditional default and SPEC_METHOD=dflash gate")
     if f'-e "{COMPACT}=' not in source():
         print("  skip G (knob not forwarded by this checkout)")
         return
@@ -319,6 +340,25 @@ def part_g() -> None:
         check(
             rc == 2 and COMPACT in err and "SPEC_METHOD=dflash" in err,
             f"G3 {COMPACT}=1 rejected with SPEC_METHOD={spec_method} before launch "
+            f"(rc={rc} err={err[:80]!r})",
+        )
+    rc, out, err = run_compact_guard(None, "dflash")
+    check(
+        rc == 0 and out == "1",
+        f"G4 unset {COMPACT} defaults to 1 with SPEC_METHOD=dflash (rc={rc} out={out!r} {err})",
+    )
+    for spec_method in ("mtp", "none"):
+        rc, out, err = run_compact_guard(None, spec_method)
+        check(
+            rc == 0 and out == "0",
+            f"G5 unset {COMPACT} defaults to 0 with SPEC_METHOD={spec_method} "
+            f"(rc={rc} out={out!r} {err})",
+        )
+    for spec_method in ("dflash", "mtp", "none"):
+        rc, out, err = run_compact_guard("", spec_method)
+        check(
+            rc == 2 and COMPACT in err,
+            f"G6 explicitly empty {COMPACT} rejected with SPEC_METHOD={spec_method} "
             f"(rc={rc} err={err[:80]!r})",
         )
 

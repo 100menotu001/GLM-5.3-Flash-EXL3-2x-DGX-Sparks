@@ -443,8 +443,16 @@ GLM53_APC_NO_STORE="${GLM53_APC_NO_STORE-1}"
 # explicitly empty value is an operator error and validate_numeric_config
 # rejects it rather than guessing a serving mode.
 GLM53_INDEXER_WORKSPACE="${GLM53_INDEXER_WORKSPACE-rightsize}"
-# Opt-in larger draft KV pages; no weight or cache precision changes.
-GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
+# Larger draft KV pages; no weight or cache precision changes. Default ON for
+# the DFlash drafter (the default spec method), OFF for mtp/none. Like
+# GLM53_INDEXER_WORKSPACE, the default applies only when UNSET: an explicit 0
+# opts out, and an explicitly empty value is an operator error that
+# validate_numeric_config rejects rather than guessing a serving mode.
+if [ "$SPEC_METHOD" = "dflash" ]; then
+    GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-1}"
+else
+    GLM53_DRAFT_KV_COMPACT="${GLM53_DRAFT_KV_COMPACT-0}"
+fi
 # SpinCondition reader busy-loop window. "stock" preserves vLLM's 1 s default;
 # 1..1000 selects milliseconds. The frozen TP=2 sweep selected 16 ms.
 GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
@@ -776,7 +784,7 @@ validate_overlay_artifacts() {
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
-        "$LOADCLONE_PATCH_HOST|[glm53-loadclone:v1]|    main()"
+        "$LOADCLONE_PATCH_HOST|[glm53-loadclone:v2]|    main()"
         "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
         "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"

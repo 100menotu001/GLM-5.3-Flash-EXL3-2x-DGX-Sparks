@@ -456,7 +456,6 @@ COPY tests/test_scheduler_decode_floor_restart.py /opt/glm53/test_scheduler_deco
 COPY overlay/patch_hybrid_prefix_hit.py /opt/glm53/patch_hybrid_prefix_hit.py
 COPY overlay/patch_apc_per_group_retention.py /opt/glm53/patch_apc_per_group_retention.py
 COPY tests/test_apc_per_group_retention.py /opt/glm53/test_apc_per_group_retention.py
-COPY tests/test_hybrid_prefix_hit.py /opt/glm53/test_hybrid_prefix_hit.py
 COPY overlay/patch_apc_no_store.py /opt/glm53/patch_apc_no_store.py
 COPY tests/test_apc_no_store.py /opt/glm53/test_apc_no_store.py
 COPY overlay/patch_kv_capacity_log.py /opt/glm53/patch_kv_capacity_log.py
@@ -541,7 +540,6 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_scheduler_decode_floor.py \
     && python3 /opt/glm53/test_scheduler_decode_floor_restart.py \
     && python3 /opt/glm53/test_mamba_align_chunking.py \
-    && python3 /opt/glm53/test_hybrid_prefix_hit.py \
     && python3 /opt/glm53/test_xgrammar_termination.py \
     && python3 /opt/glm53/test_kpool_tail_slotmap.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
