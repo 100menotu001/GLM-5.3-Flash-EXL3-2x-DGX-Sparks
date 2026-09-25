@@ -38,6 +38,8 @@ REPO = HERE.parent
 PIN = "sha256:905c02933be6021301db2dc284e24e3727467aa3a0f63b41d609885778a07bce"
 PATCHES = (
     "patch_scheduler_decode_floor.py",
+    "patch_mamba_align_chunking.py",
+    "patch_mamba_align_state_free.py",
     "patch_hybrid_prefix_hit.py",
     "patch_apc_per_group_retention.py",
     "patch_apc_no_store.py",
@@ -46,6 +48,7 @@ TARGETS = {
     "GLM53_SCHEDULER_PY": "v1/core/sched/scheduler.py",
     "GLM53_KV_COORDINATOR_PY": "v1/core/kv_cache_coordinator.py",
     "GLM53_SINGLE_TYPE_KV_CACHE_MANAGER_PY": "v1/core/single_type_kv_cache_manager.py",
+    "GLM53_KV_CACHE_INTERFACE_PY": "v1/kv_cache_interface.py",
     "GLM53_BLOCK_POOL_PY": "v1/core/block_pool.py",
     "GLM53_SAMPLING_PARAMS_PY": "sampling_params.py",
     "GLM53_REQUEST_PY": "v1/request.py",
@@ -106,19 +109,19 @@ def stage_sources(source, manifest_path, stage):
               "composed patch reapplication preserves bytes", patch=name)
     # A marked but altered target must fail without publishing a partial edit.
     for name, rel, old, new in (
-        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
-         "block_size = self.block_size\n        # The last",
-         "block_size = self.cache_config.block_size\n        # The last"),
-        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
-         "max_prefill_tokens = min(max_prefill_tokens, num_new_tokens)",
-         "max_prefill_tokens = self.max_num_scheduled_tokens"),
-        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
-         "for state_block in self._glm53_mamba_sub_block_sizes:",
+        ("patch_mamba_align_chunking.py", TARGETS["GLM53_SCHEDULER_PY"],
+         "block_size = self.block_size  # [glm53-mamba-align-chunking-v2]",
+         "block_size = self.cache_config.block_size  # [glm53-mamba-align-chunking-v2]"),
+        ("patch_mamba_align_chunking.py", TARGETS["GLM53_SCHEDULER_PY"],
+         "if end < prefill_end and num_new_tokens >= block_size:",
+         "if end < prefill_end:"),
+        ("patch_mamba_align_chunking.py", TARGETS["GLM53_SCHEDULER_PY"],
+         "for state_block in self.mamba_align_sub_block_sizes:",
          "for state_block in ():"),
-        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
-         "if self._glm53_mamba_eagle_backoff:",
+        ("patch_mamba_align_chunking.py", TARGETS["GLM53_SCHEDULER_PY"],
+         "if self.mamba_align_eagle_backoff:",
          "if self.use_eagle:"),
-        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
+        ("patch_mamba_align_chunking.py", TARGETS["GLM53_SCHEDULER_PY"],
          "and group.kv_cache_spec.participates_in_prefix_caching",
          "and True"),
         ("patch_hybrid_prefix_hit.py", TARGETS["GLM53_KV_COORDINATOR_PY"],
@@ -143,9 +146,8 @@ def stage_sources(source, manifest_path, stage):
             target.write_text(original)
     # Migrate the pre-fix overlays on an otherwise fully composed image.
     for name, rel, prefixes in (
-        ("patch_scheduler_decode_floor.py", TARGETS["GLM53_SCHEDULER_PY"],
-         ("MAMBA_EAGLE_INIT", "MAMBA_EAGLE_STOP", "MAMBA_ALIGNMENT",
-          "MAMBA_PROGRESS", "MAMBA_STATE_INIT", "MAMBA_STATE_STOP")),
+        ("patch_mamba_align_chunking.py", TARGETS["GLM53_SCHEDULER_PY"],
+         ("INIT", "SPLIT", "GRANT", "STOP")),
         ("patch_hybrid_prefix_hit.py", TARGETS["GLM53_KV_COORDINATOR_PY"],
          ("CAPABILITY", "KPOOL_INIT", "KPOOL_HIT", "COARSE_RETRY")),
     ):
@@ -156,7 +158,8 @@ def stage_sources(source, manifest_path, stage):
         original = target.read_text()
         previous = original
         for prefix in prefixes:
-            new, old = getattr(patch, prefix + "_NEW"), getattr(patch, prefix + "_OLD")
+            new = getattr(patch, prefix + "_NEW")
+            old = getattr(patch, prefix + "_V1", getattr(patch, prefix + "_OLD"))
             if previous.count(new) != 1:
                 raise AssertionError(f"Missing migration anchor {prefix}")
             previous = previous.replace(new, old, 1)
@@ -347,7 +350,7 @@ def new_manager(runtime, cfg, scheduler, global_retention=None, swa=None):
 
 
 def scheduler_state(stage, cfg, manager, global_block, scheduler, hash_size=64):
-    """Execute the actual init assignments, including optional older revisions."""
+    """Execute the dedicated checkpoint overlay's actual init assignments."""
     sched = types.SimpleNamespace(cache_config=types.SimpleNamespace(block_size=global_block),
         block_size=scheduler, hash_block_size=hash_size, max_num_scheduled_tokens=7168,
         scheduler_config=types.SimpleNamespace(long_prefill_token_threshold=0),
@@ -355,11 +358,12 @@ def scheduler_state(stage, cfg, manager, global_block, scheduler, hash_size=64):
         mamba_partial_cache_hit=manager.coordinator.enable_partial_hash_hits)
     path = stage / "v1/core/sched/scheduler.py"
     tree = ast.parse(path.read_text())
-    names = {"_glm53_mamba_sub_block_sizes", "_glm53_mamba_eagle_backoff"}
+    names = {"mamba_align_sub_block_sizes", "mamba_align_eagle_backoff"}
     assignments = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
         and any(isinstance(t, ast.Attribute) and t.attr in names for t in n.targets)]
     exec(compile(ast.Module(body=assignments, type_ignores=[]), str(path), "exec"),
-         {"self": sched, "kv_cache_config": cfg})
+         {"self": sched, "kv_cache_config": cfg,
+          "MambaSpec": sys.modules["vllm.v1.kv_cache_interface"].MambaSpec})
     return sched
 
 def alignment_probe(runtime, stage):
@@ -752,22 +756,55 @@ def production_probe(runtime, stage):
               eagle_group=group_id, expected_end=expected_end)
 
 
+def compact_boundary_probe(runtime, stage):
+    """Real retained compact-window lookup still reserves fresh target scratch."""
+    cfg = layout(runtime, draft=896)
+    _, scheduler, _ = geometry(runtime, stage, cfg, 64)
+    cache = new_manager(runtime, cfg, scheduler, swa=0)
+    seed = request(runtime, "compact-prime", range(7517))
+    for end in (3584, 7168, 7517):
+        cache.coordinator.new_step_starts()
+        assert cache.allocate_slots(seed, end - seed.num_computed_tokens) is not None
+        seed.num_computed_tokens = end
+    cache.free(seed)
+    cache.coordinator.new_step_starts()
+    compact = os.environ["GLM53_DRAFT_KV_COMPACT"] == "1"
+    for suffix in (1, 2, 3, 4, 349):
+        query = request(runtime, "compact-followup", range(7168 + suffix))
+        blocks, hit, _ = cache.get_computed_blocks(query)
+        expected = 7168 if compact and suffix >= 4 else 3584
+        check(hit == expected,
+              "compact boundary window and independent scratch floor reconcile",
+              compact=compact, suffix=suffix, hit=hit, expected=expected)
+        check(query.num_tokens - hit >= 4,
+              "retained compact drafter never replaces fresh target scratch")
+        if hit == 7168:
+            draft = blocks.blocks[-1]
+            check(len(draft) == 8 and all(not b.is_null for b in draft[-3:]),
+                  "short replay uses the complete retained compact draft window")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--compact", choices=("0", "1"), default="0")
     args = parser.parse_args()
     if sys.flags.optimize:
         raise SystemExit("Do not run with -O: upstream assertions are part of this probe")
     sys.dont_write_bytecode = True
     os.environ["PYTHONHASHSEED"] = "0"
     os.environ["GLM53_APC_NO_STORE"] = "1"
+    os.environ["GLM53_DRAFT_KV_COMPACT"] = args.compact
+    REPORT["compact_flag"] = args.compact
     REPORT["limitations"] = [
         "No tensor allocation, kernels, model forward, GPU copy, or service exercised",
         "Request input carrier and import-only dependencies are explicit stubs",
         "Hash backend is stdlib sha256/pickle; request chaining and block selection are pinned code",
         "Metadata/token consistency is not logits correctness or TTFT evidence",
+        "Pinned manifest lacks worker/utils.py: compact allocator/backend composition is unsupported here",
+        "Compact coordinator behavior uses explicit legal group geometry, not allocator or GPU evidence",
     ]
     with tempfile.TemporaryDirectory(prefix="glm53-apc-cpu-") as tmp:
         stage = Path(tmp)
@@ -778,6 +815,7 @@ def main():
                                  ("capability", capability_probe),
                                  ("cache_contract", cache_contract_probe),
                                  ("partial_tail", partial_tail_probe),
+                                 ("compact_boundary", compact_boundary_probe),
                                  ("production", production_probe)):
                 try:
                     probe(runtime, stage)

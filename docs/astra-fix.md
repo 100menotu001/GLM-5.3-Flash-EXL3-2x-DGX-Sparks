@@ -4,25 +4,12 @@ The reported concurrency failure has two causes: `skip` deliberately withholds e
 
 **Status, 2026-09-15, later: v5.** v4 was restarted and measured (see [diditfix.md](diditfix.md)). Its head log exposed a chunk-selection defect the CPU suite did not cover: every prefill-bearing step on this kit costs about 0.3 s fixed plus about 0.68 ms per token (solo 3584-token chunks 2.68 s, 82-token tails 0.31 s, mixed 128-token chunks 0.34 s, mixed 256-token chunks 0.42 s). v4's estimator scaled one sample linearly, so once a 128-token sample existed it priced 1024 tokens at about 2.7 s (real about 0.95 s) and 256 at about 0.68 s; and its selection spent credit on the smallest affordable rung as soon as it could. Credit never reached the 256 estimate, so the policy sat at 128-token steps: about 390 tokens per mixed second, about 70 tok/s effective at 20% share, and the log's own `eta_est_s` for a 30k newcomer was 330–390 s. v5 fits `dt = a + b·n` over recent solo and mixed samples (scaled so mixed samples are not underestimated), targets the largest ladder rung (128..2048) whose estimate fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, and saves credit for that rung. A never-served newcomer gets one prompt probe of that size; later service ages as before, borrowing at most one step-bounded chunk after all shared debt is repaid, so the long-run share and the one-step gap bound are unchanged. Installer marker `# [glm53-decode-floor:v5]`; v4 images migrate. GPU receipts for v5 are in diditfix.md; on that evidence `fair` became the TP2 default (`start.sh`, `.env.example`) the same day, while `start-tp4.sh` keeps `skip` (untested with `fair`) and `start-tp3.sh` keeps `0`.
 
-**Current alignment correction (CPU-qualified, not GPU-measured).** The final
-splitter also bounds alignment capacity by the actual `num_new_tokens` grant,
-not just configured, threshold and fair-policy limits. The earlier distinction
-between intentional caps and temporary residual budget is superseded: a small
-residual can recur indefinitely, so rounding each positive grant to zero can
-starve prefill. CPU execution of the patched scheduler now makes positive
-sub-block progress under those grants without enlarging them or changing
-fairness/admission policy. It still stops at shared-LCM checkpoints, the last
-reusable checkpoint and the final hash-grain prompt tail. Unequal Mamba layouts
-also stop at the next necessary smaller private-page boundary so unfinished
-recurrent state is not crossed or published prematurely.
-
-This liveness correction may create more small mixed steps rather than waiting
-for full-page capacity; its GPU throughput and decode-latency effects are
-unmeasured. The CPU proof covers actual splitter transitions and cache-manager
-allocation/prefix metadata, not numerical GPU state, copy-on-write or logit
-parity. Live measurements below remain historical, not measurements of this
-correction; final reviewer approval is not asserted. See the
-[current APC description and CPU recipe](../README.md#fine-grained-hybrid-apc-alignment-and-replay).
+**Combined PR238/PR251 alignment correction.** The dedicated
+`patch_mamba_align_chunking.py` owns shared-LCM checkpoints, smaller Mamba
+private-state boundaries and participating-group EAGLE back-off. Positive
+sub-page grants must progress even when they result from residual budget,
+not an intentional policy cap; mandatory state and prompt-tail stops still
+apply. The historical GPU measurements below do not qualify this combination.
 
 **v3 review findings and v4 corrections.** The original v3 unit tests passed, but they did not cover these failures:
 
@@ -173,9 +160,9 @@ if aligned_end > start or block_size <= max_prefill_tokens:
     end = aligned_end
 ```
 
-It did not know the overlay’s smaller mixed cap. At a block boundary, if the prompt needed more chunks and `mixed_cap < block_size <= max_prefill_tokens`, the capped chunk rounded down to zero. A waiting request then hit the alignment branch’s `break`; a running prefill took the zero-token `continue`. Repeating this decision could reproduce starvation even with a positive mixed cap. This was an additional hazard when choosing a fix, not the explanation for the reporter’s `CHUNK=0` runs. The current grant-aware correction is described above.
+It did not know the overlay's smaller mixed cap. At a block boundary, if the prompt needed more chunks and `mixed_cap < block_size <= max_prefill_tokens`, the capped chunk rounded down to zero. A waiting request then hit the alignment branch's `break`; a running prefill took the zero-token `continue`. The combined alignment correction also handles repeatedly small residual grants; configured capacity alone cannot establish forward progress. This was not the explanation for the reporter's `CHUNK=0` runs.
 
-Historical CPU execution of the extracted, uncorrected alignment method used request/configuration stubs. With MNBT 7168 and an illustrative 3584-token block:
+Historical CPU execution of the uncorrected alignment method used request/configuration stubs. With MNBT 7168 and an illustrative 3584-token block:
 
 | Global threshold | Proposed chunk | Aligned result at position zero of a 30k prompt |
 |---:|---:|---:|
@@ -208,7 +195,7 @@ A bounded tuning experiment could hold the global threshold at 1024 and sweep th
 
 3. **Control elapsed GPU service, not just step counts.** Start with a conservative chunk cap and update a cost estimate from completed engine steps, accounting for prompt position/history and batch shape. Combine a configurable prefill time share with a maximum interval between prefill opportunities. A rule such as “one mixed step every N decodes” alone is inadequate when a mixed step takes seconds and a decode step takes milliseconds. Account for async work already in flight so stale timing cannot admit a burst of expensive chunks. Avoid introducing a GPU synchronization on every scheduler decision solely for measurement.
 
-4. **Make the small-chunk policy compatible with hybrid alignment.** Pass the effective policy chunk limit into the alignment decision, or otherwise explicitly allow the base implementation’s private sub-block state progression under that limit. Preserve mandatory cache boundaries, partial-tail handling, and resumed-request replay. Do not remove alignment or publish an incomplete recurrent state as a reusable prefix entry. The original requirement distinguished an intentional policy cap from temporary residual capacity after other requests consumed a step budget; the final correction supersedes that distinction by clamping to the actual grant as well, with smaller private-Mamba-page protection. Otherwise a persistently small residual could repeat zero progress indefinitely.
+4. **Make the small-chunk policy compatible with hybrid alignment.** Preserve positive-grant progress under both policy caps and temporary residual capacity, without enlarging the grant. Preserve mandatory cache boundaries, partial-tail handling, and resumed-request replay. Do not remove alignment or publish an incomplete recurrent state as a reusable prefix entry.
 
 5. **Handle transitions and overload.** Classify work using the actual tokens still requiring computation, including resumed/recomputed output, cached prefixes, and async placeholders. Remove policy state on completion/abort. Yield a partial prefill without discarding its KV. Log separate deferral reasons for policy, alignment, token budget, sequence slots, and KV capacity. Fair service promises apply when a request can obtain a slot and memory; they cannot override resource exhaustion or make an overloaded queue have bounded latency.
 

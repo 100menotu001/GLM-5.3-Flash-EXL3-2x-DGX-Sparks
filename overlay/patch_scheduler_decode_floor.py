@@ -1082,126 +1082,11 @@ def apply_v5(text: str) -> str:
     return text
 
 
-MAMBA_ALIGNMENT_MARK = "# [glm53-mamba-scheduler-alignment-v1]"
-MAMBA_ALIGNMENT_OLD = """        block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached."""
-MAMBA_ALIGNMENT_NEW = """        # [glm53-mamba-scheduler-alignment-v1] The engine's global cache
-        # block is the minimum participating group size (including the draft).
-        # State checkpoints must instead satisfy every group's resolved LCM.
-        block_size = self.block_size
-        # The last block-aligned position whose state can be cached."""
-
-MAMBA_PROGRESS_MARK = "# [glm53-mamba-budget-progress-v1]"
-MAMBA_PROGRESS_OLD = ALIGN_NEW.replace(MARK_V4, MARK_V5)
-MAMBA_PROGRESS_NEW = MAMBA_PROGRESS_OLD.replace(
-    "            aligned_end = end // block_size * block_size\n",
-    """            # [glm53-mamba-budget-progress-v1] The current grant is also
-            # a hard cap, even without an intentional fair/threshold limit.
-            # Waiting for an entire page can starve behind persistent decodes.
-            # Keep sub-block state private; mandatory stops below prevent a
-            # mid-block chunk from crossing its next shared checkpoint.
-            max_prefill_tokens = min(max_prefill_tokens, num_new_tokens)
-            aligned_end = end // block_size * block_size
-""",
-)
-MAMBA_STATE_INIT_OLD = """        self.has_mamba_layers = kv_cache_config.has_mamba_layers
-"""
-MAMBA_STATE_INIT_NEW = MAMBA_STATE_INIT_OLD + """        # Cache smaller state-page sizes once; the usual equal-page layout
-        # needs no extra boundary arithmetic in the scheduling hot path.
-        self._glm53_mamba_sub_block_sizes = tuple(sorted({
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.kv_cache_groups
-            if getattr(group.kv_cache_spec, "mamba_cache_mode", None) == "align"
-            and group.kv_cache_spec.block_size != self.block_size
-        }))
-"""
-MAMBA_STATE_STOP_OLD = """        next_block_boundary = (start // block_size + 1) * block_size
-"""
-MAMBA_STATE_STOP_NEW = MAMBA_STATE_STOP_OLD + """        # A private state may belong to a smaller Mamba page than the LCM.
-        # Do not publish that slot under its full-page hash before finishing it.
-        for state_block in self._glm53_mamba_sub_block_sizes:
-            if start % state_block:
-                next_block_boundary = min(
-                    next_block_boundary, (start // state_block + 1) * state_block
-                )
-"""
-MAMBA_PROGRESS_PAIRS = (
-    (MAMBA_PROGRESS_OLD, MAMBA_PROGRESS_NEW, "Mamba budget progress"),
-    (MAMBA_STATE_INIT_OLD, MAMBA_STATE_INIT_NEW, "Mamba state-page sizes"),
-    (MAMBA_STATE_STOP_OLD, MAMBA_STATE_STOP_NEW, "Mamba private-state stop"),
-)
-
-MAMBA_EAGLE_MARK = "# [glm53-mamba-eagle-backoff-v1]"
-MAMBA_EAGLE_INIT_OLD = MAMBA_STATE_INIT_OLD
-MAMBA_EAGLE_INIT_NEW = MAMBA_EAGLE_INIT_OLD + """        # [glm53-mamba-eagle-backoff-v1] SWA-only draft lookahead does not
-        # prune a target checkpoint. Preserve upstream backoff for non-SWA
-        # EAGLE participants (including MTP's no-SWA all-groups fallback).
-        self._glm53_mamba_eagle_backoff = self.use_eagle and any(
-            i in self.kv_cache_manager.coordinator.eagle_group_ids
-            and group.kv_cache_spec.participates_in_prefix_caching
-            and type(group.kv_cache_spec).__name__ != "SlidingWindowSpec"
-            for i, group in enumerate(kv_cache_config.kv_cache_groups)
-        )
-"""
-MAMBA_EAGLE_STOP_OLD = """        if self.use_eagle:
-            last_cache_position = max(last_cache_position - block_size, 0)
-"""
-MAMBA_EAGLE_STOP_NEW = MAMBA_EAGLE_STOP_OLD.replace(
-    "self.use_eagle", "self._glm53_mamba_eagle_backoff"
-)
-MAMBA_EAGLE_PAIRS = (
-    (MAMBA_EAGLE_INIT_OLD, MAMBA_EAGLE_INIT_NEW, "Mamba EAGLE initialization"),
-    (MAMBA_EAGLE_STOP_OLD, MAMBA_EAGLE_STOP_NEW, "Mamba EAGLE checkpoint"),
-)
-
-
-def unpatch_mamba_eagle(text: str) -> str:
-    if MAMBA_EAGLE_MARK in text:
-        for old, new, label in MAMBA_EAGLE_PAIRS:
-            text = replace_once(text, new, old, label)
-    elif "_glm53_mamba_eagle_backoff" in text:
-        raise SystemExit(f"{P}: Mamba EAGLE marker drifted")
-    return text
-
-
-def patch_mamba_eagle(text: str) -> str:
-    for old, new, label in MAMBA_EAGLE_PAIRS:
-        text = replace_once(text, old, new, label)
-    return text
-
-
-def unpatch_mamba_progress(text: str) -> str:
-    if MAMBA_PROGRESS_MARK not in text:
-        return text
-    for old, new, label in MAMBA_PROGRESS_PAIRS:
-        text = replace_once(text, new, old, label)
-    return text
-
-
-def patch_mamba_progress(text: str) -> str:
-    clean = unpatch_mamba_progress(text)
-    for old, new, label in MAMBA_PROGRESS_PAIRS:
-        clean = replace_once(clean, old, new, label)
-    return clean
-
-
-def patch_mamba_alignment(text: str) -> str:
-    if MAMBA_ALIGNMENT_MARK in text:
-        if text.count(MAMBA_ALIGNMENT_NEW) != 1 or MAMBA_ALIGNMENT_OLD in text:
-            raise SystemExit(f"{P}: Mamba scheduler alignment drifted")
-        return text
-    return replace_once(
-        text, MAMBA_ALIGNMENT_OLD, MAMBA_ALIGNMENT_NEW, "Mamba scheduler alignment"
-    )
-
-
 def main() -> int:
     if not P.is_file():
         raise SystemExit(f"missing {P}")
     text = P.read_text()
     original = text
-    text = unpatch_mamba_eagle(text)
-    text = patch_mamba_alignment(text)
     if MARK_V5 in text:
         # Validate existing anchors/helper instead of trusting the marker alone.
         # unpatch_v5 checks every v5 insertion occurs exactly once, strips the
@@ -1209,16 +1094,12 @@ def main() -> int:
         # later overlay may legitimately sit between the helper and the
         # cuda_graph import anchor, so re-applying at that fixed anchor would
         # relocate the helper and fail a byte-compare on a healthy file.
-        unpatch_v5(unpatch_mamba_progress(text))
-        text = patch_mamba_progress(text)
-        text = patch_mamba_eagle(text)
+        unpatch_v5(text)
         # The import edit is part of the applied state; the byte-compare used
         # to cover it implicitly.
         if "import os\n" not in text.split("import time\n", 1)[0]:
             raise SystemExit(f"{P}: v5 import drifted")
         compile(text, str(P), "exec")
-        if text != original:
-            P.write_text(text)
         print(f"{P.name}: {MARK_V5} already present — verified")
         return 0
     if MARK_V4 in text:
@@ -1230,9 +1111,6 @@ def main() -> int:
     elif MARK in text or V1_HELPER_START in text:
         text = unpatch_v1(text)
     text = apply_v5(text)
-    text = patch_mamba_progress(text)
-    text = patch_mamba_eagle(text)
-    compile(text, str(P), "exec")
     if MARK_V2 in text or MARK_V3 in text or MARK_V4 in text:
         raise SystemExit(f"{P}: older marker left after migration")
     if text != original:
