@@ -69,9 +69,14 @@ KV_FORWARD = '-e "GLM53_KV_CAPACITY_LOG=$GLM53_KV_CAPACITY_LOG"'
 # through the serve_env list). A one-rank miss would silently disable the kernel on
 # that rank, so the scenarios below always require it.
 THIN = "GLM53_EXL3_MOE_FAST"
+# Opt-in large-M KDA BF16 prefill path: same both-ranks contract as THIN. A
+# one-rank miss would silently leave that rank on Marlin, so the scenarios
+# below always require it.
+LARGE_M = "GLM53_KDA_BF16_LARGE_M"
 
 # Launcher knobs and the container-side names they map to.
-LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV, THIN)
+LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV, THIN,
+                  LARGE_M)
 CONTAINER_NAMES = LAUNCHER_KNOBS + (
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA",
@@ -273,19 +278,109 @@ def part_f() -> None:
         )
 
 
+# ------------------------------------- part G (compact draft pages gate) --
+
+COMPACT = "GLM53_DRAFT_KV_COMPACT"
+
+
+def compact_default_block() -> str:
+    """The conditional GLM53_DRAFT_KV_COMPACT default, lifted from start.sh
+    (same technique as guard_source)."""
+    m = re.search(
+        r'(?ms)^if \[ "\$SPEC_METHOD" = "dflash" \]; then\n'
+        r"\s+GLM53_DRAFT_KV_COMPACT=.*?\nfi$",
+        source(),
+    )
+    assert m, "conditional GLM53_DRAFT_KV_COMPACT default not found in start.sh"
+    return m.group(0)
+
+
+def run_compact_guard(value: str | None, spec_method: str) -> tuple[int, str, str]:
+    script = (
+        guard_source()
+        + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n"
+        + "MAX_NUM_BATCHED_TOKENS=1024\n"
+        + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n"
+        + f"{NS}=1\n"
+    )
+    env = base_env(SPEC_METHOD=spec_method)
+    if value is None:
+        # Unset: the launcher's own conditional default decides.
+        script += compact_default_block() + "\n"
+    else:
+        env[COMPACT] = value
+    script += (
+        "validate_numeric_config || exit $?\n"
+        + f'printf "%s\\n" "${COMPACT}"\n'
+    )
+    r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def part_g() -> None:
+    """`GLM53_DRAFT_KV_COMPACT` defaults to 1 only for the DFlash drafter; an
+    explicit 0 opts out everywhere, an explicitly empty value is an operator
+    error, and 1 stays DFlash-only: the coordinator's boundary lookup relies
+    on DFlash's per-position context KV, so the launcher rejects it before
+    any host action unless SPEC_METHOD=dflash."""
+    print(f"Part G: {COMPACT} conditional default and SPEC_METHOD=dflash gate")
+    if f'-e "{COMPACT}=' not in source():
+        print("  skip G (knob not forwarded by this checkout)")
+        return
+    for spec_method in ("dflash", "mtp", "none"):
+        rc, out, err = run_compact_guard("0", spec_method)
+        check(
+            rc == 0 and out == "0",
+            f"G1 {COMPACT}=0 accepted with SPEC_METHOD={spec_method} (rc={rc} out={out!r} {err})",
+        )
+    rc, out, err = run_compact_guard("1", "dflash")
+    check(rc == 0 and out == "1", f"G2 {COMPACT}=1 accepted with SPEC_METHOD=dflash (rc={rc} {err})")
+    for spec_method in ("mtp", "none"):
+        rc, out, err = run_compact_guard("1", spec_method)
+        check(
+            rc == 2 and COMPACT in err and "SPEC_METHOD=dflash" in err,
+            f"G3 {COMPACT}=1 rejected with SPEC_METHOD={spec_method} before launch "
+            f"(rc={rc} err={err[:80]!r})",
+        )
+    rc, out, err = run_compact_guard(None, "dflash")
+    check(
+        rc == 0 and out == "1",
+        f"G4 unset {COMPACT} defaults to 1 with SPEC_METHOD=dflash (rc={rc} out={out!r} {err})",
+    )
+    for spec_method in ("mtp", "none"):
+        rc, out, err = run_compact_guard(None, spec_method)
+        check(
+            rc == 0 and out == "0",
+            f"G5 unset {COMPACT} defaults to 0 with SPEC_METHOD={spec_method} "
+            f"(rc={rc} out={out!r} {err})",
+        )
+    for spec_method in ("dflash", "mtp", "none"):
+        rc, out, err = run_compact_guard("", spec_method)
+        check(
+            rc == 2 and COMPACT in err,
+            f"G6 explicitly empty {COMPACT} rejected with SPEC_METHOD={spec_method} "
+            f"(rc={rc} err={err[:80]!r})",
+        )
+
+
 # --------------------------------------------------------------- harness --
 
 
 class Harness:
     """A throwaway copy of the launcher checkout plus a stub PATH."""
 
-    def __init__(self, tmp: Path) -> None:
+    def __init__(self, tmp: Path, launcher: str = "start.sh") -> None:
         self.tmp = tmp
         self.repo = tmp / "repo"
         self.repo.mkdir()
-        shutil.copy2(START, self.repo / "start.sh")
+        shutil.copy2(ROOT / launcher, self.repo / "start.sh")
         shutil.copy2(ROOT / ".env.example", self.repo / ".env.example")
         (self.repo / ".env").write_text((ROOT / ".env.example").read_text())
+        if launcher != "start.sh":
+            topology = launcher.removeprefix("start-").removesuffix(".sh")
+            template = ROOT / f".env.{topology}.example"
+            shutil.copy2(template, self.repo / template.name)
+            shutil.copy2(template, self.repo / f".env.{topology}")
         for sub in ("overlay", "files", "ablit"):
             if (ROOT / sub).is_dir():
                 shutil.copytree(ROOT / sub, self.repo / sub)
@@ -647,6 +742,8 @@ def part_d(h: Harness) -> None:
     # Unconditional: this checkout ships the thin-decode wiring, so a dropped
     # or one-rank-missing forward must fail D2 rather than skip the scenario.
     scenarios += [("FAST=0", {THIN: "0"}), ("FAST=1", {THIN: "1"})]
+    scenarios += [("LARGEM=0", {LARGE_M: "0"}),
+                  ("LARGEM=1", {LARGE_M: "1"})]
 
     # UMA cold-load knobs (optional; docs/cold-load-uma.md): both ranks when
     # set, neither rank when unset — an exported empty would engage the
@@ -684,6 +781,8 @@ def part_d(h: Harness) -> None:
         for name, value in COLDLOAD.items():
             if name in env:
                 required[name] = value
+        if LARGE_M in env:
+            required[LARGE_M] = env[LARGE_M]
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:
@@ -870,6 +969,78 @@ def part_e(h: Harness) -> None:
         CHAT_TEMPLATE_HOST=str(loop_template),
     )
 
+def loader_all_rank_wiring() -> None:
+    """Exercise real launch functions against the existing recording PATH."""
+    weight_dest = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py"
+    patch_dest = "/opt/glm53/patch_loadclone.py"
+    for launcher, count in (("start.sh", 2), ("start-tp3.sh", 3), ("start-tp4.sh", 4)):
+        with tempfile.TemporaryDirectory() as raw:
+            h = Harness(Path(raw), launcher=launcher)
+            fn = h.repo / "start.fn.sh"
+            fn.write_text(fn.read_text().rsplit('"$@"', 1)[0] + '''
+launch_loader() {
+    validate_numeric_config || return
+    launch_cluster
+}
+"$@"
+''')
+            result = h.run("launch_loader", entry="start.fn.sh",
+                           MODEL_DIR="/root/.cache/huggingface/x",
+                           LOAD_FORMAT="", GLM53_LOAD_CLONE="0", GLM53_LOAD_PREFETCH="0006")
+            assert result.returncode == 0, (launcher, result.stderr)
+            runs = []
+            copies = {}
+            for call in h.calls():
+                if call[:2] == ["docker", "run"]:
+                    runs.append((None, call[2:]))
+                elif call[0] == "ssh" and call[-1].lstrip().startswith("docker run"):
+                    runs.append((call[-2], shlex.split(call[-1])[2:]))
+                elif call[0] == "scp" and ":" in call[-1]:
+                    host, dest = call[-1].split(":", 1)
+                    copies[(host, dest)] = call[-2]
+            assert len(runs) == count, (launcher, runs)
+            for host, argv in runs:
+                rank = Rank(argv)
+                assert rank.env["GLM53_LOAD_CLONE"] == "0"
+                assert rank.env["GLM53_LOAD_PREFETCH"] == "6"
+                assert rank.env["LOAD_FORMAT"] == ""
+                if launcher == "start-tp3.sh":
+                    mounts = dict(argv[i + 1].split(":")[:2][::-1]
+                                  for i, arg in enumerate(argv[:-1]) if arg == "-v")
+                    expected_root = str(h.repo / "overlay/tp3")
+                    if host is None:
+                        assert mounts[weight_dest] == expected_root + "/vllm/model_executor/model_loader/weight_utils.py"
+                    else:
+                        assert mounts[weight_dest] == "/tmp/glm53-tp3/vllm/model_executor/model_loader/weight_utils.py"
+                        assert copies[(host, "/tmp/glm53-tp3")] == expected_root
+                else:
+                    expected_patch = str(h.repo / "overlay/patch_loadclone.py")
+                    if host is None:
+                        assert rank.mounts[patch_dest] == expected_patch
+                    else:
+                        assert copies[(host, rank.mounts[patch_dest])] == expected_patch
+
+
+def loader_artifacts_fail_before_restart_stop() -> None:
+    for launcher in ("start.sh", "start-tp3.sh", "start-tp4.sh"):
+        with tempfile.TemporaryDirectory() as raw:
+            h = Harness(Path(raw), launcher=launcher)
+            # Positive control: the loader gate itself accepts the shipped tree.
+            gate = "validate_overlay_artifacts" if launcher == "start.sh" else "validate_loadclone_artifacts"
+            result = h.run(gate, entry="start.fn.sh")
+            assert result.returncode == 0, (launcher, result.stderr)
+            assert not h.host_touching_calls()
+            result = h.run("restart", LOADCLONE_PATCH_HOST=str(h.tmp / "missing.py"))
+            assert result.returncode == 2, (launcher, result.stderr)
+            assert not h.host_touching_calls()
+            if launcher == "start-tp3.sh":
+                target = h.repo / "overlay/tp3/vllm/model_executor/model_loader/weight_utils.py"
+                target.write_text(target.read_text().replace("def _glm53_load_options():", "def broken_options():"))
+                result = h.run("restart")
+                assert result.returncode == 2, result.stderr
+                assert not h.host_touching_calls()
+
+
 # ------------------------------------------------------------------- main --
 
 
@@ -880,6 +1051,7 @@ def main() -> int:
     print(f"ships: {', '.join(f'{v}={b}' for v, b in shipped_apc_vars().items())}; forwards SWA={wires_swa()} NO_STORE={wires_ns()} KVCAP={wires_kv()}")
     part_a()
     part_f()
+    part_g()
     with tempfile.TemporaryDirectory() as raw:
         h = Harness(Path(raw))
         part_b(h)
@@ -888,6 +1060,8 @@ def main() -> int:
         allocator_overrides(h)
     with tempfile.TemporaryDirectory() as raw:
         part_e(Harness(Path(raw)))
+    loader_all_rank_wiring()
+    loader_artifacts_fail_before_restart_stop()
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): " + "; ".join(FAILURES))
