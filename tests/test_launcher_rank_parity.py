@@ -310,6 +310,11 @@ class Harness:
             PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
             HOME=str(self.home),
             GLM53_STUB_LOG=str(self.log),
+            # host_memory_hygiene is not what this harness exercises; without
+            # this its pre-launch wait runs 45 x 2 s per scenario on a host
+            # whose MemAvailable is below GPU_MEM_UTIL x total (sudo is not
+            # stubbed here), timing the suite out.
+            GLM53_HOST_MEM_HYGIENE="0",
             **extra,
         )
 

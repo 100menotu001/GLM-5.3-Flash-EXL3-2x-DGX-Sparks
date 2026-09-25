@@ -685,7 +685,7 @@ validate_numeric_config() {
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_spinwait_ms || return
     _glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}" || return
-    _glm53_validate_bool_flag GLM53_HOST_MEM_HYGIENE "$GLM53_HOST_MEM_HYGIENE" || return
+    _glm53_validate_bool_flag GLM53_HOST_MEM_HYGIENE "${GLM53_HOST_MEM_HYGIENE:-1}" || return
     _glm53_validate_bool_flag GLM53_KV_CAPACITY_LOG "${GLM53_KV_CAPACITY_LOG-1}" || return
     # The template treats medium as max, so do not advertise it as a level.
     if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
