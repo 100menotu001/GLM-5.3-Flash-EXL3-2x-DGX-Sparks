@@ -104,22 +104,18 @@ def test_stage_flag_follows_page_size():
     assert ns["_GLM53_UMA_STAGE_MMAP"] is False
 
 
-def test_budget_math():
+def _budget_ns(logs, meminfo, cuda_free, drop, env=None):
+    """Exec the helper slice with fake os/torch/platform; returns the namespace."""
     out = _run(FIXTURE)
     helper_src = out[out.index("# [glm53-cold-load-uma:v1] helpers") : out.index("def instanttensor_weights_iterator(")]
-    logs: list = []
 
     class L:
         def info(self, *a): logs.append(("info", a))
         def warning(self, *a): logs.append(("warn", a))
 
-    meminfo = {"MemFree": 2 << 20, "MemAvailable": 110 << 20}  # KiB: 2 GiB free, 110 GiB avail
-    dropped = {"n": 0}
-    cuda_free = [2 << 30]
-
-    def fake_sysconf(k): return 65536
-    fake_os = types.SimpleNamespace(sysconf=fake_sysconf, environ={}, sync=lambda: None, path=os.path)
-
+    fake_os = types.SimpleNamespace(
+        sysconf=lambda k: 65536, environ=env or {}, sync=lambda: None, path=os.path
+    )
     torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(
             is_available=lambda: True,
@@ -130,19 +126,28 @@ def test_budget_math():
     ns: dict = {}
     g = {"os": fake_os, "logger": L(), "current_platform": plat, "__builtins__": __builtins__}
     exec(helper_src, g, ns)
-    # stub the meminfo reader and drop_caches
+    # stub the meminfo reader and drop_caches; the helper looks these up as
+    # globals of the exec namespace
     ns["_glm53_meminfo_kib"] = lambda f: meminfo[f]
+    ns["_glm53_uma_drop_caches"] = drop
+    g.update(ns)
+    sys.modules["torch"] = torch  # type: ignore[assignment]
+    sys.modules.setdefault("instanttensor", types.ModuleType("instanttensor"))
+    return ns
+
+
+def test_budget_math():
+    logs: list = []
+    meminfo = {"MemFree": 2 << 20, "MemAvailable": 110 << 20}  # KiB: 2 GiB free, 110 GiB avail
+    dropped = {"n": 0}
+    cuda_free = [2 << 30]
 
     def drop():
         dropped["n"] += 1
         cuda_free[0] = 100 << 30
         return True
 
-    ns["_glm53_uma_drop_caches"] = drop
-    # the helper looks these up as globals of the exec namespace
-    g.update(ns)
-    sys.modules["torch"] = torch  # type: ignore[assignment]
-    sys.modules.setdefault("instanttensor", types.ModuleType("instanttensor"))
+    ns = _budget_ns(logs, meminfo, cuda_free, drop)
     try:
         ns["_glm53_uma_prepare_instanttensor_budget"](["/dev/null"])
     finally:
@@ -152,6 +157,87 @@ def test_budget_math():
     assert st["max_free_mem_usage"] == 0.5
     assert st["buffer_size"] == 4 << 30
     assert any(k == "info" for k, _ in logs)
+
+
+def test_budget_math_drop_fails_full_cache():
+    """Our observed failure: /proc/sys is read-only in the stock container so
+    drop_caches fails, cuda free == 2 x the 647100416 B budget we logged, and
+    the largest tensor is 1268776960 B. The budget must come from the
+    MemAvailable window and the buffer must cover the largest tensor."""
+    logs: list = []
+    free = 2 * 647100416  # cuda free == host MemFree on UMA
+    meminfo = {"MemFree": free // 1024, "MemAvailable": 100 << 20}  # KiB
+    dropped = {"n": 0}
+    cuda_free = [free]
+
+    def drop():
+        dropped["n"] += 1
+        return False  # containers cannot drop caches (no CAP_SYS_ADMIN)
+
+    ns = _budget_ns(logs, meminfo, cuda_free, drop)
+    largest = 1268776960
+    with tempfile.TemporaryDirectory() as td:
+        shard = Path(td) / "shard.safetensors"
+        with open(shard, "wb") as fh:
+            fh.truncate(largest)
+        try:
+            ns["_glm53_uma_prepare_instanttensor_budget"]([str(shard)])
+        finally:
+            del sys.modules["torch"]
+    st = ns["_GLM53_UMA_STATE"]
+    assert dropped["n"] == 1, "the in-container drop attempt stays (harmless)"
+    frac = st["max_free_mem_usage"]
+    assert frac > 1, frac  # sized against MemAvailable, not cuda free
+    assert frac <= 0.9 * (100 << 30) / free, frac
+    assert int(free * frac) >= (4 << 30) + largest, int(free * frac)
+    assert st["buffer_size"] == 4 << 30  # io_depth stays at the backend default
+    assert st["buffer_size"] >= largest
+    assert not any(k == "warn" for k, _ in logs), logs
+
+
+def test_budget_math_discrete_gpu_unchanged():
+    meminfo = {"MemFree": 2 << 20, "MemAvailable": 110 << 20}
+    dropped = {"n": 0}
+    cuda_free = [80 << 30]  # device free nowhere near host MemFree
+
+    def drop():
+        dropped["n"] += 1
+        return True
+
+    ns = _budget_ns([], meminfo, cuda_free, drop)
+    try:
+        ns["_glm53_uma_prepare_instanttensor_budget"](["/dev/null"])
+    finally:
+        del sys.modules["torch"]
+    assert dropped["n"] == 0
+    assert ns["_GLM53_UMA_STATE"] == {"max_free_mem_usage": None, "buffer_size": None}
+
+    # env overrides pass through unchanged on the discrete path
+    ns = _budget_ns(
+        [], meminfo, cuda_free, drop,
+        env={"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "0.7", "INSTANTTENSOR_BUFFER_SIZE": str(2 << 30)},
+    )
+    try:
+        ns["_glm53_uma_prepare_instanttensor_budget"](["/dev/null"])
+    finally:
+        del sys.modules["torch"]
+    assert ns["_GLM53_UMA_STATE"] == {"max_free_mem_usage": 0.7, "buffer_size": 2 << 30}
+
+
+def test_budget_math_env_overrides_win_on_uma():
+    free = 2 * 647100416
+    meminfo = {"MemFree": free // 1024, "MemAvailable": 100 << 20}
+    ns = _budget_ns(
+        [], meminfo, [free], lambda: False,
+        env={"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "1.5", "INSTANTTENSOR_BUFFER_SIZE": str(2 << 30)},
+    )
+    try:
+        ns["_glm53_uma_prepare_instanttensor_budget"](["/dev/null"])
+    finally:
+        del sys.modules["torch"]
+    st = ns["_GLM53_UMA_STATE"]
+    assert st["max_free_mem_usage"] == 1.5  # >1 env values are legal now
+    assert st["buffer_size"] == 2 << 30
 
 
 def test_env_number_parsing():
@@ -174,6 +260,9 @@ def test_env_number_parsing():
     env["INSTANTTENSOR_MAX_FREE_MEM_USAGE"] = "0.75"
     assert fn("INSTANTTENSOR_MAX_FREE_MEM_USAGE", float, 0.0, 1.0) == 0.75
     assert fn("MISSING", int, None, None) is None
+    # the UMA helper lifts the upper bound: >1 fractions are legal
+    env["INSTANTTENSOR_MAX_FREE_MEM_USAGE"] = "1.5"
+    assert fn("INSTANTTENSOR_MAX_FREE_MEM_USAGE", float, 0.0, None) == 1.5
 
 
 def test_installed_optin():

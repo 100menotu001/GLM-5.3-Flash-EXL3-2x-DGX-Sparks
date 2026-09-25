@@ -13,14 +13,17 @@ Two independent problems, both in ``model_executor/model_loader/weight_utils.py`
    memory budget (1255964672 B)``), or survives with ``io_depth`` shrunk from
    512 to double digits and loads at a fraction of the NVMe ceiling.
 
-   Fix: before opening, measure ``MemAvailable`` (page cache is reclaimable on
-   this box) and, when ``MemFree`` is short of the requested budget, drop clean
-   page cache from inside the container (``/proc/sys/vm/drop_caches`` is
-   writable under ``--privileged`` or with ``CAP_SYS_ADMIN``; otherwise the
-   launcher already did it on the host and this is a no-op) and pin an
-   explicit ``max_free_mem_usage`` / ``buffer_size`` that keeps
-   ``io_depth`` at the backend default. The launcher forwards
-   ``INSTANTTENSOR_*`` unchanged; this patch only supplies defaults.
+   Fix: before opening, measure ``MemAvailable`` (clean page cache is
+   reclaimable on demand, so it — not ``MemFree`` — is what the load can
+   actually use) and pin an explicit ``max_free_mem_usage`` / ``buffer_size``
+   against that window. The fraction may exceed 1 relative to cuda free:
+   InstantTensor treats it as pure arithmetic against ``mem_get_info`` and
+   the pinned allocation reclaims clean cache, so ``io_depth`` stays at the
+   backend default even with a full page cache. Containers cannot drop
+   caches (``/proc/sys`` is read-only without ``CAP_SYS_ADMIN``); the
+   in-container attempt is kept as a harmless no-op and the budget no longer
+   depends on it. The launcher forwards ``INSTANTTENSOR_*`` unchanged; this
+   patch only supplies defaults.
 
 2. File-backed 64 KiB mmap sources (``safetensors_weights_iterator``).
    ``cuMemcpyHtoDAsync`` wedges on this GB10 driver when the source is a
@@ -121,8 +124,9 @@ def _glm53_env_number(name: str, kind, lo, hi):
 
 
 def _glm53_uma_drop_caches() -> bool:
-    """Drop clean page cache. Only possible with CAP_SYS_ADMIN; returns False
-    when the container cannot (the launcher dropped on the host instead)."""
+    """Drop clean page cache. Only possible with CAP_SYS_ADMIN, which the
+    stock container does not have; returns False there. The budget no longer
+    depends on this succeeding."""
     try:
         os.sync()
         with open("/proc/sys/vm/drop_caches", "w") as fh:
@@ -136,9 +140,12 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
     """Keep InstantTensor's device-memory budget honest on unified memory.
 
     Sets ``_GLM53_UMA_STATE[\\"max_free_mem_usage\\"]`` / ``[\\"buffer_size\\"]``
-    (None = InstantTensor/env default) and drops page cache when MemFree is
-    short. Reads ``torch.cuda.mem_get_info()`` (the same query InstantTensor
-    makes) and ``/proc/meminfo``; allocates nothing on the device.
+    (None = InstantTensor/env default). Reads ``torch.cuda.mem_get_info()``
+    (the same query InstantTensor makes) and ``/proc/meminfo``; allocates
+    nothing on the device. On UMA with a full page cache the budget is sized
+    against ``MemAvailable`` — clean cache is reclaimable on demand — so the
+    fraction may exceed 1 relative to cuda free and dropping caches is not
+    required.
     """
     import torch
 
@@ -150,7 +157,7 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
     except ImportError:
         return
 
-    env_budget = _glm53_env_number("INSTANTTENSOR_MAX_FREE_MEM_USAGE", float, 0.0, 1.0)
+    env_budget = _glm53_env_number("INSTANTTENSOR_MAX_FREE_MEM_USAGE", float, 0.0, None)
     env_buffer = _glm53_env_number("INSTANTTENSOR_BUFFER_SIZE", int, 1, None)
     # Default buffer target: 4 GiB keeps io_depth at the AIO/uring default
     # (512 // world_size x 8 MiB chunks) — measured 5.08 GB/s on this kit,
@@ -175,20 +182,38 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
         _GLM53_UMA_STATE["buffer_size"] = env_buffer
         return
 
+    avail_bytes = mem_avail * 1024 if mem_avail is not None else None
+    window_holds = avail_bytes is not None and avail_bytes >= need_bytes
     dropped = False
-    if free_bytes < need_bytes and mem_avail is not None and mem_avail * 1024 >= need_bytes:
+    if free_bytes < need_bytes and window_holds:
         dropped = _glm53_uma_drop_caches()
         free_bytes, _ = torch.cuda.mem_get_info()
-    # Budget = fraction of *current* free. Ask for exactly what the buffer
-    # needs (plus margin) so a later CUDA allocation is never starved, but
-    # never below InstantTensor's 0.5 default when free memory is plentiful.
+    # Budget = fraction of *current* cuda free. When the MemAvailable window
+    # holds the whole load, ask for exactly what the load needs: clean page
+    # cache is reclaimable on demand, so the fraction may exceed 1 (bounded
+    # at 90% of MemAvailable) — InstantTensor does not cap it and the pinned
+    # allocation reclaims the cache. Otherwise keep InstantTensor's 0.5
+    # default when free memory is plentiful, else the stock-capped fraction.
     frac = env_budget
     if frac is None:
-        frac = 0.5 if free_bytes >= 2 * need_bytes else min(0.95, need_bytes / max(free_bytes, 1))
+        if free_bytes >= 2 * need_bytes:
+            frac = 0.5
+        elif window_holds:
+            frac = min(need_bytes, int(0.9 * avail_bytes)) / max(free_bytes, 1)
+        else:
+            frac = min(0.95, need_bytes / max(free_bytes, 1))
     budget = int(free_bytes * frac)
-    buffer_size = env_buffer if env_buffer else min(buffer_target, max(budget - (1 << 30), 0))
-    if buffer_size <= 0:
-        buffer_size = None
+    if env_buffer:
+        buffer_size = env_buffer
+    elif window_holds:
+        # The window holds the load: pin the io_depth-preserving size.
+        buffer_size = buffer_target
+    else:
+        # Genuinely short: best effort under the budget, but never None —
+        # None falls back to InstantTensor's default buffer, which aborts
+        # against a small budget, while an explicit floor is enlarged to the
+        # largest tensor and loads whenever the budget covers it.
+        buffer_size = max(min(buffer_target, budget - (1 << 30)), 1)
     _GLM53_UMA_STATE["max_free_mem_usage"] = frac
     _GLM53_UMA_STATE["buffer_size"] = buffer_size
     logger.info(
@@ -203,12 +228,13 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
         frac,
         f"{buffer_size / (1 << 30):.2f} GiB" if buffer_size else "auto",
     )
-    if free_bytes < need_bytes:
+    if free_bytes < need_bytes and not window_holds:
         logger.warning(
-            "[glm53-cold-load-uma] only %.1f GiB free for a %.1f GiB load "
-            "window; InstantTensor will shrink io_depth. Drop page cache on the "
-            "host before launch (start.sh does this with sudo -n).",
+            "[glm53-cold-load-uma] only %.1f GiB free / %.1f GiB available for "
+            "a %.1f GiB load window; InstantTensor will shrink io_depth or "
+            "raise. Free host memory before launch.",
             free_bytes / (1 << 30),
+            (avail_bytes or 0) / (1 << 30),
             need_bytes / (1 << 30),
         )
 

@@ -73,16 +73,23 @@ Applied to `model_executor/model_loader/weight_utils.py` at image build and
 re-applied (idempotent) at boot from `GLM53_OVERLAY_ORDER`:
 
 * `instanttensor_weights_iterator`: before `safe_open`, read `/proc/meminfo`.
-  If the host is UMA (`cuda free ≈ MemFree`) and `MemFree` is short of the
-  load window (4 GiB buffer + largest shard + 2 GiB) while `MemAvailable`
-  suffices, try `drop_caches` (works only with `CAP_SYS_ADMIN`; the launcher
-  does it on the host first) and hand InstantTensor an explicit
-  `max_free_mem_usage` / `buffer_size` that keeps `io_depth` at the AIO/uring
-  default. `INSTANTTENSOR_*` env vars still win when set.
+  If the host is UMA (`cuda free ≈ MemFree`) and the `MemAvailable` window
+  holds the load window (4 GiB buffer + largest shard + 2 GiB), hand
+  InstantTensor an explicit `max_free_mem_usage` sized against that window —
+  clean page cache is reclaimable on demand, so the fraction may exceed 1
+  relative to cuda free (InstantTensor does not cap it) — and pin
+  `buffer_size` at the size that keeps `io_depth` at the AIO/uring default.
+  Containers cannot drop caches (`/proc/sys` is read-only without
+  `CAP_SYS_ADMIN`); the in-container `drop_caches` attempt is kept as a
+  harmless no-op and the budget no longer depends on it. `INSTANTTENSOR_*`
+  env vars still win when set.
 * `safetensors_weights_iterator`: when `sysconf(SC_PAGE_SIZE) != 4096`,
   `clone()` each tensor off the file-backed mmap into anonymous memory before
   yielding it. `cuMemcpyHtoDAsync` wedges on this driver when the source is a
   file-backed 64 KiB-page mapping. Kill switch `GLM53_COLD_LOAD_STAGE_MMAP=0`.
+  On 4 KiB kernels this half stays byte-identical to stock by design; the
+  slow stock file-backed read there is owned by #251's `GLM53_LOAD_CLONE`
+  perf clone, not by this patch.
 
 Kill switch for the whole patch: `GLM53_COLD_LOAD_UMA=0`. Host-only tests:
 `tests/test_cold_load_uma.py` (also run in the Dockerfile before the patch is
@@ -95,7 +102,7 @@ applied).
 | 4 KiB kernel (sysconf faked to 4096) | `False` | — | `safetensors_weights_iterator` yields the stock mmap views, no clone |
 | discrete GPU (`cuda free` ≠ `MemFree`) | n/a | `max_free_mem_usage=None, buffer_size=None` | InstantTensor's own defaults / env; one INFO line |
 | UMA, plentiful free memory | `True` on 64 KiB | `0.5, 4 GiB` | identical to InstantTensor's default budget (0.5) with the buffer pinned at the io_depth-preserving size |
-| UMA, page cache full | `True` on 64 KiB | `0.95, ≤ free − 1 GiB` | loads instead of raising; warns to drop cache on the host |
+| UMA, page cache full | `True` on 64 KiB | `need/free` vs the `MemAvailable` window (can exceed 1), 4 GiB | loads at full `io_depth` instead of raising |
 
 The UMA test is `abs(cuda_free − MemFree) < 8 GiB`; a discrete card's free
 memory and the host's MemFree never track within that band.
