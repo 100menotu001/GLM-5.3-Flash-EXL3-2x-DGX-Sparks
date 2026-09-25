@@ -2,7 +2,7 @@
 """CPU-only: python -m unittest discover -s tests -p test_loadclone.py -v.
 
 Optional exact PR230 composition probe (no downloads during tests):
-GLM53_PR230_PATCH=/path/to/bc97cbf1/patch_cold_load_uma.py <same command>.
+GLM53_PR230_PATCH=/path/to/1f3ab4ea/patch_cold_load_uma.py <same command>.
 The source fixture is an attributed extraction, not an installed vLLM module.
 """
 from __future__ import annotations
@@ -495,8 +495,8 @@ class Patching(unittest.TestCase):
                             self.assertTrue(torch.equal(values[0][1], torch.tensor([1.0, -0.0])))
 
 
-# overlay/patch_cold_load_uma.py at PR230 head bc97cbf1d5ab06df778b79b99efa92997bb4f153.
-PR230_SHA256 = "b52b45325d2525e52f7c0fc9f82edf7b2eb564fe2b4cacc5433fd4a32c0734c9"
+# overlay/patch_cold_load_uma.py at PR230 head 1f3ab4eacf8590341e783336be70eaed99eb92ef.
+PR230_SHA256 = "d24c0aa24e256a2a5f552fe162fadc8a71ae5980eb7b0a0e9c0e0a4a578ad1bf"
 
 if __name__ == "__main__":
     unittest.main()
