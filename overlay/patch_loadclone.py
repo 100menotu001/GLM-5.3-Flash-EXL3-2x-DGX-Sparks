@@ -26,7 +26,7 @@ TARGET = Path(os.environ.get(
     "GLM53_WEIGHT_UTILS_PY",
     "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py",
 ))
-MARK = "# [glm53-loadclone:v1]"
+MARK = "# [glm53-loadclone:v2]"
 NAME = "safetensors_weights_iterator"
 PRIVATE = "_glm53_original_safetensors_weights_iterator"
 LOOP = "    for st_file in tqdm(\n        sorted_files,\n"
@@ -47,7 +47,7 @@ MMAP_PR230 = (
 )
 MMAP_YIELD = '                    yield name, param'
 
-HELPERS = '''# [glm53-loadclone:v1]
+HELPERS = '''# [glm53-loadclone:v2]
 def _glm53_load_options():
     import os
 
@@ -78,6 +78,10 @@ class _Glm53ShardPrefetch:
         self.stop = threading.Event()
         self.pool = None
         self.pending = {}
+        self.consumed = []
+        self.current = -1
+        self.released = 0
+        self.advice_enabled = True
 
     def read(self, path):
         # One reusable 1 MiB buffer per active worker, not per queued shard.
@@ -90,23 +94,45 @@ class _Glm53ShardPrefetch:
             while not self.stop.is_set() and stream.readinto(buffer):
                 pass
 
+    def release(self, path):
+        import os
+
+        if not self.advice_enabled:
+            return
+        try:
+            with open(path, "rb", buffering=0) as stream:
+                os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, NotImplementedError, OSError):
+            self.advice_enabled = False
+            logger.warning_once("glm53: checkpoint cache advice unavailable; disabling for this load")
+
+    def release_before(self, index):
+        # A new tensor, not a new filename, proves both param locals advanced.
+        # Fully filtered shards can leave the preceding tensor alive across gaps.
+        for previous in range(self.released, index):
+            self.release(self.consumed[previous])
+        self.released = index
+
     def files(self, files, strategy, is_net_fs):
-        if not self.depth or strategy not in (None, "lazy") or is_net_fs or not files:
+        if strategy not in (None, "lazy") or is_net_fs or not files:
             yield from files
             return
         from concurrent.futures import ThreadPoolExecutor
 
-        self.pool = ThreadPoolExecutor(
-            max_workers=min(self.depth, len(files)), thread_name_prefix="glm53-load-prefetch"
-        )
+        if self.depth:
+            self.pool = ThreadPoolExecutor(
+                max_workers=min(self.depth, len(files)), thread_name_prefix="glm53-load-prefetch"
+            )
         next_index = 0
         for index, path in enumerate(files):
-            # Includes the current shard: outstanding reads/futures never exceed
-            # depth. Advance only after the consumer finishes the previous shard.
-            while next_index < min(index + self.depth, len(files)):
-                self.pending[next_index] = self.pool.submit(self.read, files[next_index])
-                next_index += 1
-            self.pending.pop(index).result()  # deterministic error and yield order
+            if self.depth:
+                # Includes the current shard: outstanding reads never exceed depth.
+                while next_index < min(index + self.depth, len(files)):
+                    self.pending[next_index] = self.pool.submit(self.read, files[next_index])
+                    next_index += 1
+                self.pending.pop(index).result()
+            self.consumed.append(path)
+            self.current = index
             yield path
 
     def close(self):
@@ -116,6 +142,12 @@ class _Glm53ShardPrefetch:
         if self.pool is not None:
             self.pool.shutdown(wait=True, cancel_futures=True)
         self.pending.clear()
+        # Retry all yielded shards after native close, including trailing filtered
+        # shards and pages that a clone-disabled consumer may since have released.
+        # Future prefetched shards were never yielded and must remain cached.
+        for path in self.consumed:
+            self.release(path)
+        self.consumed.clear()
 
 
 '''
@@ -145,8 +177,8 @@ def prepare(src: str) -> str:
                    for stage in ("", MMAP_PR230)):
             raise ValueError("safetensors mmap staging drift or conflicting clone patch")
         return src
-    if PRIVATE in src or "_Glm53ShardPrefetch" in src:
-        raise ValueError("unmarked loadclone patch")
+    if "# [glm53-loadclone:v1]" in src or PRIVATE in src or "_Glm53ShardPrefetch" in src:
+        raise ValueError("unmarked/legacy loadclone patch")
     node = _function(src, NAME)
     lines = src.splitlines(keepends=True)
     original = "".join(lines[node.lineno - 1:node.end_lineno])
@@ -185,6 +217,7 @@ def _wrapper() -> str:
         safetensors_prefetch_num_threads=safetensors_prefetch_num_threads,
         safetensors_prefetch_block_size=safetensors_prefetch_block_size,
     )
+    seen = -1
     try:
         # PR #230 owns staging when its module-level flag is true. Do not clone
         # again, nor weaken its non-4KiB safety when optional clone is disabled.
@@ -192,8 +225,12 @@ def _wrapper() -> str:
                  and safetensors_load_strategy not in ("eager", "torchao")
                  and not globals().get("_GLM53_UMA_STAGE_MMAP", False))
         for name, param in iterator:
+            if prefetcher.current != seen:
+                prefetcher.release_before(prefetcher.current)
+                seen = prefetcher.current
             yield name, param.clone() if stage else param
     finally:
+        param = None
         try:
             iterator.close()
         finally:
@@ -211,7 +248,14 @@ def main() -> None:
     if args.check and out != src:
         raise SystemExit(f"[glm53-loadclone] {TARGET}: missing loader overlay; regenerate before mounting read-only")
     if out != src:
-        TARGET.write_text(out)
+        # A failed write must not leave the installed loader truncated.
+        temporary = TARGET.with_name(f".{TARGET.name}.glm53-loadclone.tmp")
+        try:
+            temporary.write_text(out)
+            temporary.chmod(TARGET.stat().st_mode)
+            os.replace(temporary, TARGET)
+        finally:
+            temporary.unlink(missing_ok=True)
     print(f"[glm53-loadclone] {TARGET}: {'already patched' if out == src else 'patched'}")
 
 

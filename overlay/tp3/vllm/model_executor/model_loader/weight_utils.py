@@ -826,7 +826,7 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
-# [glm53-loadclone:v1]
+# [glm53-loadclone:v2]
 def _glm53_load_options():
     import os
 
@@ -857,6 +857,10 @@ class _Glm53ShardPrefetch:
         self.stop = threading.Event()
         self.pool = None
         self.pending = {}
+        self.consumed = []
+        self.current = -1
+        self.released = 0
+        self.advice_enabled = True
 
     def read(self, path):
         # One reusable 1 MiB buffer per active worker, not per queued shard.
@@ -869,23 +873,45 @@ class _Glm53ShardPrefetch:
             while not self.stop.is_set() and stream.readinto(buffer):
                 pass
 
+    def release(self, path):
+        import os
+
+        if not self.advice_enabled:
+            return
+        try:
+            with open(path, "rb", buffering=0) as stream:
+                os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, NotImplementedError, OSError):
+            self.advice_enabled = False
+            logger.warning_once("glm53: checkpoint cache advice unavailable; disabling for this load")
+
+    def release_before(self, index):
+        # A new tensor, not a new filename, proves both param locals advanced.
+        # Fully filtered shards can leave the preceding tensor alive across gaps.
+        for previous in range(self.released, index):
+            self.release(self.consumed[previous])
+        self.released = index
+
     def files(self, files, strategy, is_net_fs):
-        if not self.depth or strategy not in (None, "lazy") or is_net_fs or not files:
+        if strategy not in (None, "lazy") or is_net_fs or not files:
             yield from files
             return
         from concurrent.futures import ThreadPoolExecutor
 
-        self.pool = ThreadPoolExecutor(
-            max_workers=min(self.depth, len(files)), thread_name_prefix="glm53-load-prefetch"
-        )
+        if self.depth:
+            self.pool = ThreadPoolExecutor(
+                max_workers=min(self.depth, len(files)), thread_name_prefix="glm53-load-prefetch"
+            )
         next_index = 0
         for index, path in enumerate(files):
-            # Includes the current shard: outstanding reads/futures never exceed
-            # depth. Advance only after the consumer finishes the previous shard.
-            while next_index < min(index + self.depth, len(files)):
-                self.pending[next_index] = self.pool.submit(self.read, files[next_index])
-                next_index += 1
-            self.pending.pop(index).result()  # deterministic error and yield order
+            if self.depth:
+                # Includes the current shard: outstanding reads never exceed depth.
+                while next_index < min(index + self.depth, len(files)):
+                    self.pending[next_index] = self.pool.submit(self.read, files[next_index])
+                    next_index += 1
+                self.pending.pop(index).result()
+            self.consumed.append(path)
+            self.current = index
             yield path
 
     def close(self):
@@ -895,6 +921,12 @@ class _Glm53ShardPrefetch:
         if self.pool is not None:
             self.pool.shutdown(wait=True, cancel_futures=True)
         self.pending.clear()
+        # Retry all yielded shards after native close, including trailing filtered
+        # shards and pages that a clone-disabled consumer may since have released.
+        # Future prefetched shards were never yielded and must remain cached.
+        for path in self.consumed:
+            self.release(path)
+        self.consumed.clear()
 
 
 def safetensors_weights_iterator(
@@ -915,6 +947,7 @@ def safetensors_weights_iterator(
         safetensors_prefetch_num_threads=safetensors_prefetch_num_threads,
         safetensors_prefetch_block_size=safetensors_prefetch_block_size,
     )
+    seen = -1
     try:
         # PR #230 owns staging when its module-level flag is true. Do not clone
         # again, nor weaken its non-4KiB safety when optional clone is disabled.
@@ -922,8 +955,12 @@ def safetensors_weights_iterator(
                  and safetensors_load_strategy not in ("eager", "torchao")
                  and not globals().get("_GLM53_UMA_STAGE_MMAP", False))
         for name, param in iterator:
+            if prefetcher.current != seen:
+                prefetcher.release_before(prefetcher.current)
+                seen = prefetcher.current
             yield name, param.clone() if stage else param
     finally:
+        param = None
         try:
             iterator.close()
         finally:
@@ -1356,13 +1393,6 @@ def row_parallel_weight_loader(
     if shard_dim is not None:
         shard_size = param.data.shape[shard_dim]
         start_idx = tp_rank * shard_size
-        need = start_idx + shard_size
-        cur = loaded_weight.size(shard_dim)
-        if cur < need:
-            pads = [0, 0] * loaded_weight.dim()
-            axis_from_end = loaded_weight.dim() - 1 - shard_dim
-            pads[2 * axis_from_end + 1] = need - cur
-            loaded_weight = torch.nn.functional.pad(loaded_weight, tuple(pads))
         loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
 
     return default_weight_loader(param, loaded_weight)
@@ -1379,13 +1409,6 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        need = start_idx + shard_size
-        cur = loaded_weight.size(shard_axis)
-        if cur < need:
-            pads = [0, 0] * loaded_weight.dim()
-            axis_from_end = loaded_weight.dim() - 1 - shard_axis
-            pads[2 * axis_from_end + 1] = need - cur
-            loaded_weight = torch.nn.functional.pad(loaded_weight, tuple(pads))
         loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
 
         return default_weight_loader(param, loaded_weight)

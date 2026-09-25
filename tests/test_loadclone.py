@@ -18,6 +18,7 @@ import tempfile
 import threading
 import types
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
@@ -186,6 +187,107 @@ class LoaderCPU(unittest.TestCase):
             self.collect(ns)
         self.assert_no_workers()
 
+    @unittest.skipUnless(hasattr(os, "posix_fadvise") and Path("/proc/self/fd").is_dir(),
+                         "requires Linux file advice")
+    def test_completed_shard_advice_waits_for_tensor_release(self):
+        for depth, early in ((0, False), (2, False), (2, True)):
+            with self.subTest(depth=depth, early=early), \
+                    patch.dict(os.environ, {"GLM53_LOAD_PREFETCH": str(depth)}):
+                ns = runtime()
+                views, advised = {}, []
+                class Shard:
+                    def __init__(self, path, **kwargs):
+                        self.path = path
+                        self.shard = safe_open(path, **kwargs)
+                    def __enter__(self):
+                        self.shard.__enter__()
+                        return self
+                    def __exit__(self, *args):
+                        return self.shard.__exit__(*args)
+                    def keys(self):
+                        return self.shard.keys()
+                    def get_tensor(self, name):
+                        value = self.shard.get_tensor(name)
+                        views.setdefault(self.path, []).append(weakref.ref(value))
+                        return value
+                real_advice = os.posix_fadvise
+                def advise(fd, offset, length, advice):
+                    path = os.readlink(f"/proc/self/fd/{fd}")
+                    self.assertIn(path, views)
+                    self.assertTrue(all(ref() is None for ref in views[path]),
+                                    "cache advice preceded mmap tensor release")
+                    advised.append(path)
+                    return real_advice(fd, offset, length, advice)
+                with patch.dict(ns, {"safe_open": Shard}), patch.object(os, "posix_fadvise", advise):
+                    iterator = ns["safetensors_weights_iterator"](self.files, False)
+                    if early:
+                        values = [next(iterator)]
+                        iterator.close()
+                    else:
+                        values = list(iterator)
+                ordered = sorted(self.files, key=ns["_natural_sort_key"])
+                self.assertEqual(set(advised), set(ordered[:1] if early else ordered))
+                expected = self.collect(runtime(FIXTURE))
+                self.assert_bytes(expected[:1] if early else expected, values)
+                self.assert_no_workers()
+
+    @unittest.skipUnless(hasattr(os, "posix_fadvise") and Path("/proc/self/maps").is_file(),
+                         "requires Linux mmap and file advice")
+    def test_filtered_shard_gaps_wait_for_next_tensor_and_release_tail(self):
+        paths = []
+        for index in range(5):
+            path = str(Path(self.tmp.name) / f"filtered-{index}.safetensors")
+            save_file({"int" if index in (0, 3) else "skip": torch.tensor(index)}, path)
+            paths.append(path)
+        real_advice = os.posix_fadvise
+        for depth in (0, 2):
+            advised = []
+            def advise(fd, offset, length, advice):
+                path = os.readlink(f"/proc/self/fd/{fd}")
+                self.assertNotIn(path, Path("/proc/self/maps").read_text(),
+                                 "filtered gap left a source mapping alive")
+                advised.append(path)
+                return real_advice(fd, offset, length, advice)
+            with self.subTest(depth=depth), \
+                    patch.dict(os.environ, {"GLM53_LOAD_PREFETCH": str(depth)}), \
+                    patch.object(os, "posix_fadvise", advise):
+                iterator = runtime()["safetensors_weights_iterator"](paths, False, None, {0})
+                first = next(iterator)
+                self.assertFalse(advised)
+                second = next(iterator)
+                self.assertEqual(set(advised), set(paths[:3]))
+                self.assertEqual(list(iterator), [])
+            self.assertEqual(set(advised), set(paths))
+            self.assertEqual((first[0], first[1].item(), second[0], second[1].item()),
+                             ("int", 0, "int", 3))
+            self.assert_no_workers()
+
+    @unittest.skipUnless(hasattr(os, "posix_fadvise"), "requires file advice")
+    def test_advice_failure_preserves_load_error_and_retained_views(self):
+        ns = runtime()
+        with patch.dict(os.environ, {"GLM53_LOAD_CLONE": "0", "GLM53_LOAD_PREFETCH": "0"}):
+            baseline = self.collect(runtime(FIXTURE))
+            values = self.collect(ns)
+            self.assert_bytes(baseline, values)
+            original = ns["safe_open"]
+            ordered = sorted(self.files, key=ns["_natural_sort_key"])
+            def broken(path, **kwargs):
+                if path == ordered[1]:
+                    raise RuntimeError("original tensor load failure")
+                return original(path, **kwargs)
+            with patch.dict(ns, {"safe_open": broken}), \
+                    patch.object(os, "posix_fadvise", side_effect=OSError("advice unavailable")), \
+                    patch.object(ns["logger"], "warning_once") as warning:
+                with self.assertRaisesRegex(RuntimeError, "original tensor load failure"):
+                    self.collect(ns)
+                warning.assert_called_once()
+            with patch.object(os, "posix_fadvise", side_effect=OSError("advice unavailable")) as advice, \
+                    patch.object(ns["logger"], "warning_once") as warning:
+                self.assert_bytes(baseline, self.collect(ns))
+                advice.assert_called_once()
+                warning.assert_called_once()
+        self.assert_no_workers()
+
     def test_window_bound_and_no_retained_completed_futures(self):
         ns = runtime()
         prefetch = ns["_Glm53ShardPrefetch"](2)
@@ -236,7 +338,8 @@ class LoaderCPU(unittest.TestCase):
                              (None, "nfs"), (None, "nfs4"), (None, "lustre"), ("lazy", "nfs")):
             ns = runtime(fs=fs)
             with self.subTest(strategy=strategy, fs=fs), \
-                    patch.object(ns["_Glm53ShardPrefetch"], "read", side_effect=AssertionError("extra prefetch")):
+                    patch.object(ns["_Glm53ShardPrefetch"], "read", side_effect=AssertionError("extra prefetch")), \
+                    patch.object(ns["_Glm53ShardPrefetch"], "release", side_effect=AssertionError("extra advice")):
                 self.assert_bytes(self.collect(runtime(FIXTURE, fs=fs), strategy), self.collect(ns, strategy), strategy)
             self.assert_no_workers()
         for strategy in ("eager", "prefetch"):
@@ -247,6 +350,7 @@ class LoaderCPU(unittest.TestCase):
         ao.unflatten_tensor_state_dict = lambda state, metadata: (state, {})
         with patch.dict(sys.modules, {ao.__name__: ao}), \
                 patch.object(ns["_Glm53ShardPrefetch"], "read", side_effect=AssertionError("extra prefetch")), \
+                patch.object(ns["_Glm53ShardPrefetch"], "release", side_effect=AssertionError("extra advice")), \
                 patch.object(torch.Tensor, "clone", side_effect=AssertionError("torchao clone")):
             self.assert_bytes(self.collect(runtime(FIXTURE), "torchao"), self.collect(ns, "torchao"))
 
@@ -320,6 +424,22 @@ class Patching(unittest.TestCase):
                         with self.assertRaises(SystemExit):
                             OVERLAY.main()
                 self.assertEqual(target.read_text(), src)
+
+    def test_failed_publication_preserves_loader_and_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "weight_utils.py"
+            target.write_text(FIXTURE)
+            target.chmod(0o644)
+            with patch.object(OVERLAY, "TARGET", target), patch.object(sys, "argv", ["patch"]):
+                with patch.object(OVERLAY.os, "replace", side_effect=OSError("publish failed")):
+                    with self.assertRaisesRegex(OSError, "publish failed"):
+                        OVERLAY.main()
+                self.assertEqual(target.read_text(), FIXTURE)
+                self.assertEqual(set(Path(tmp).iterdir()), {target})
+                OVERLAY.main()
+                self.assertEqual(target.read_text(), OVERLAY.prepare(FIXTURE))
+                self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+                self.assertEqual(set(Path(tmp).iterdir()), {target})
 
     @unittest.skipUnless(os.environ.get("GLM53_LOADCLONE_SOURCE"), "set GLM53_LOADCLONE_SOURCE for full-image source probe")
     def test_full_source_patch_and_optional_pr_composition(self):
