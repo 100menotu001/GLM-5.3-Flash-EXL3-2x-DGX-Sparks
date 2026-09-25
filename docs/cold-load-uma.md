@@ -109,7 +109,7 @@ memory and the host's MemFree never track within that band.
 
 ## Launcher side (`GLM53_HOST_MEM_HYGIENE=1`, default)
 
-`start.sh` drops clean page cache and cycles residual swap on **both** nodes
+`start.sh` drops clean page cache on **both** nodes
 right before `docker run` (`sudo -n`; warns and continues without it), then
 waits until `torch.cuda.mem_get_info()` free in a throwaway container clears
 `GPU_MEM_UTIL × total + 1.5 GiB`. That second part matters on `restart`: the

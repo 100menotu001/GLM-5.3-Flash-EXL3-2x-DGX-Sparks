@@ -440,7 +440,7 @@ VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
 # On UMA the page cache is "used" device memory to the CUDA driver: after a
 # 164 GiB rsync or a previous serve, MemFree is ~2 GiB and the InstantTensor
 # loader either dies (buffer > budget) or shrinks io_depth to double digits.
-# 1 = drop clean page cache + cycle swap on BOTH nodes (needs passwordless
+# 1 = drop clean page cache on BOTH nodes (needs passwordless
 # sudo; skipped with a warning otherwise), then wait until CUDA free memory
 # clears GPU_MEM_UTIL x total (the driver returns a torn-down context a few
 # GiB behind MemFree). Set 0 to leave the host alone.
@@ -1851,26 +1851,23 @@ _glm53_stage_coop_runtime_worker() {
 }
 
 # ------------------------------- launch ------------------------------------
-# Drop clean page cache and cycle swap on both nodes while no engine runs.
-# Needs passwordless sudo (sudo -n); otherwise warns and continues. The
-# in-container patch_cold_load_uma.py cannot drop caches (no CAP_SYS_ADMIN)
-# and only rescales the InstantTensor budget, so this host step is what keeps
-# the 164 GiB load at the NVMe ceiling instead of a double-digit io_depth.
+# Drop clean page cache on both nodes while no engine runs. Needs
+# passwordless sudo (sudo -n); otherwise warns and continues — the
+# in-container InstantTensor budget (patch_cold_load_uma.py) sizes against
+# MemAvailable and no longer depends on the drop. Swap is not cycled:
+# residual swap belongs to live co-tenants, swapoff pulls it back into RAM
+# (the opposite of the goal) and swapon only re-enables fstab entries.
 host_memory_hygiene() {
     [ "$GLM53_HOST_MEM_HYGIENE" = "1" ] || { log "host memory hygiene skipped (GLM53_HOST_MEM_HYGIENE=0)"; return 0; }
-    # One POSIX sh script, sent to `sudo -n sh -s` on stdin on each node: drop
-    # clean page cache, cycle swap only if any is in use, report the result.
+    # One POSIX sh script, sent to `sudo -n sh -s` on stdin on each node:
+    # drop clean page cache, report the result.
     local hygiene_script
     hygiene_script="$(cat <<'HYG'
 set -e
 sync
 echo 1 > /proc/sys/vm/drop_caches
-used_kib=$(awk '$1 != "Filename" { s += $4 } END { print s + 0 }' /proc/swaps)
-if [ "$used_kib" -gt 0 ]; then
-    swapoff -a && swapon -a
-fi
 free_gib=$(awk '/^MemFree:/ { print int($2 / 1048576) }' /proc/meminfo)
-echo "MemFree=${free_gib}GiB swap_used_before=${used_kib}KiB"
+echo "MemFree=${free_gib}GiB"
 HYG
 )"
     # After a teardown the driver returns ~80 GiB of weights asynchronously;
@@ -1892,12 +1889,12 @@ HYG
     if out="$(printf '%s\n' "$hygiene_script" | sudo -n sh -s 2>/dev/null)"; then
         log "host hygiene head: $out"
     else
-        warn "head: passwordless sudo unavailable — page cache not dropped (cold load may run below the NVMe ceiling)"
+        warn "head: could not drop page cache (passwordless sudo unavailable) — continuing; the InstantTensor budget uses MemAvailable and does not depend on it"
     fi
     if out="$(printf '%s\n' "$hygiene_script" | worker_ssh "sudo -n sh -s" 2>/dev/null)"; then
         log "host hygiene worker: $out"
     else
-        warn "worker: passwordless sudo unavailable — page cache not dropped"
+        warn "worker: could not drop page cache (passwordless sudo unavailable) — continuing"
     fi
 }
 

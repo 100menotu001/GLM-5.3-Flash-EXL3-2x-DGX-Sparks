@@ -34,8 +34,8 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   On kernels whose page size is not 4 KiB it also stages file-backed safetensors
   tensors into anonymous memory before H2D (`cuMemcpyHtoDAsync` wedges on
   file-backed 64 KiB mappings); byte-identical to stock on 4 KiB kernels and
-  discrete GPUs. Launcher: `GLM53_HOST_MEM_HYGIENE=1` (default) drops page cache,
-  cycles swap and waits for CUDA free memory to clear the `GPU_MEM_UTIL` request
+  discrete GPUs. Launcher: `GLM53_HOST_MEM_HYGIENE=1` (default) drops page cache
+  and waits for CUDA free memory to clear the `GPU_MEM_UTIL` request
   on both nodes before `docker run`. Kill switches `GLM53_COLD_LOAD_UMA=0`,
   `GLM53_COLD_LOAD_STAGE_MMAP=0`.
 - **Boot time 259 s → 122 s on `./start.sh restart`** (`/health` 230 → 99 s from
