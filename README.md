@@ -500,9 +500,13 @@ not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marli
 ### Experimental compact DFlash2 cache pages
 
 `GLM53_DRAFT_KV_COMPACT=1` reduces the block IDs reserved by the drafter's
-padded slot-shared cache. Default `0` keeps 64-token padded blocks. The
-TP2/TP3/TP4 launchers accept exactly `0` or `1` and reject `1` unless
-`SPEC_METHOD=dflash`; this is a startup setting. It changes neither weight
+padded slot-shared cache. The TP2/TP3/TP4 launchers default it to `1` when
+`SPEC_METHOD=dflash` (the default method) and to `0` otherwise, so
+`SPEC_METHOD=mtp`/`none` keeps the 64-token padded blocks. The default
+applies only when the variable is unset: an explicit `0` opts out and an
+explicitly empty value is rejected at launch. The launchers accept exactly
+`0` or `1` and reject `1` unless `SPEC_METHOD=dflash`; this is a startup
+setting. It changes neither weight
 nor KV precision, the sliding window, nor the target cache groups. The
 PR233 KDA path is independent and unchanged.
 
@@ -548,8 +552,24 @@ The complete-window check and replay clamp remain intact. Under the flag
 the allocator preflights every grouping path at `get_kv_cache_groups`,
 before any exact-fit or padded page is chosen: every sliding-window layer
 must belong to the DFlash drafter (speculative method and one layer per
-draft decoder layer), else boot fails. Default `0` never gates and keeps
-the EAGLE lookup and its 64-token rule.
+draft decoder layer), else boot fails. Value `0` (explicit, or the implicit
+non-DFlash default) never gates and keeps the EAGLE lookup and its 64-token
+rule.
+
+**Mamba correctness, with either flag value.** Two overlays fix the target
+state independently of compact draft pages. `patch_mamba_align_state_free.py`
+tracks every superseded state until committed progress makes release safe,
+instead of overwriting an unreleased state index during async prefill.
+Align-mode admission reserves the running state, speculative states, and
+one superseded state per concurrent batch. `patch_mamba_align_chunking.py`
+uses the resolved scheduler LCM for shared checkpoints, not the drafter's
+smaller block, and preserves smaller Mamba private-state boundaries. EAGLE
+back-off applies only when a participating non-SWA group needs it. Alignment
+capacity is bounded by the actual grant so positive sub-block grants progress.
+The launchers apply the chunking overlay after decode-floor v5.
+
+The GPU receipts below qualify the retained PR238 implementation. They do
+not automatically qualify the combined loader and fine-grained APC changes.
 
 **Mamba correctness, with either flag value.** Two overlays fix the target
 state independently of compact draft pages. `patch_mamba_align_state_free.py`
@@ -637,12 +657,13 @@ image source sets passed the Mamba/capacity tests, ordered composition,
 compilation and byte-identical reapplication. Installer/test CLI smoke
 passed inside both images with GPU and network access disabled. All 75
 native BF16 draft-cache write/attention probe cases were exact against
-64-token pages. TP3/TP4 launcher checks passed. TP=4 GPU execution,
+64-token pages. TP3/TP4 launcher checks passed, but TP3/TP4 GPU execution,
 other architectures/backends, a full image rebuild and full-model bitwise
 equivalence remain unqualified. Cached model revisions were reused.
-**Default remains `0`.** A later TP=3 boot on this kit confirmed the
-derived page and boundary lookup; see the geometry paragraph above.
-`.env.tp3.example` leaves the flag commented.
+**Default: `1` under `SPEC_METHOD=dflash` (the default method), `0` otherwise,
+applied only when the variable is unset.** A later TP=3 boot on this kit
+confirmed the derived page and boundary lookup; see the geometry paragraph
+above. `.env.tp3.example` leaves the flag commented.
 
 Neutralized follow-up receipt SHA-256 (raw evidence retained privately):
 `abee1ec2b2783620a5f42cd397d29c92ce33add653f8dc106ea0103420e4b671`.
@@ -757,10 +778,9 @@ the geometry-derived selection and backend guard here are specific to this recip
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
 resends the full history each turn; vLLM hashes that prefix. Concurrent chats
 do **not** mix activations. `--max-num-seqs 4` is four **in-flight** generations,
-not four parked sessions. Historically the nonparticipating `KpoolTailManager`
-incorrectly vetoed fine-grained hits, leaving only the 3584-token hybrid checkpoints.
-The current overlay excludes nonparticipating scratch groups from that capability
-gate, while preserving their replay requirements; see [fine-grained APC](#fine-grained-hybrid-apc-alignment-and-replay).
+not four parked sessions. Nonparticipating `KpoolTailManager` scratch no longer
+vetoes fine-grained prefix lookup. Participating groups still must support the
+resolved hash grain; the scratch itself is never a reusable cache hit.
 
 `dflash` is `use_eagle()`. GLM never sets `is_eagle_group` (that annotator is
 DeepseekV4-only), so stock HybridKVCacheCoordinator flagged **every** group.
@@ -806,129 +826,48 @@ Re-measure (see also `tests/bench_prefix_cache.py`):
 python3 tests/bench_prefix_cache.py --runs 3
 ```
 
-The historical receipts above used **3584-token hybrid MLA checkpoints**:
-the 7168 / 10752 / 14336 hit rows are 2 / 3 / 4 complete pages. This is not
-an upper bound for the corrected fine-grained path, whose eligibility also depends
-on state checkpoints and replay coverage. The bench POSTs `/reset_prefix_cache` between colds when that route is
+The historical rows above reused **3584-token hybrid checkpoints**: their
+7168 / 10752 / 14336 hits are 2 / 3 / 4 complete pages. Corrected fine-grained
+lookup may also reuse partial entries, subject to state and replay coverage.
+The bench POSTs `/reset_prefix_cache` between colds when that route is
 enabled (`GLM53_EXPOSE_CACHE_RESET=1`; opt-in, see the API surface notes
 below) and salts its filler content per invocation on top — repeated runs
 stay genuinely cold even with the reset route off.
 
 ### Fine-grained hybrid APC: alignment and replay
 
-The existing scheduler and hybrid-prefix overlays correct alignment, grant-progress
-and capability defects, without a new retention policy or serving default:
+`patch_mamba_align_chunking.py` owns checkpoint alignment, small-grant progress
+and EAGLE back-off; decode-floor retains its scheduling and fairness policy.
+Shared checkpoints use the scheduler LCM. When resuming inside a smaller Mamba
+private page, a chunk stops at that page boundary before its running state can
+cross it.
 
-- **Checkpoint alignment:** the splitter now uses the resolved scheduler LCM
-  (`self.block_size`, 3584 tokens in the tested hybrid geometry), not the minimum
-  group's `cache_config.block_size` (64 with the draft group). A small scheduling
-  step must not cross a shared state checkpoint without producing that checkpoint.
-  This does not require every step to be 3584 tokens: the splitter clamps its
-  alignment capacity to the actual `num_new_tokens` grant as well as configured,
-  threshold and fair limits. A repeatedly small leftover budget can therefore
-  make sub-block progress rather than repeatedly rounding a positive grant to
-  zero. Grants are never enlarged, and fairness/admission policy is unchanged.
-  Unequal Mamba layouts additionally stop at the next necessary smaller private
-  page boundary, preserving incomplete recurrent state before crossing that page.
-  Shared-LCM checkpoints and the final hash-grain prompt-tail stop remain enforced.
-  When only SWA drafter groups use EAGLE, the mandatory last full target
-  checkpoint is not backed off by a page. Non-SWA EAGLE participants, including
-  no-SWA MTP, retain upstream backoff. This preserves production solo-prefill
-  checkpoints with 7168-token grants and short (300-token) follow-ups; it may
-  add a prefill step when that checkpoint is not a natural chunk end. The
-  GPU cost of this extra-step/cache-hit tradeoff is unmeasured.
-  More small mixed steps may affect throughput and decode latency; those GPU
-  effects have not been measured.
-- **Capability gate:** only prefix-participating groups may veto partial hits.
-  The demonstrated unwanted veto came from the non-cacheable, four-token
-  `KpoolTailSpec` scratch group, **not** from a compatible SWA64 group. There is
-  no SWA-class exemption: participating SWA128 with hash64 remains incompatible.
+`PREFIX_MATCH_UNIT` remains empty by default so vLLM resolves the hash grain.
+The participating-group capability check can now enable existing fine-grained
+machinery without a configuration change. A smaller hash grain does not create
+missing state checkpoints or waive a participating drafter's compatibility
+requirements. Compact draft pages and their verified boundary lookup remain
+controlled by `GLM53_DRAFT_KV_COMPACT`; they are not enabled by the loader.
 
-`PREFIX_MATCH_UNIT` remains **empty by default**, letting vLLM resolve the hash
-grain. Explicit `PREFIX_MATCH_UNIT=64` is supported for the tested geometry and
-forwarded by TP2/TP3/TP4; 512 is invalid because the participating drafter SWA
-block is 64, not because of a KDA64 block. The fixes can
-activate the already-present fine-grained machinery when its conditions are met,
-even without changing the empty default. A smaller hash grain is not a promise
-that every boundary is stored or reusable.
+If a partial target hit lacks a complete reusable drafter window, lookup retries
+the preceding shared checkpoint before discarding a full replay window. Every
+target group and the draft window are rechecked. Kpool scratch conservatively
+requires four fresh prompt tokens even when the draft window is retained.
+This floor is not kernel-proven necessary; with coarse-only hits, a one-to-three
+token suffix can consequently lose a whole shared cache page.
 
-Replay safety still limits a hit. If a fine target state cannot supply the
-required complete DFlash/EAGLE draft window, lookup first retries the preceding
-shared scheduler checkpoint, rechecking all participating target groups and
-draft-window coverage, before the larger replay backoff. It never treats an
-incomplete or ordinary undropped draft window as reusable. The request-local
-Kpool scratch conservatively retains **four fresh prompt tokens**; a fine hit
-cannot consume that tail, and draft replay may require more fresh tokens.
-Its necessity remains unverified against the indexer kernel, so the safety
-floor is not relaxed. With fine hits disabled (for example DCP > 1 or an
-incompatible participating SWA128 group), a query ending one to three tokens
-past a scheduler boundary can lose a whole 3584-token cache page to this floor.
+With compact 896-token draft pages and 3584-token shared checkpoints, draft
+retention still follows the shared checkpoint grid. A short-suffix warm request
+can therefore fall back to a full checkpoint even when a finer target entry
+exists. Appending a fresh 2048-token window can make that finer target entry
+usable without a retained draft window; a warm hit alone does not prove this
+path was exercised.
 
-Existing SWA retention and `GLM53_APC_RETENTION_INTERVAL_SWA` behavior are retained,
-not widened to every hash64 boundary. Some fine target states therefore still
-need a full fresh draft replay window or an older valid coarse hit. CPU fixtures
-exercise these boundaries, actual partial-entry/allocator metadata, and no-store
-composition. They do **not** compute GPU state values or model outputs, and do not
-establish GPU copy-on-write/state/logit parity, TTFT, or distributed serving safety.
-
-#### Reproduce the pinned-source CPU probe
-
-Run from this checkout with Python and Docker available. Choose a **new absolute
-directory outside the repository** for `SNAPSHOT`; keep its source, manifest and
-result JSON outside git. Extract the pristine **Dockerfile base-image digest**,
-not a mutable tag, installed runtime or already-patched serving container.
-The container below is created only for `docker cp` and is never started:
-
-```bash
-(
-    set -eu
-    SNAPSHOT=/absolute/path/outside-the-checkout/apc-snapshot
-    test ! -e "$SNAPSHOT"
-    mkdir -p "$SNAPSHOT/vllm"
-    IMAGE="$(sed -n 's/^ARG BASE=//p' Dockerfile)"
-    case "$IMAGE" in *@sha256:*) ;; *) echo "Dockerfile base must be digest-pinned" >&2; exit 1 ;; esac
-    docker pull "$IMAGE"
-    CID="$(docker create "$IMAGE")"
-    trap 'docker rm "$CID" >/dev/null' EXIT
-    docker cp "$CID:/usr/local/lib/python3.12/dist-packages/vllm/." "$SNAPSHOT/vllm/"
-    docker rm "$CID" >/dev/null
-    trap - EXIT
-
-    python3 - "$SNAPSHOT" "$IMAGE" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-snapshot = Path(sys.argv[1])
-source = snapshot / "vllm"
-files = {
-    path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-    for path in sorted(source.rglob("*.py"))
-}
-if not files:
-    raise SystemExit("No Python sources extracted")
-(snapshot / "manifest.json").write_text(
-    json.dumps({"image": sys.argv[2], "files": files}, indent=2) + "\n"
-)
-PY
-    python3 tests/probe_apc_pinned_cpu.py \
-        --source-root "$SNAPSHOT/vllm" \
-        --manifest "$SNAPSHOT/manifest.json" \
-        --output "$SNAPSHOT/result.json"
-)
-```
-
-The manifest covers every extracted Python source. The probe checks the image
-against its explicit pin and the Dockerfile, verifies the recorded file hashes,
-and applies the overlay composition to temporary copies. Keep the original
-snapshot and manifest unchanged; do not regenerate hashes to bless edited inputs.
-Only `--source-root`, `--manifest` and `--output` are probe options; acquisition
-and manifest creation above are separate Docker/stdlib steps. Do not use Python
-`-O`, which disables upstream assertions. Exit status is `0` for passed contracts,
-`1` for an observed defect/contract failure, and `2` for a harness error; inspect
-the JSON's checks, observations, defects, errors and limitations, not a check count
-alone. GPU qualification remains outstanding.
+`tests/probe_apc_pinned_cpu.py` checks recorded source hashes and runs the
+combined patch chain on temporary copies. Supply `--source-root`, its original
+`--manifest`, and an external `--output` JSON path. Do not regenerate a manifest
+to accept modified inputs. CPU state/allocator checks are not GPU state-value,
+copy-on-write, output-parity or distributed-serving qualification.
 
 ## API surface notes (this build, 2026-08-29)
 
@@ -996,50 +935,44 @@ before selecting a policy or a cache budget for another kit.
 
 ## Auto safetensors staging and read-ahead
 
-`LOAD_FORMAT=` selects vLLM auto without changing the launcher's default loader.
-On TP=2, TP=3 and TP=4, the auto/lazy safetensors iterator stages mmap tensors
-into anonymous CPU memory before yielding them (`GLM53_LOAD_CLONE=1`, default).
-Optional local shard read-ahead is off by default (`GLM53_LOAD_PREFETCH=0`).
-To enable a six-shard window, choose **one** command for your existing topology:
+`LOAD_FORMAT=` selects vLLM auto; it does not change the launcher's default
+loader. On TP2/TP3/TP4, `GLM53_LOAD_CLONE=1` stages auto/lazy mmap tensors
+into independent CPU storage before yielding them. `GLM53_LOAD_PREFETCH=0`
+leaves additional local-shard read-ahead off. Clone accepts exactly `0` or
+`1`; prefetch accepts decimal `0..16`, normalizing leading zeros. Empty or
+malformed values are rejected before restart stops ranks. Exported values
+override topology env files and are forwarded to every rank.
 
-```bash
-LOAD_FORMAT= GLM53_LOAD_PREFETCH=6 ./start.sh restart
-LOAD_FORMAT= GLM53_LOAD_PREFETCH=6 ./start-tp3.sh restart
-LOAD_FORMAT= GLM53_LOAD_PREFETCH=6 ./start-tp4.sh restart
-```
+Read-ahead includes the current shard in its bounded window. Each worker
+uses a reusable 1 MiB buffer; tensor staging needs an additional tensor-sized
+allocation. The window is **not a bound on host RAM or OS page-cache residency**.
+For local auto/lazy loading, completed shards receive read-only
+`POSIX_FADV_DONTNEED` advice after the next shard's first tensor replaces the
+iterator's mmap reference. Close releases iterator references, joins readers,
+and retries advice for consumed shards. This also applies with read-ahead off;
+cloning alone does not release file-cache pages. Advice does not modify weights
+or invalidate consumer tensors. Unsupported or failed advice is logged once
+and disabled; live mappings and other readers can still keep pages resident.
+Keep read-ahead at zero until measured headroom supports a larger window:
+shards and transient tensors can each occupy gigabytes.
+Recognized NFS/NFS4/Lustre filesystems retain stock prefetch behavior; unknown
+filesystem types are treated as local. Explicit eager, torchao and prefetch
+strategies retain stock loading apart from non-4KiB mmap safety staging.
+InstantTensor and the separately selected multithread loader are unchanged.
 
-Keep your existing context, memory-utilization and topology-specific KV settings;
-these commands do not size or guarantee a KV pool. Exported controls, including
-`LOAD_FORMAT=`, override the shared and topology env files. Clone accepts exactly
-`0` or `1`; prefetch accepts decimal `0..16`, with leading zeros normalized.
-An explicitly empty clone/prefetch value is rejected before restart stops ranks.
+`GLM53_LOAD_CLONE=0` disables optional staging, not non-4KiB safety. The patch
+composes with PR230's mmap staging without cloning twice or importing its
+InstantTensor budget changes. TP3 uses the same generated loader implementation
+and rejects a stale vendored loader before restart. Closing the iterator cancels
+queued reads and joins workers; a kernel-blocked read cannot be interrupted.
+The v2 installer rejects a v1-patched loader instead of stacking implementations;
+use the pinned pristine loader when rebuilding or regenerating the TP3 vendor.
 
-The window includes the **current** shard, not that many additional shards.
-Each active reader uses a reusable 1 MiB buffer; staging also needs a transient
-tensor-sized anonymous allocation. Read-ahead populates reclaimable OS page cache:
-the shard bound is **not** a hard bound on total cache residency or host RAM.
-`GLM53_LOAD_PREFETCH=0` disables only this added reader. Recognized NFS, NFS4 and
-Lustre filesystems retain their stock prefetch policy; unknown filesystem types
-are treated as local. Explicit `eager`, `torchao` and `prefetch` strategies retain
-stock loading, apart from the existing non-4KiB mmap safety requirement.
-InstantTensor and the separately selected multithread loader are untouched;
-a draft that falls back to the auto/lazy iterator can use these controls.
-
-`GLM53_LOAD_CLONE=0` disables optional staging, not non-4KiB safety staging.
-The patch composes with PR #230's mmap staging at
-`bc97cbf1d5ab06df778b79b99efa92997bb4f153` without cloning twice or importing
-its separate InstantTensor/UMA budget changes. CPU probes pass both patch orders
-and repeated application. TP3's read-only vendored loader is generated by the same
-overlay; a stale custom `TP3_OVERLAY_HOST` is rejected before restart.
-
-Closing the iterator cancels queued reads and joins its workers. Cancellation is
-checked between reads; Python cannot interrupt a kernel-blocked read. Consumers
-retaining a partially consumed generator must explicitly close it.
-CPU tests verify exact tensor bytes, dtype/shape, auto/lazy yield order, error
-propagation and cleanup. They do **not** establish a GPU boot-speed, KV-capacity
-or model-quality result for this port.
-
-Motivated by [Alexbob0's mmap-load measurements at `bc3891a`](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md); this port uses a bounded, joined read-ahead window.
+The loader port is motivated by
+[Alexbob0's mmap-load measurements](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md).
+Those measurements and earlier unstaged-auto results do not qualify this
+combined candidate's GPU startup time, usable KV pool or model outputs.
+Keep context, memory-utilization and KV settings fixed when comparing loaders.
 
 ## InstantTensor and KV memory
 
@@ -1522,8 +1455,8 @@ that are now documented/enforced:
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Existing kits must pull this tag — `git pull` does not replace a leftover `:exl3` or `SKIP_PULL=1` ([Existing installs](#existing-installs-pull-the-instanttensor-image)). Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3` |
 | `LOAD_FORMAT` | `instanttensor` when `IMAGE` contains `instanttensor`; else empty | `--load-format`. Direct-I/O safetensors. Explicit empty (`LOAD_FORMAT=`) restores vLLM auto. Required empty on the wheel-less `:exl3` tag |
-| `GLM53_LOAD_CLONE` | `1` | auto/lazy safetensors mmap staging on TP2/TP3/TP4; exact `0`/`1`. `0` disables optional staging, not non-4KiB safety. [Loader scope and limits](#auto-safetensors-staging-and-read-ahead) |
-| `GLM53_LOAD_PREFETCH` | `0` | optional auto/lazy local-shard read-ahead on all three topologies; decimal `0..16`, including current shard. Empty is invalid; `0` preserves stock prefetch policy without adding readers |
+| `GLM53_LOAD_CLONE` | `1` | Auto/lazy safetensors staging; exact `0`/`1`. Disabling it does not disable non-4KiB safety. [Scope](#auto-safetensors-staging-and-read-ahead) |
+| `GLM53_LOAD_PREFETCH` | `0` | Additional local-shard read-ahead on TP2/TP3/TP4; decimal `0..16`, including the current shard. Not a host-memory limit |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
@@ -1557,6 +1490,7 @@ that are now documented/enforced:
 | `GPU_MEM_UTIL` | `0.85` | GB10 UMA budget (default lowered from 0.87 on 2026-09-07: each 0.01 is 1.2 GiB of host headroom, and long prefills need it — see *Cold prefill (E3)*). E3 at 900k / 0.85: pool ~1.05M tokens / 1.17× (0.87: 16.2 GiB / 1,051,648 tokens). Pre-E3 receipts at 1M / 0.87: 1,754,237 tokens / 18.67 GiB (MNBT 2048); 1,243,902 tokens / 1.24× (7168, rightsize, E2) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` when unset | TP=2 `start.sh` passes the effective value to both ranks. An explicit empty value disables this option; caller exports, including empty, override `.env`. Changing allocator settings requires a restart and separate memory/connector qualification; TP=4 is unchanged |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
+| `PREFIX_MATCH_UNIT` | *(empty)* | Let vLLM resolve the prefix hash grain. Explicit values must fit participating groups, including compact drafter pages; they do not change the scheduler LCM |
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
 | `PREFIX_MATCH_UNIT` | *(empty)* | let vLLM resolve the prefix hash grain. Explicit `64` is supported for the tested hybrid geometry on TP2/TP3/TP4; it does not force fine hits without valid target state and draft/scratch replay. `512` is invalid here. See [alignment and replay](#fine-grained-hybrid-apc-alignment-and-replay) |
 | `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | DFlash2 drafter retention on TP=2/3/4. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
@@ -1572,7 +1506,7 @@ that are now documented/enforced:
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_DEFAULT_REASONING_EFFORT` | *(empty)* | `low` / `high` / `max` via `--default-chat-template-kwargs` on both ranks. Empty sends no flag, so omitted effort renders Max. Per-request `chat_template_kwargs.reasoning_effort` overrides the default; `medium` is rejected because the template maps it to Max |
 | `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
-| `GLM53_DRAFT_KV_COMPACT` | `0` | Experimental geometry-derived DFlash2 cache blocks; no additional quantization. Reduces shared block-ID demand, not allocated tensor bytes. Requires an unsplit padded page. TP=2 qualification is in [compact draft pages](#experimental-compact-dflash2-cache-pages). A 2026-09-23 TP=3 boot selected the derived 640-token page and boundary lookup; tensor-level parity and TP=4 GPU remain unqualified. `.env.tp3.example` ships the flag commented |
+| `GLM53_DRAFT_KV_COMPACT` | `1` when `SPEC_METHOD=dflash` (the default), `0` otherwise (default since 2026-09-23; was `0` everywhere). Applies only when unset: explicit `0` opts out, explicit empty is rejected | Experimental geometry-derived DFlash2 cache blocks; no additional quantization. Reduces shared block-ID demand, not allocated tensor bytes. Requires an unsplit padded page; CPU-verified only. A 2026-09-23 TP=3 boot selected the derived 640-token page and boundary lookup; tensor-level parity and TP=4 GPU remain unqualified. `.env.tp3.example` ships the flag commented. See [compact draft pages](#experimental-compact-dflash2-cache-pages) |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
 | `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal) |
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
@@ -1633,9 +1567,9 @@ request then:
 Server-log receipts (each once per process): `[glm53-apc-no-store] first request resolved
 skip_writing_prefix_cache=1` (the flag reached the engine) and `[glm53-apc-no-store] suppressing
 prefix-cache store (full site)` / `(partial site)` (a store was actually cut; the partial site needs the
-runtime's fine-grained partial-tail producer, which can now be enabled when
-participating-group capabilities and replay requirements permit it — see
-[alignment and replay](#fine-grained-hybrid-apc-alignment-and-replay)). If the first line never appears, the flag did not reach the
+runtime's fine-grained partial-tail producer, enabled only when participating
+groups and replay coverage permit it — see [alignment and replay](#fine-grained-hybrid-apc-alignment-and-replay)).
+If the first line never appears, the flag did not reach the
 engine — do not trust an A/B measured without it. Not covered:
 KV connectors / CPU offload (none on this kit), pooling requests. Kill switch: `GLM53_APC_NO_STORE=0`.
 Design + receipts protocol: `docs/DESIGN-apc-no-store.md`.
@@ -1681,6 +1615,10 @@ reported as unmodelled and the capacity is withheld rather than guessed, as it i
 are rescaled per rank there). The alignment is the lcm of the group block sizes (the coordinator's scheduler
 block). The figure is an upper bound: a running request holds its own blocks, and PR #83's per-group retention
 lowers the drafter's cost to boundary tails only (not modelled here — the summary states its assumption).
+Fine-grained Mamba tails add cached copy-on-write state that this block-aligned
+model excludes. Four Mamba groups can retain four extra pool IDs per conversation
+with a non-shared-checkpoint tail. Treat the summary as the stated upper bound,
+not a measured fine-hit conversation capacity.
 
 The numbers move with the boot, the arithmetic does not: the figures elsewhere in this README (690 blocks /
 1,754,237 tokens / 1.75× at 1M) are the same quantity on the reference kit's boot (690 / 1.75 ≈ 394 ids per
