@@ -11,13 +11,23 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- Auto/lazy safetensors staging (`GLM53_LOAD_CLONE=1`) and optional bounded
+  local-shard read-ahead (`GLM53_LOAD_PREFETCH=0`, decimal `0..16`) on TP2/TP3/TP4.
+  Preserve InstantTensor selection, rank parity, PR230 safety and compact-draft
+  settings. The shard window is not a host-memory limit; GPU loader performance
+  and KV-capacity gains are not established for this combined candidate.
+  Motivated by [Alexbob0's mmap-load measurements](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md).
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not
   sourced automatically; defaults are unchanged.
-- Experimental compact DFlash2 KV pages (`GLM53_DRAFT_KV_COMPACT`, default
-  `0`): derive a page-fitting divisor of the MLA block to reduce draft
-  block-ID demand without changing precision or backing allocations.
+- Compact DFlash2 KV pages (`GLM53_DRAFT_KV_COMPACT`): derive a
+  page-fitting divisor of the MLA block to reduce draft block-ID demand
+  without changing precision or backing allocations. Now ON by default under
+  `SPEC_METHOD=dflash` (the default method) and OFF otherwise, so
+  `SPEC_METHOD=mtp`/`none` is unaffected; the default applies only when the
+  variable is unset — an explicit `0` opts out and an explicitly empty value
+  is rejected at launch (was: default `0` everywhere).
   Reject padded-page kernel splitting during backend setup. DFlash-only:
   an allocator preflight on every grouping path verifies the method and
   matching draft-layer count before exact-fit or padded selection.
@@ -107,6 +117,27 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Changed
 
+- Correct hybrid APC checkpoint alignment to use the resolved scheduler LCM
+  (3584 in the tested layout), rather than the minimum group's 64-token size,
+  while retaining bounded small-step progress and the hash-grain prompt tail.
+  Apply the scheduler EAGLE backoff only when a participating non-SWA group
+  needs it: SWA-only drafting preserves the last full target checkpoint under
+  production 7168-token grants; no-SWA MTP retains upstream behavior. The
+  extra prefill step versus improved short-suffix hits has unmeasured GPU cost.
+- Limit the partial-hit capability veto to prefix-participating groups:
+  nonparticipating KpoolTail scratch no longer blocks compatible target states.
+  No unsafe SWA exemption is introduced; incompatible participating SWA still vetoes.
+  Preserve a reusable preceding coarse checkpoint before larger draft replay
+  backoff, require four fresh prompt tokens for Kpool scratch, and retain SWA
+  retention policy. `PREFIX_MATCH_UNIT` stays empty by default; explicit `64` is
+  supported for the tested geometry. CPU real-function metadata/composition
+  checks are not GPU state/logit parity or TTFT measurements; GPU qualification
+  remains outstanding. Reproduction uses the Dockerfile-pinned source probe
+  described in [README](README.md#reproduce-the-pinned-source-cpu-probe).
+  The four-token Kpool replay floor remains conservative and kernel-unverified;
+  coarse-only lookup can lose a whole page within three tokens of a boundary.
+- TP3/TP4 now preserve an explicitly exported `LOAD_FORMAT=` through shared and
+  topology env files, so callers can select auto without changing loader defaults.
 - Repinned the cooperative-MoE profile generators' `overlay/exl3.py` digest
   (`extensions/cooperative_moe/prepare_profile.py` and
   `extensions/cooperative_moe/tp3/prepare_profile.py`) after reviewing the
@@ -141,15 +172,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   `MambaSpec.max_memory_usage_bytes`
   reserves `1 + max_concurrent_batches + num_speculative_blocks` pages in
   align mode (10 here, was 9), matching the resident peak.
-- `overlay/patch_mamba_align_chunking.py`: align prefill chunks to the Mamba
-  groups' block instead of `cache_config.block_size`, which the drafter
-  group drags down to its page (64, or the compact page). Off-block chunk
-  ends could hash a running state under the next boundary's label and miss
-  valid checkpoints (stock diagnostic: tails 2047, 2048, 2049 and 3583 behind
-  a 28,672-token prefix hit 25,088 while the target cached 28,672).
-  The one-block EAGLE back-off applies only when full attention is an EAGLE
-  group. Sub-block budgets keep advancing; with a 7168-token budget the
-  aligned chunk is one Mamba block. Requires decode-floor v5.
+- `overlay/patch_mamba_align_chunking.py` is the sole owner of Mamba checkpoint
+  alignment and EAGLE back-off. Use the resolved scheduler LCM rather than the
+  drafter's smaller page, preserve smaller private Mamba state boundaries, and
+  let positive sub-page grants progress without changing decode-floor policy.
+  Back off only for participating non-SWA EAGLE groups. Migrate the retained
+  alignment overlay without stacking a second scheduler implementation.
+- Exclude nonparticipating scratch groups from fine-hit capability checks.
+  Preserve compact DFlash boundary lookup while reserving four fresh Kpool
+  tokens and retrying the preceding shared checkpoint when a partial target
+  hit lacks a reusable drafter window. Existing PR238 GPU receipts below do
+  not qualify these additional fine-grained APC changes.
 - Under `GLM53_DRAFT_KV_COMPACT=1`, the DFlash drafter manager drops the
   extra EAGLE lookahead block from each retained window; the KV-capacity
   log costs the boundary lookup accordingly (`lookup=boundary`). The
