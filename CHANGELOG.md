@@ -184,7 +184,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
   `487ecf187` still uses a dense 2048 B stride in `_kpool_tail_seed_kernel`.
   This is separate from `patch_kpool_tail_slotmap.py` (block-table row clamp).
-  Issue #264.
+  An unmarked file counts as already fixed upstream only when every seed
+  launch passes the tail tensor's real strides; a half-fixed file fails the
+  boot. Dependency-gated tests now report as skipped, not passed
+  (`GLM53_REQUIRE_KERNEL_TESTS=1` makes them required). Issue #264.
+- `README.md`: the Context row's KV pool is the measured 1,572,073 tokens at
+  the 850k default (14 GiB reservation, compact draft KV), not "~1M".
 - `start.sh`, `start-tp3.sh`, and `start-tp4.sh`: a GHCR pull could replace a
   local image whose recipe stamp already matched the repo, then launch the
   published image (no locally compiled artifacts; `GLM53_EXL3_MOE_FAST=1`

@@ -41,6 +41,7 @@ Fail-closed, idempotent, preflights the pinned anchor before writing.
 """
 from __future__ import annotations
 
+import ast
 import os
 import stat
 import sys
@@ -286,10 +287,71 @@ def view_row(
     return list(backing[base : base + head_dim])
 
 
+def _is_stride_of(node: ast.expr, dim: int) -> str | None:
+    """Return ``X`` when ``node`` is ``X.stride(dim)`` on a plain name."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "stride"
+        and isinstance(node.func.value, ast.Name)
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == dim
+    ):
+        return node.func.value.id
+    return None
+
+
+def seed_launch_passes_strides(text: str) -> bool:
+    """True when the seed kernel takes both stride constexprs and every launch
+    passes them as ``tail.stride(0)`` / ``tail.stride(1)`` of one tensor
+    argument of the launching function (the other half of vLLM #57477)."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+    kernels = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_kpool_tail_seed_kernel"
+    ]
+    if len(kernels) != 1:
+        return False
+    params = {a.arg for a in kernels[0].args.args}
+    if not {"TAIL_BLOCK_ELEMS", "KPOOL_HEAD"} <= params:
+        return False
+    launches = 0
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef) or fn is kernels[0]:
+            continue
+        fn_args = {a.arg for a in fn.args.args}
+        for call in ast.walk(fn):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Subscript)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "_kpool_tail_seed_kernel"
+            ):
+                continue
+            launches += 1
+            kw = {k.arg: k.value for k in call.keywords}
+            if "TAIL_BLOCK_ELEMS" not in kw or "KPOOL_HEAD" not in kw:
+                return False
+            t0 = _is_stride_of(kw["TAIL_BLOCK_ELEMS"], 0)
+            t1 = _is_stride_of(kw["KPOOL_HEAD"], 1)
+            if t0 is None or t0 != t1 or t0 not in fn_args:
+                return False
+    return launches >= 1
+
+
 def seed_kernel_fixed(text: str) -> bool:
-    """True when the prefill seed uses the padded stride (marker optional)."""
+    """True when the prefill seed uses the padded stride (marker optional):
+    the kernel body addresses blocks through both strides and every launch
+    supplies them from the tail tensor's real strides."""
     return (
-        text.count(FIXED_BASE) == 1
+        seed_launch_passes_strides(text)
+        and text.count(FIXED_BASE) == 1
         and text.count(FIXED_SCORE) == 1
         and DENSE_BASE not in text
         and "assert tail_kv_cache.ndim == 4 and tail_kv_cache.shape[1] == 2\n" in text

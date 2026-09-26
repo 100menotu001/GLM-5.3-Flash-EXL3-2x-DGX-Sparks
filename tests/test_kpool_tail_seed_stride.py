@@ -45,6 +45,7 @@ from patch_kpool_tail_seed_stride import (  # noqa: E402
     padded_k_element,
     prepare,
     seed_kernel_fixed,
+    seed_launch_passes_strides,
     verified_state,
     view_row,
 )
@@ -54,8 +55,26 @@ from patch_kpool_tail_slotmap import (  # noqa: E402
 )
 from patch_kpool_tail_seed_stride import TARGET as SEED_TARGET  # noqa: E402
 
-def _pin_fixture() -> Path:
-    name = "kpool_tail_seed_kernel-487ecf187.py.txt"
+PIN_FIXTURE = "kpool_tail_seed_kernel-487ecf187.py.txt"
+# The seed kernel + launcher from vLLM db1bfdd4fb0d (the #57477 merge), for the
+# genuine already-upstream positive control.
+UPSTREAM_FIXTURE = "kpool_tail_seed_kernel-db1bfdd.py.txt"
+
+
+def _skip(reason: str, *, kernel: bool = True) -> None:
+    """Report a skip as a skip under pytest, a printed line when run directly.
+    GLM53_REQUIRE_KERNEL_TESTS=1 turns a kernel/installed-source skip into a
+    failure (the checkout-only wiring check is never required)."""
+    if kernel and os.environ.get("GLM53_REQUIRE_KERNEL_TESTS") == "1":
+        raise AssertionError(f"required test could not run: {reason}")
+    if "pytest" in sys.modules:
+        import pytest
+
+        pytest.skip(reason)
+    print(f"skip {reason}")
+
+
+def _pin_fixture(name: str = PIN_FIXTURE) -> Path:
     for candidate in (
         ROOT / "tests" / "fixtures" / name,
         HERE / "fixtures" / name,
@@ -63,7 +82,7 @@ def _pin_fixture() -> Path:
     ):
         if candidate.is_file():
             return candidate
-    raise AssertionError(f"pinned seed-kernel fixture {name} missing")
+    raise AssertionError(f"seed-kernel fixture {name} missing")
 INSTALLED = Path(
     "/usr/local/lib/python3.12/dist-packages/vllm/"
     "models/glm5next/nvidia/ops/kpool_compress.py"
@@ -260,7 +279,7 @@ def test_patched_kernel_under_triton_interpreter() -> None:
     and this recipe's stride. Needs torch and triton (the image has both);
     skipped on hosts without them."""
     if not _triton_interpreter_available():
-        print("skip test_patched_kernel_under_triton_interpreter (no torch/triton)")
+        _skip("test_patched_kernel_under_triton_interpreter (no torch/triton)")
         return
     import json
     import subprocess
@@ -313,6 +332,57 @@ def test_already_upstream_without_marker() -> None:
     assert again == upstream
 
 
+def test_genuine_upstream_fixture_is_already_upstream() -> None:
+    upstream = _module(_pin_fixture(UPSTREAM_FIXTURE).read_text())
+    assert MARK not in upstream
+    assert seed_launch_passes_strides(upstream)
+    again, action = prepare(upstream)
+    assert action == "already upstream"
+    assert again == upstream
+
+
+LAUNCH_STRIDES = (
+    "        TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),\n"
+    "        KPOOL_HEAD=tail_kv_cache.stride(1),\n"
+)
+
+
+def test_half_fixed_upstream_is_rejected() -> None:
+    """An unmarked file whose kernel body looks fixed but whose launch does
+    not pass both real strides must not be reported "already upstream"."""
+    upstream = _module(_pin_fixture(UPSTREAM_FIXTURE).read_text())
+    assert upstream.count(LAUNCH_STRIDES) == 1
+    broken = {
+        "strides dropped": upstream.replace(LAUNCH_STRIDES, ""),
+        "dense block stride": upstream.replace(
+            "TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0)",
+            "TAIL_BLOCK_ELEMS=2 * kpool * head_dim",
+        ),
+        "zero plane stride": upstream.replace(
+            "KPOOL_HEAD=tail_kv_cache.stride(1)", "KPOOL_HEAD=0"
+        ),
+        "swapped dims": upstream.replace(
+            LAUNCH_STRIDES,
+            "        TAIL_BLOCK_ELEMS=tail_kv_cache.stride(1),\n"
+            "        KPOOL_HEAD=tail_kv_cache.stride(0),\n",
+        ),
+        "strides of another tensor": upstream.replace(
+            "KPOOL_HEAD=tail_kv_cache.stride(1)", "KPOOL_HEAD=key.stride(1)"
+        ),
+    }
+    for label, text in broken.items():
+        assert text != upstream, label
+        assert not seed_launch_passes_strides(text), label
+        assert not seed_kernel_fixed(text), label
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "kpool_compress.py"
+            target.write_text(text)
+            result = _run_patch(target)
+            assert result.returncode != 0, (label, result.stdout)
+            assert "preflight failed" in result.stderr, label
+            assert target.read_text() == text, label
+
+
 def test_fail_closed() -> None:
     drifted = _module(ANCHOR).replace(
         "base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM",
@@ -340,6 +410,7 @@ def test_fail_closed() -> None:
 def test_installed_copy_if_present() -> None:
     src = Path(os.environ.get("GLM53_KPOOL_COMPRESS_PY_SRC", INSTALLED))
     if not src.is_file():
+        _skip(f"test_installed_copy_if_present (no installed {src})")
         return
     with tempfile.TemporaryDirectory() as raw:
         target = Path(raw) / "kpool_compress.py"
@@ -355,6 +426,7 @@ def test_recipe_wiring_if_present() -> None:
     start = ROOT / "start.sh"
     dockerfile = ROOT / "Dockerfile"
     if not start.is_file() or not dockerfile.is_file():
+        _skip("test_recipe_wiring_if_present (no recipe checkout)", kernel=False)
         return
     launcher = start.read_text()
     image = dockerfile.read_text()
@@ -399,6 +471,8 @@ def main() -> int:
     test_patched_kernel_under_triton_interpreter()
     test_fixture_apply_idempotent()
     test_already_upstream_without_marker()
+    test_genuine_upstream_fixture_is_already_upstream()
+    test_half_fixed_upstream_is_rejected()
     test_fail_closed()
     test_installed_copy_if_present()
     test_recipe_wiring_if_present()

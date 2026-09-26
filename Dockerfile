@@ -473,6 +473,7 @@ COPY tests/test_mamba_align_chunking.py /opt/glm53/test_mamba_align_chunking.py
 COPY tests/test_kpool_tail_slotmap.py /opt/glm53/test_kpool_tail_slotmap.py
 COPY tests/test_kpool_tail_seed_stride.py /opt/glm53/test_kpool_tail_seed_stride.py
 COPY tests/fixtures/kpool_tail_seed_kernel-487ecf187.py.txt /opt/glm53/fixtures/kpool_tail_seed_kernel-487ecf187.py.txt
+COPY tests/fixtures/kpool_tail_seed_kernel-db1bfdd.py.txt /opt/glm53/fixtures/kpool_tail_seed_kernel-db1bfdd.py.txt
 COPY overlay/patch_spinwait.py /opt/glm53/patch_spinwait.py
 COPY tests/test_spinwait_patch.py /opt/glm53/test_spinwait_patch.py
 COPY overlay/patch_indexer_workspace.py /opt/glm53/patch_indexer_workspace.py
