@@ -1367,8 +1367,33 @@ curl -s http://127.0.0.1:8888/v1/chat/completions \
 
 Thinking defaults on. Disable it with the **top-level** JSON field
 `"chat_template_kwargs": {"enable_thinking": false}`. This closes the empty
-thinking block in the generation prompt. The `Reasoning Effort:` line itself
-renders unconditionally since #63 (prefix-cache stability), thinking on or off.
+thinking block in the generation prompt. The `Reasoning Effort:` system line
+renders only while thinking is on (`files/chat_template.jinja:8`), so switching
+thinking on or off within a conversation changes the prompt prefix.
+
+**Prefer low-effort thinking to thinking off for long structured output.**
+With thinking off, long answers with numeric tables can come back corrupted:
+CJK text or stray English words inside numbers and table separator rows,
+sometimes looping until `max_tokens` ([#257](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/issues/257)).
+In a local 2× GB10 replay of a synthetic ~5k-token Polish table-recompute
+conversation (24 requests, arms interleaved in random order, 6,000-token cap),
+thinking off garbled 11 of 12 answers (5/6 at temperature 1.0, 6/6 at
+temperature 0), and only 49–73 % of the 792 expected table numbers per arm
+came back correct. With `"chat_template_kwargs": {"enable_thinking": true,
+"reasoning_effort": "low"}`, 0 of 6 answers were garbled and 791 of 792 numbers
+were correct, at a similar median time (74 s against 72–115 s). Sending
+`reasoning_effort: "low"` with `enable_thinking: false` behaved like thinking
+off (5 of 6 garbled). These are workload-specific observations, not a guarantee
+of correctness, response length, or latency.
+
+**Low effort does not undo thinking off.** Remove an existing explicit
+`enable_thinking: false` (or `thinking: false`), or send the explicit
+thinking-on request above. Avoid disabling thinking server-wide through
+`--default-chat-template-kwargs` in `EXTRA_ARGS`; remove that override first.
+To request low effort by default, set `GLM53_DEFAULT_REASONING_EFFORT=low`
+and restart the deployment. This knob only supplies a default effort level;
+it does not override a client's explicit thinking-off setting or cap reasoning
+tokens.
 
 Do not send a literal nested `extra_body` object over raw HTTP; `extra_body` is
 an OpenAI Python SDK option that merges its contents into the top-level request.
@@ -1384,7 +1409,7 @@ template reads. None of them need a restart, and none are enforced by
 
 | Field | Send | Why |
 |---|---|---|
-| `reasoning_effort` | `high` for reasoning work | Unset = **Max** (`files/chat_template.jinja:7`); `low` is the model card's lightest simple-Q&A mode. Keep it constant per route — see below |
+| `reasoning_effort` | `high` for reasoning work; `low` with thinking enabled for long numeric tables | With no request or server effort supplied, the template falls back to **Max** (`files/chat_template.jinja:7`). `low` reduced the tested corruption in the #257 replay; it does not override an explicit thinking-off flag. Keep it constant per route — see below |
 | `max_tokens` | ≥ `32768` with thinking on | Max-effort reasoning runs well past 8k output tokens. Too small a cap truncates mid-thought and the reply comes back with empty `content` |
 | `chat_template_kwargs.clear_thinking` | `true` for multi-turn agents | Replaces earlier turns' reasoning with `<think></think>` (`chat_template.jinja:154`), keeping the current tool-call chain. Cuts context, not answer quality |
 | `top_p` / `temperature` | leave unset | `generation_config.json` already supplies `0.95` / `1.0`; the boot log prints the override line. Sending `top_p=1.0` explicitly overrides that and is worse |
@@ -1502,6 +1527,7 @@ that are now documented/enforced:
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
 | `PREFIX_MATCH_UNIT` | *(empty)* | let vLLM resolve the prefix hash grain. Explicit `64` is supported for the tested hybrid geometry on TP2/TP3/TP4; it does not force fine hits without valid target state and draft/scratch replay. `512` is invalid here. See [alignment and replay](#fine-grained-hybrid-apc-alignment-and-replay) |
 | `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | DFlash2 drafter retention on TP=2/3/4. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
+| `GLM53_HOST_MEM_HYGIENE` | `1` | drop clean page cache on both nodes right before `docker run`, then wait for `MemAvailable` to clear `GPU_MEM_UTIL` × total — the number vLLM's startup check reads on integrated GPUs (`sudo -n`; warns and skips the wait without it). On GB10 UMA the page cache is "used" CUDA memory: a full cache after the 164 GiB rsync made InstantTensor abort (`buffer_size … exceeds device memory budget`) or crawl at a double-digit `io_depth`. Pairs with `overlay/patch_cold_load_uma.py` (in-container budget + 64 KiB mmap staging; runtime kill switches `GLM53_COLD_LOAD_UMA=0` / `GLM53_COLD_LOAD_STAGE_MMAP=0`, forwarded to both ranks when set; no-op on 4 KiB kernels / discrete GPUs). See [docs/cold-load-uma.md](docs/cold-load-uma.md) |
 | `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_MIXED_PREFILL_CHUNK` | `fair` (`start.sh`, `start-tp3.sh`, `start-tp4.sh`, `.env.example`, `.env.tp3.example`, `.env.tp4.example`) | Mixed-prefill policy while a peer decodes. **`skip` starves prefills until decode ends** (the reported multi-minute newcomer freeze). `N>0` caps mixed chunks with hybrid alignment support; `0`/`off` disables isolation (admits newcomers in ~1 s but collapses the incumbent 10–36× on TP=2). `fair` v5 allocates decodes first, charges only prefill that contends with a decoder, fits a fixed-plus-per-token step cost, runs the largest chunk that fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, and gives a newcomer one prompt probe. Measured on TP=2 (reporter recipe, thinking essay at ~24 tok/s): 2k newcomer first token ~12 s, 30k newcomer ~164 s while the essay still streams, incumbent keeps ~80–90% of its in-run rate. TP=3 same recipe: 2k in 8.7 s, 30k in 110 s, both during the essay, incumbent ~83–87%. TP=4 inherits the same default; that topology was not re-measured. See [receipts](docs/diditfix.md) and [design](docs/astra-fix.md). |
@@ -1652,6 +1678,8 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/exl3_fat_gemm.cu` | additive `exl3_fat_gemm` / `_scatter` compiled into `exllamav3_ext` |
 | `overlay/exl3_fat_moe.cu` / `.cuh` | E3 grouped fat-expert kernels (gather / gate-up+SwiGLU / down+scatter); compiled into `exllamav3_ext` by the full build, or as the additive `exl3_fat_moe_ext` module by `Dockerfile.e3-layer` + `overlay/build_exl3_fat_moe_ext.py` |
 | `tests/bench_e3_microbench.py` | CUDA-event MoE-layer timing E2 vs E3 + production-geometry parity (isolated, serving stopped) |
+| `overlay/patch_skip_cudagraph_profile.py` | skip the CUDA-graph memory dry-capture when `CG_ESTIMATE=0` discards it (`tests/test_skip_cudagraph_profile.py`) |
+| `overlay/patch_cold_load_uma.py` | InstantTensor budget vs UMA page cache + 64 KiB file-backed mmap staging; TP=2 only (`start-tp3.sh`/`start-tp4.sh` run neither it nor the host hygiene) (`tests/test_cold_load_uma.py`) |
 | `overlay/patch_exl3_ext_aarch64.py` | stub AVX CPU allreduce so the ext builds on GB10 |
 | `overlay/patch_exl3_decode_pipeline.py` | additive SM121 K4/N256 thin-decode kernels (shared / independent gate-up transform) + `glm53_fast_moe_version` in `exllamav3_ext`; stock kernels untouched, every anchor validated before anything is written |
 | `tests/test_exl3_decode_pipeline.py` | CPU: patch anchors, double-apply and partial-write refusal, gate/up SUH alias gate, `GLM53_EXL3_MOE_FAST` 0/1 contract, and the load-time fail-closed paths (no native symbol, wrong version, fused path unavailable) |
