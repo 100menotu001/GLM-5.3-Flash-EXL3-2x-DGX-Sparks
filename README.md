@@ -1359,8 +1359,33 @@ curl -s http://127.0.0.1:8888/v1/chat/completions \
 
 Thinking defaults on. Disable it with the **top-level** JSON field
 `"chat_template_kwargs": {"enable_thinking": false}`. This closes the empty
-thinking block in the generation prompt. The `Reasoning Effort:` line itself
-renders unconditionally since #63 (prefix-cache stability), thinking on or off.
+thinking block in the generation prompt. The `Reasoning Effort:` system line
+renders only while thinking is on (`files/chat_template.jinja:8`), so switching
+thinking on or off within a conversation changes the prompt prefix.
+
+**Prefer low-effort thinking to thinking off for long structured output.**
+With thinking off, long answers with numeric tables can come back corrupted:
+CJK text or stray English words inside numbers and table separator rows,
+sometimes looping until `max_tokens` ([#257](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/issues/257)).
+In a local 2× GB10 replay of a synthetic ~5k-token Polish table-recompute
+conversation (24 requests, arms interleaved in random order, 6,000-token cap),
+thinking off garbled 11 of 12 answers (5/6 at temperature 1.0, 6/6 at
+temperature 0), and only 49–73 % of the 792 expected table numbers per arm
+came back correct. With `"chat_template_kwargs": {"enable_thinking": true,
+"reasoning_effort": "low"}`, 0 of 6 answers were garbled and 791 of 792 numbers
+were correct, at a similar median time (74 s against 72–115 s). Sending
+`reasoning_effort: "low"` with `enable_thinking: false` behaved like thinking
+off (5 of 6 garbled). These are workload-specific observations, not a guarantee
+of correctness, response length, or latency.
+
+**Low effort does not undo thinking off.** Remove an existing explicit
+`enable_thinking: false` (or `thinking: false`), or send the explicit
+thinking-on request above. Avoid disabling thinking server-wide through
+`--default-chat-template-kwargs` in `EXTRA_ARGS`; remove that override first.
+To request low effort by default, set `GLM53_DEFAULT_REASONING_EFFORT=low`
+and restart the deployment. This knob only supplies a default effort level;
+it does not override a client's explicit thinking-off setting or cap reasoning
+tokens.
 
 Do not send a literal nested `extra_body` object over raw HTTP; `extra_body` is
 an OpenAI Python SDK option that merges its contents into the top-level request.
@@ -1376,7 +1401,7 @@ template reads. None of them need a restart, and none are enforced by
 
 | Field | Send | Why |
 |---|---|---|
-| `reasoning_effort` | `high` for reasoning work | Unset = **Max** (`files/chat_template.jinja:7`); `low` is the model card's lightest simple-Q&A mode. Keep it constant per route — see below |
+| `reasoning_effort` | `high` for reasoning work; `low` with thinking enabled for long numeric tables | With no request or server effort supplied, the template falls back to **Max** (`files/chat_template.jinja:7`). `low` reduced the tested corruption in the #257 replay; it does not override an explicit thinking-off flag. Keep it constant per route — see below |
 | `max_tokens` | ≥ `32768` with thinking on | Max-effort reasoning runs well past 8k output tokens. Too small a cap truncates mid-thought and the reply comes back with empty `content` |
 | `chat_template_kwargs.clear_thinking` | `true` for multi-turn agents | Replaces earlier turns' reasoning with `<think></think>` (`chat_template.jinja:154`), keeping the current tool-call chain. Cuts context, not answer quality |
 | `top_p` / `temperature` | leave unset | `generation_config.json` already supplies `0.95` / `1.0`; the boot log prints the override line. Sending `top_p=1.0` explicitly overrides that and is worse |
