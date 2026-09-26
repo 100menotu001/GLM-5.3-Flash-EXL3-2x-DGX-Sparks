@@ -305,8 +305,9 @@ def _is_stride_of(node: ast.expr, dim: int) -> str | None:
 
 def seed_launch_passes_strides(text: str) -> bool:
     """True when the seed kernel takes both stride constexprs and every launch
-    passes them as ``tail.stride(0)`` / ``tail.stride(1)`` of one tensor
-    argument of the launching function (the other half of vLLM #57477)."""
+    passes them as ``T.stride(0)`` / ``T.stride(1)`` where ``T`` is the tensor
+    that launch passes as the kernel's ``tail_ptr`` (the other half of vLLM
+    #57477)."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -318,9 +319,10 @@ def seed_launch_passes_strides(text: str) -> bool:
     ]
     if len(kernels) != 1:
         return False
-    params = {a.arg for a in kernels[0].args.args}
-    if not {"TAIL_BLOCK_ELEMS", "KPOOL_HEAD"} <= params:
+    params = [a.arg for a in kernels[0].args.args]
+    if not {"TAIL_BLOCK_ELEMS", "KPOOL_HEAD", "tail_ptr"} <= set(params):
         return False
+    tail_idx = params.index("tail_ptr")
     launches = 0
     for fn in ast.walk(tree):
         if not isinstance(fn, ast.FunctionDef) or fn is kernels[0]:
@@ -338,9 +340,17 @@ def seed_launch_passes_strides(text: str) -> bool:
             kw = {k.arg: k.value for k in call.keywords}
             if "TAIL_BLOCK_ELEMS" not in kw or "KPOOL_HEAD" not in kw:
                 return False
+            if "tail_ptr" in kw:
+                tail = kw["tail_ptr"]
+            elif len(call.args) > tail_idx:
+                tail = call.args[tail_idx]
+            else:
+                return False
+            if not isinstance(tail, ast.Name):
+                return False
             t0 = _is_stride_of(kw["TAIL_BLOCK_ELEMS"], 0)
             t1 = _is_stride_of(kw["KPOOL_HEAD"], 1)
-            if t0 is None or t0 != t1 or t0 not in fn_args:
+            if t0 is None or t0 != t1 or t0 != tail.id or t0 not in fn_args:
                 return False
     return launches >= 1
 

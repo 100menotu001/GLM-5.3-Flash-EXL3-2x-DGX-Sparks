@@ -369,6 +369,11 @@ def test_half_fixed_upstream_is_rejected() -> None:
         "strides of another tensor": upstream.replace(
             "KPOOL_HEAD=tail_kv_cache.stride(1)", "KPOOL_HEAD=key.stride(1)"
         ),
+        "both strides of a non-tail tensor": upstream.replace(
+            LAUNCH_STRIDES,
+            "        TAIL_BLOCK_ELEMS=key.stride(0),\n"
+            "        KPOOL_HEAD=key.stride(1),\n",
+        ),
     }
     for label, text in broken.items():
         assert text != upstream, label
