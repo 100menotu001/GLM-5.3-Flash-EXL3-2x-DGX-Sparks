@@ -238,7 +238,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Fabric | CX7 QSFP: `enp1s0f1np1`/`rocep1s0f1` ↔ `enp1s0f0np0`/`rocep1s0f0`. Image NCCL (`USE_HOST_NCCL=0`) |
 | Attention | `FLASHINFER_MLA_SPARSE_SM120` (NoPE MLA padded into GLM_NSA 576-wide) |
 | KV | `--kv-cache-dtype fp8` → packed **`fp8_ds_mla`** (target). Draft DFlash2 KV is `auto`/bf16. Latest validated 7168/rightsize pool: **1,243,902** tokens / **1.24×** at 1M. `--enable-prefix-caching` (block-aligned hits; see Prefix caching) |
-| Context | **850k** default since 2026-09-07 (E3; `EXL3_FAT_GROUPED=0` fits 1M again). KV pool is **~1M tokens** (measured 989,010 at 900k / util 0.85, and 1,023,626-1,084,615 at 900k / util 0.86; pool size varies ±0.4 GiB between identical boots, and the 850k default is not yet measured). Pre-E3 1M receipts: live pool **1,754,237** tokens (1.75×) / 690 GPU blocks / 18.67 GiB at MNBT 2048; latest validated 7168/rightsize E2 pool at 1M **1,243,902** tokens / **1.24×**. Pool size varies with MNBT, activation/graph reservations and hybrid block geometry. Padded slot-share is why 1M allocates; the old 900k cap was 1.95× on this same pool. Do not drop to 256k to “free” slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
+| Context | **850k** default since 2026-09-07 (E3; `EXL3_FAT_GROUPED=0` fits 1M again). KV pool is **1,572,073 tokens** (1.85× at 850k), measured 2026-09-26 on two community kits at the defaults (14 GiB KV reservation from #242, compact draft KV from #238, util 0.85). Earlier E3 receipts, before #238: 989,010 at 900k / util 0.85, and 1,023,626-1,084,615 at 900k / util 0.86; pool size varies ±0.4 GiB between identical boots. Pre-E3 1M receipts: live pool **1,754,237** tokens (1.75×) / 690 GPU blocks / 18.67 GiB at MNBT 2048; latest validated 7168/rightsize E2 pool at 1M **1,243,902** tokens / **1.24×**. Pool size varies with MNBT, activation/graph reservations and hybrid block geometry. Padded slot-share is why 1M allocates; the old 900k cap was 1.95× on this same pool. Do not drop to 256k to “free” slots (hybrid mamba + DFlash window block-id demand is mostly length-independent) |
 | Experts | packed trellis + suh + svh + mcg, codebook MCG, **one fused `exllamav3_ext.exl3_moe` launch per layer** |
 | Dense / shared / attn / embed / lm_head | native (unquantized) |
 | Tools / reasoning | `--tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45` |
@@ -404,7 +404,58 @@ block-table entry. Without that clamp, every token at `pos >= block_size`
 fills the mapping with adjacent memory and the kpool seed/update kernels
 write through it — long generations (~2k tokens) crash or silently corrupt
 another layer's indexer. The clamp is identity for every other KV group.
-Fail-closed, idempotent, mounted and run on both ranks.
+Fail-closed, idempotent, mounted and run on both ranks. It edits
+`vllm/v1/worker/block_table.py` only.
+
+`overlay/patch_kpool_tail_seed_stride.py` is a different backport
+([vLLM #57477](https://github.com/vllm-project/vllm/pull/57477), issue
+[#264](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/issues/264)).
+Pinned vLLM `487ecf187d3dfe74d2cf6119a92881dba403c219` (base image
+`vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c02933be6021301db2dc284e24e3727467aa3a0f63b41d609885778a07bce`,
+the tree behind `:exl3-instanttensor`) still addresses the NVIDIA prefill
+tail seed with a dense 2048 B stride. The tail tensor is an `as_strided`
+view of the indexer page, whose size scales with the KV block: 118272 B
+(`stride(0) == 59136` bf16 elements) at this recipe's 3584-token block, and
+38016 B (`stride(0) == 19008`) at upstream's 1152. That seed writes into
+another request's indexer blocks and leaves its own tail block untouched.
+On a 2× GB10 kit, dense tail writes from all 552 block ids land in indexer
+blocks 0–9, typically the first long prefix-cached prompt after boot. The decode kernel in the same file already takes
+`TAIL_BLOCK_ELEMS`; only `_kpool_tail_seed_kernel` does not. Confirmed
+missing on 2026-09-25 by reading that commit: the seed function has no
+`TAIL_BLOCK_ELEMS` parameter, and no other overlay edits
+`kpool_compress.py`. The slot-map clamp does not fix this.
+
+On a vLLM that already carries #57477 the overlay logs `already upstream` and
+leaves the file alone. It says so only when the seed kernel takes both
+strides and every launch passes `tail.stride(0)` / `tail.stride(1)` of the
+tail tensor. A half-fixed file (body fixed, launch not) fails the boot.
+
+CPU check (no image bake, no GPU). Inside the image, the same file also runs
+the patched and pinned Triton seed kernels on CPU under `TRITON_INTERPRET=1`
+at both strides. Without torch/triton or an installed vLLM those checks are
+reported as skipped; set `GLM53_REQUIRE_KERNEL_TESTS=1` to fail instead:
+
+```bash
+python3 tests/test_kpool_tail_seed_stride.py
+```
+
+After the overlay runs, the boot log contains `[glm53-kpool-tail-seed-stride]`.
+Inside the container, confirm the seed function itself (a file-wide grep for
+`TAIL_BLOCK_ELEMS` is not enough; the decode kernel on the pin already has it):
+
+```bash
+python3 - << 'PY'
+import inspect
+from vllm.models.glm5next.nvidia.ops.kpool_compress import _kpool_tail_seed_kernel
+src = inspect.getsource(_kpool_tail_seed_kernel)
+assert "TAIL_BLOCK_ELEMS" in src and "base = blk * TAIL_BLOCK_ELEMS" in src
+assert "(blk * 2 * KPOOL" not in src
+print("kpool tail seed stride: padded")
+PY
+```
+
+Upstream's GPU test is
+`pytest tests/kernels/test_kpool_decode_update_batched.py::test_prefill_seed_honors_padded_tail_block_stride`.
 
 `overlay/patch_glm_video_placeholders.py` routes Glm5Next video timestamps through
 the glm46v path and aligns placeholder blocks to encoder `grid_t`. The overlay
@@ -1709,6 +1760,8 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `tests/test_cache_reset_endpoint.py` | exact `build_app` anchor, flag semantics (off / on / dev precedence), fail-closed drift, idempotence, installed copy |
 | `overlay/patch_kpool_tail_slotmap.py` | clamp KpoolTail one-block circular slot mapping; identity for other KV groups |
 | `tests/test_kpool_tail_slotmap.py` | circular addressing math, exact kernel patch, idempotence, fail-closed drift, launcher wiring |
+| `overlay/patch_kpool_tail_seed_stride.py` | vLLM #57477 backport: NVIDIA prefill tail seed uses the padded indexer stride (`kpool_compress.py`). Not the slot-map clamp |
+| `tests/test_kpool_tail_seed_stride.py` | pin-anchor match, CPU port of the padded-stride contract, #57477 and recipe (block 3584) byte windows, the real seed kernel under the Triton interpreter (image only), idempotence, fail-closed drift, genuine upstream (vLLM `db1bfdd`) recognized and half-fixed launches rejected, launcher wiring |
 | `overlay/patch_kv_capacity_log.py` | log-only: after the stock `GPU KV cache size` line (kept byte-identical) log per-group `blocks/request` (the stock line's own denominator) and the usable-block-ids / ids-per-aligned-segment / cached-conversation-capacity summary; unmodelled spec kinds withhold the figure; knob `GLM53_KV_CAPACITY_LOG` (0/1); two pinned anchors, preflighted before either is written, atomic, idempotent |
 | `tests/test_kv_capacity_log.py` | CPU-only execution of the shipped derivation helpers against hybrid, single-group, uniform-type, unsupported-spec, and null-block cases; patch application and idempotence on a pinned fixture, fail-closed anchor drift, and installed-source preflight when available (required in the image). Launcher flag validation belongs to `tests/test_numeric_config.py`. |
 | `overlay/patch_indexer_workspace.py` | opt-in `GLM53_INDEXER_WORKSPACE=rightsize`: size the sparse-indexer prefill workspace to the legal per-step maximum instead of `max_model_len * 40`; boot-time compress-ratio cross-check |
