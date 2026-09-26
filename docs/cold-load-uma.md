@@ -82,7 +82,14 @@ re-applied (idempotent) at boot from `GLM53_OVERLAY_ORDER`:
   Containers cannot drop caches (`/proc/sys` is read-only without
   `CAP_SYS_ADMIN`); the in-container `drop_caches` attempt is kept as a
   harmless no-op and the budget no longer depends on it. `INSTANTTENSOR_*`
-  env vars still win when set.
+  env vars are used when set, with one exception (#273). A bare
+  `INSTANTTENSOR_MAX_FREE_MEM_USAGE`, with no `INSTANTTENSOR_BUFFER_SIZE`, that
+  cannot cover the pinned 4 GiB buffer while `MemAvailable` holds the load would
+  make InstantTensor abort. It is raised to the MemAvailable-sized fraction, and
+  the loader logs a `[glm53-cold-load-uma] INSTANTTENSOR_MAX_FREE_MEM_USAGE=…
+  gives a … budget` warning. It is never lowered. Set `INSTANTTENSOR_BUFFER_SIZE`
+  as well to keep an explicit pair as given. An undersized pair can still fail
+  the load.
 * `safetensors_weights_iterator`: when `sysconf(SC_PAGE_SIZE) != 4096`,
   `clone()` each tensor off the file-backed mmap into anonymous memory before
   yielding it. `cuMemcpyHtoDAsync` wedges on this driver when the source is a

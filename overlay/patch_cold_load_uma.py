@@ -23,7 +23,12 @@ Two independent problems, both in ``model_executor/model_loader/weight_utils.py`
    caches (``/proc/sys`` is read-only without ``CAP_SYS_ADMIN``); the
    in-container attempt is kept as a harmless no-op and the budget no longer
    depends on it. The launcher forwards ``INSTANTTENSOR_*`` to both ranks
-   when set; this patch only supplies defaults.
+   when set, and set values are used, with one exception (#273): a bare
+   ``INSTANTTENSOR_MAX_FREE_MEM_USAGE`` (no ``INSTANTTENSOR_BUFFER_SIZE``)
+   that cannot cover the pinned buffer while ``MemAvailable`` holds the load
+   is raised to the MemAvailable-sized fraction, with a warning. It is never
+   lowered. An explicit pair is used as given, which does not guarantee the
+   load fits.
 
 2. File-backed 64 KiB mmap sources (``safetensors_weights_iterator``).
    ``cuMemcpyHtoDAsync`` wedges on this GB10 driver when the source is a
@@ -197,14 +202,40 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
     # at 90% of MemAvailable) — InstantTensor does not cap it and the pinned
     # allocation reclaims the cache. Otherwise keep InstantTensor's 0.5
     # default when free memory is plentiful, else the stock-capped fraction.
+    if free_bytes >= 2 * need_bytes:
+        auto_frac = 0.5
+    elif window_holds:
+        auto_frac = min(need_bytes, int(0.9 * avail_bytes)) / max(free_bytes, 1)
+    else:
+        auto_frac = min(0.95, need_bytes / max(free_bytes, 1))
     frac = env_budget
     if frac is None:
-        if free_bytes >= 2 * need_bytes:
-            frac = 0.5
-        elif window_holds:
-            frac = min(need_bytes, int(0.9 * avail_bytes)) / max(free_bytes, 1)
-        else:
-            frac = min(0.95, need_bytes / max(free_bytes, 1))
+        frac = auto_frac
+    elif (
+        env_buffer is None
+        and window_holds
+        and int(free_bytes * frac) < buffer_target
+        and auto_frac > frac
+    ):
+        # A bare INSTANTTENSOR_MAX_FREE_MEM_USAGE (the pre-UMA workaround from
+        # #204/#273) scales cuda free, which is MemFree here: with the page
+        # cache full it cannot even hold the buffer pinned below, and
+        # InstantTensor aborts. Only in that case raise it to the
+        # MemAvailable-sized fraction; a fraction that covers the buffer is
+        # the caller's choice and is kept, and it is never lowered.
+        # An explicit INSTANTTENSOR_BUFFER_SIZE keeps the caller's pair as-is.
+        logger.warning(
+            "[glm53-cold-load-uma] INSTANTTENSOR_MAX_FREE_MEM_USAGE=%.2f gives a "
+            "%.1f GiB budget (cuda free %.1f GiB counts page cache as used) for "
+            "a %.1f GiB load; using the MemAvailable-sized %.2f instead. Unset "
+            "it, or also set INSTANTTENSOR_BUFFER_SIZE to keep an explicit pair.",
+            frac,
+            free_bytes * frac / (1 << 30),
+            free_bytes / (1 << 30),
+            need_bytes / (1 << 30),
+            auto_frac,
+        )
+        frac = auto_frac
     budget = int(free_bytes * frac)
     if env_buffer:
         buffer_size = env_buffer
@@ -244,6 +275,24 @@ def _glm53_uma_prepare_instanttensor_budget(hf_weights_files: list[str]) -> None
 
 '''
 
+# The v1 helper (PR #230) differed only in the budget-fraction block below.
+# Images baked with it are upgraded in place by prepare() (#273).
+_V1_BUDGET_BLOCK = '''\
+    frac = env_budget
+    if frac is None:
+        if free_bytes >= 2 * need_bytes:
+            frac = 0.5
+        elif window_holds:
+            frac = min(need_bytes, int(0.9 * avail_bytes)) / max(free_bytes, 1)
+        else:
+            frac = min(0.95, need_bytes / max(free_bytes, 1))
+'''
+_BUDGET_BLOCK_START = "    if free_bytes >= 2 * need_bytes:\n        auto_frac = 0.5\n"
+_BUDGET_BLOCK_END = "        frac = auto_frac\n"
+_b0 = HELPER.index(_BUDGET_BLOCK_START)
+_b1 = HELPER.index(_BUDGET_BLOCK_END, HELPER.index("auto_frac,\n        )\n", _b0)) + len(_BUDGET_BLOCK_END)
+HELPER_V1 = HELPER[:_b0] + _V1_BUDGET_BLOCK + HELPER[_b1:]
+
 # --- 2. file-backed 64 KiB mmap -----------------------------------------------
 ANCHOR_ST_YIELD = (
     "            with safe_open(st_file, framework=\"pt\") as f:\n"
@@ -276,10 +325,13 @@ STAGE_FLAG = (
 
 def verified_state(src: str) -> str:
     if src.count(MARK) >= 4:
-        for needle in (NEW_IT_OPEN, HELPER, NEW_ST_YIELD, STAGE_FLAG):
+        helper_state = "patched" if HELPER in src else "patched-v1" if HELPER_V1 in src else None
+        for needle in (NEW_IT_OPEN, NEW_ST_YIELD, STAGE_FLAG):
             if needle not in src:
-                raise SystemExit(f"{TARGET}: partially patched — source drift")
-        return "patched"
+                helper_state = None
+        if helper_state is None:
+            raise SystemExit(f"{TARGET}: partially patched — source drift")
+        return helper_state
     if src.count(MARK):
         raise SystemExit(f"{TARGET}: partial marks ({src.count(MARK)}) — source drift")
     for name, needle in (
@@ -297,6 +349,9 @@ def verified_state(src: str) -> str:
 
 
 def prepare(src: str) -> str:
+    if MARK in src and HELPER_V1 in src and HELPER not in src:
+        # Baked with the v1 helper: swap in the current one (#273).
+        return src.replace(HELPER_V1, HELPER, 1)
     if MARK in src:
         # Already carries the overlay (verified_state guards partial marks);
         # a second apply must be a no-op.
@@ -320,6 +375,13 @@ def main() -> int:
         print(f"[glm53-cold-load-uma] {TARGET}: already patched")
         return 0
     out = prepare(src)
+    if state == "patched-v1":
+        if verified_state(out) != "patched":
+            raise SystemExit("v1 helper upgrade self-check failed")
+        compile(out, str(TARGET), "exec")
+        TARGET.write_text(out)
+        print(f"[glm53-cold-load-uma] upgraded the v1 budget helper in {TARGET}")
+        return 0
     if verified_state(out) != "patched":
         raise SystemExit("patch self-check failed")
     compile(out, str(TARGET), "exec")

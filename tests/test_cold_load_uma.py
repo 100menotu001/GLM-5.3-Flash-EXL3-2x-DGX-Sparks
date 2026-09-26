@@ -240,6 +240,127 @@ def test_budget_math_env_overrides_win_on_uma():
     assert st["buffer_size"] == 2 << 30
 
 
+def _run_budget(meminfo, free, env, largest=1268776960):
+    logs: list = []
+    ns = _budget_ns(logs, meminfo, [free], lambda: False, env=env)
+    with tempfile.TemporaryDirectory() as td:
+        shard = Path(td) / "shard.safetensors"
+        with open(shard, "wb") as fh:
+            fh.truncate(largest)
+        try:
+            ns["_glm53_uma_prepare_instanttensor_budget"]([str(shard)])
+        finally:
+            del sys.modules["torch"]
+    return ns["_GLM53_UMA_STATE"], logs
+
+
+def test_bare_env_budget_raised_when_page_cache_is_full():
+    """#273: the #204/#273 workaround sets only INSTANTTENSOR_MAX_FREE_MEM_USAGE.
+    On UMA with the page cache full, 0.8 x cuda free cannot hold the pinned
+    4 GiB buffer; the helper must raise it to the MemAvailable-sized fraction
+    (with a warning) instead of letting InstantTensor abort."""
+    free = 2 * 647100416  # ~1.2 GiB cuda free == MemFree, as in the #230 receipt
+    largest = 1268776960
+    st, logs = _run_budget(
+        {"MemFree": free // 1024, "MemAvailable": 100 << 20}, free,
+        {"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "0.8"}, largest,
+    )
+    assert st["max_free_mem_usage"] > 1, st
+    assert st["buffer_size"] == 4 << 30
+    assert int(free * st["max_free_mem_usage"]) >= st["buffer_size"] + largest, st
+    assert any(k == "warn" and "INSTANTTENSOR_MAX_FREE_MEM_USAGE" in a[0] for k, a in logs), logs
+
+
+def test_bare_env_budget_kept_when_it_fits():
+    free = 60 << 30  # plenty of cuda free: the caller's fraction already holds the load
+    st, logs = _run_budget(
+        {"MemFree": free // 1024, "MemAvailable": 100 << 20}, free,
+        {"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "0.8"},
+    )
+    assert st["max_free_mem_usage"] == 0.8, st
+    assert not any(k == "warn" for k, _ in logs), logs
+
+
+def test_bare_env_budget_kept_when_it_covers_the_buffer():
+    """Between the buffer and the full load window the override already loads
+    on main; the fix must not touch it (only the abort case is changed)."""
+    free = 6 << 30  # 0.8 x 6 GiB = 4.8 GiB >= the 4 GiB pinned buffer, < the ~9.8 GiB window
+    st, logs = _run_budget(
+        {"MemFree": free // 1024, "MemAvailable": 100 << 20}, free,
+        {"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "0.8"},
+    )
+    assert st["max_free_mem_usage"] == 0.8, st
+    assert st["buffer_size"] == 4 << 30
+    assert not any(k == "warn" for k, _ in logs), logs
+
+
+def test_bare_env_budget_never_lowered():
+    free = 2 * 647100416
+    st, _ = _run_budget(
+        {"MemFree": free // 1024, "MemAvailable": 100 << 20}, free,
+        {"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "9.0"},
+    )
+    assert st["max_free_mem_usage"] == 9.0, st
+
+
+def test_explicit_pair_untouched_on_full_cache():
+    """Setting INSTANTTENSOR_BUFFER_SIZE too is an explicit choice: leave both."""
+    free = 2 * 647100416
+    st, logs = _run_budget(
+        {"MemFree": free // 1024, "MemAvailable": 100 << 20}, free,
+        {"INSTANTTENSOR_MAX_FREE_MEM_USAGE": "0.8", "INSTANTTENSOR_BUFFER_SIZE": str(1 << 30)},
+    )
+    assert st == {"max_free_mem_usage": 0.8, "buffer_size": 1 << 30}, st
+    assert not any(k == "warn" for k, _ in logs), logs
+
+
+# The PR #230 helper exactly as merged (main 75a0e9e / #230 fix-up head 3432f57,
+# unchanged through 70b2f33). Frozen as a digest rather than a copy so the bake,
+# which copies only this file into the image, needs no extra fixture file.
+V1_HELPER_SHA256 = "e6c6122a16ce50d76c560994c76101409deda9548b7d3c7492f44a7cb62b1b47"
+
+
+def test_v1_helper_matches_frozen_history():
+    """HELPER_V1 is derived from HELPER; a future edit outside the budget
+    block would silently change both. Pin it to the historical bytes."""
+    import hashlib
+
+    assert hashlib.sha256(mod.HELPER_V1.encode()).hexdigest() == V1_HELPER_SHA256
+
+
+def test_v1_upgrade_through_cli():
+    """The real main() upgrades a v1-baked file in place, then is a no-op."""
+    v1 = _run(FIXTURE).replace(mod.HELPER, mod.HELPER_V1, 1)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "weight_utils.py"
+        p.write_text(v1)
+        mod.TARGET = p
+        saved = os.environ.pop(mod.ENV_NAME, None)
+        try:
+            assert mod.main() == 0
+            first = p.read_text()
+            assert mod.verified_state(first) == "patched" and mod.HELPER in first
+            assert mod.main() == 0
+            assert p.read_text() == first
+        finally:
+            if saved is not None:
+                os.environ[mod.ENV_NAME] = saved
+
+
+def test_v1_helper_upgraded_in_place():
+    """An image baked with the PR #230 (v1) helper must not fail closed as
+    'source drift': prepare() swaps in the current helper, then is a no-op."""
+    out = _run(FIXTURE)
+    v1 = out.replace(mod.HELPER, mod.HELPER_V1, 1)
+    assert v1 != out and mod.HELPER not in v1
+    assert mod.verified_state(v1) == "patched-v1"
+    up = mod.prepare(v1)
+    assert up == out
+    assert mod.verified_state(up) == "patched"
+    compile(up, "weight_utils.py", "exec")
+    assert mod.prepare(up) == up
+
+
 def test_budget_math_kill_switch():
     """GLM53_COLD_LOAD_UMA=0 at runtime leaves InstantTensor on its own
     defaults (the image is patched at build, so this is the runtime off)."""
@@ -289,9 +410,35 @@ def test_installed_optin():
     if os.environ.get("GLM53_REQUIRE_TARGET") != "1":
         return
     assert INSTALLED.is_file(), INSTALLED
-    src = INSTALLED.read_text()
-    mod.TARGET = INSTALLED
-    assert mod.verified_state(src) in ("stock", "patched")
+    _check_installed(INSTALLED)
+
+
+def _check_installed(path: Path) -> str:
+    """Pre-patch validation of an installed weight_utils.py: stock, current, or
+    an image baked with the PR #230 (v1) helper are all supported inputs, and
+    applying the patch must leave the file fully patched."""
+    src = path.read_text()
+    mod.TARGET = path
+    state = mod.verified_state(src)
+    assert state in ("stock", "patched", "patched-v1"), state
+    if state != "patched":
+        out = mod.prepare(src)
+        assert mod.verified_state(out) == "patched"
+        compile(out, str(path), "exec")
+    return state
+
+
+def test_installed_check_accepts_every_supported_state():
+    """#273 review: the opt-in check must not reject a v1-baked image that
+    the patch itself upgrades."""
+    stock = FIXTURE
+    patched = _run(FIXTURE)
+    v1 = patched.replace(mod.HELPER, mod.HELPER_V1, 1)
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "weight_utils.py"
+        for src, want in ((stock, "stock"), (v1, "patched-v1"), (patched, "patched")):
+            p.write_text(src)
+            assert _check_installed(p) == want
 
 
 if __name__ == "__main__":
