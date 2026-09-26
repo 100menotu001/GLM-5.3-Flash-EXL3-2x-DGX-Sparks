@@ -6,7 +6,7 @@
 Motivated by Alexbob0/glm53-flash-vllm-upstream-sm121 loadclone measurements,
 revision bc3891aed74a1f4ccd679e5205ab9bd2605cf283. The implementation below
 retains the upstream iterator rather than replacing weight_utils.py. Its mmap
-block remains byte-identical so PR #230 (bc97cbf1d5ab06df778b79b99efa92997bb4f153)
+block remains byte-identical so PR #230 (1f3ab4eacf8590341e783336be70eaed99eb92ef)
 can apply before OR after this patch, including that patch's verification.
 
 GLM53_LOAD_CLONE=1 stages auto/lazy mmap tensors; 0 disables optional staging, never the

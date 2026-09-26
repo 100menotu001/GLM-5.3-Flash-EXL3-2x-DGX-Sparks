@@ -405,6 +405,11 @@ class Harness:
             PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
             HOME=str(self.home),
             GLM53_STUB_LOG=str(self.log),
+            # host_memory_hygiene is not what this harness exercises; without
+            # this its pre-launch wait runs 45 x 2 s per scenario on a host
+            # whose MemAvailable is below GPU_MEM_UTIL x total (sudo is not
+            # stubbed here), timing the suite out.
+            GLM53_HOST_MEM_HYGIENE="0",
             **extra,
         )
 
@@ -740,6 +745,21 @@ def part_d(h: Harness) -> None:
     scenarios += [("LARGEM=0", {LARGE_M: "0"}),
                   ("LARGEM=1", {LARGE_M: "1"})]
 
+    # UMA cold-load knobs (optional; docs/cold-load-uma.md): both ranks when
+    # set, neither rank when unset — an exported empty would engage the
+    # GLM53_COLD_LOAD_UMA kill switch and crash InstantTensor's env readers.
+    COLDLOAD = {
+        "GLM53_COLD_LOAD_UMA": "0",
+        "GLM53_COLD_LOAD_STAGE_MMAP": "0",
+        "INSTANTTENSOR_MAX_FREE_MEM_USAGE": "1.5",
+        "INSTANTTENSOR_BUFFER_SIZE": "2147483648",
+        "INSTANTTENSOR_CHUNK_SIZE": "8388608",
+        "INSTANTTENSOR_CONCURRENCY": "4",
+        "INSTANTTENSOR_IO_DEPTH": "256",
+        "INSTANTTENSOR_BACKEND": "aio",
+    }
+    scenarios.append(("cold-load knobs", dict(COLDLOAD)))
+
     first = None
     for label, env in scenarios:
         got = rank_runs(h, **env)
@@ -758,6 +778,9 @@ def part_d(h: Harness) -> None:
             required[KV] = env[KV]
         if THIN in env:
             required[THIN] = env[THIN]
+        for name, value in COLDLOAD.items():
+            if name in env:
+                required[name] = value
         if LARGE_M in env:
             required[LARGE_M] = env[LARGE_M]
         issues = parity_issues(head, worker, scp, required)
@@ -770,6 +793,12 @@ def part_d(h: Harness) -> None:
                 "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA" not in head.env and "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA" not in worker.env,
                 f"D2 [{label}] empty SWA override is forwarded to neither rank",
             )
+        for name in COLDLOAD:
+            if name not in env:
+                check(
+                    name not in head.env and name not in worker.env,
+                    f"D2 [{label}] unset {name} reaches neither rank",
+                )
         mounted = {Path(p).name for p in head.mounts}
         # Expected source -> destination map for EVERY *_PATCH_HOST: the head
         # mount, the scp source and the worker mount must all be that file.
