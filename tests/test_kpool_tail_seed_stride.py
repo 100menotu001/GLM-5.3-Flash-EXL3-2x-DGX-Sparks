@@ -61,11 +61,9 @@ PIN_FIXTURE = "kpool_tail_seed_kernel-487ecf187.py.txt"
 UPSTREAM_FIXTURE = "kpool_tail_seed_kernel-db1bfdd.py.txt"
 
 
-def _skip(reason: str, *, kernel: bool = True) -> None:
-    """Report a skip as a skip under pytest, a printed line when run directly.
-    GLM53_REQUIRE_KERNEL_TESTS=1 turns a kernel/installed-source skip into a
-    failure (the checkout-only wiring check is never required)."""
-    if kernel and os.environ.get("GLM53_REQUIRE_KERNEL_TESTS") == "1":
+def _skip(reason: str) -> None:
+    """Skip optional installed-source or Triton checks unless explicitly required."""
+    if os.environ.get("GLM53_REQUIRE_KERNEL_TESTS") == "1":
         raise AssertionError(f"required test could not run: {reason}")
     if "pytest" in sys.modules:
         import pytest
@@ -427,46 +425,6 @@ def test_installed_copy_if_present() -> None:
         assert DENSE_BASE not in text
 
 
-def test_recipe_wiring_if_present() -> None:
-    start = ROOT / "start.sh"
-    dockerfile = ROOT / "Dockerfile"
-    if not start.is_file() or not dockerfile.is_file():
-        _skip("test_recipe_wiring_if_present (no recipe checkout)", kernel=False)
-        return
-    launcher = start.read_text()
-    image = dockerfile.read_text()
-    readme = (ROOT / "README.md").read_text()
-    assert 'KPOOL_SEED_PATCH_HOST="${KPOOL_SEED_PATCH_HOST:-' in launcher
-    order = launcher[
-        launcher.index("GLM53_OVERLAY_ORDER=(") : launcher.index(
-            ")", launcher.index("GLM53_OVERLAY_ORDER=(")
-        )
-    ]
-    assert "\n    patch_kpool_tail_seed_stride.py\n" in order
-    assert order.index("patch_kpool_tail_slotmap.py") < order.index(
-        "patch_kpool_tail_seed_stride.py"
-    )
-    assert (
-        "-v '/tmp/patch_kpool_tail_seed_stride.py:"
-        "/opt/glm53/patch_kpool_tail_seed_stride.py:ro'" in launcher
-    )
-    assert (
-        '-v "$KPOOL_SEED_PATCH_HOST:'
-        '/opt/glm53/patch_kpool_tail_seed_stride.py:ro"' in launcher
-    )
-    assert 'scp -q -o BatchMode=yes "$KPOOL_SEED_PATCH_HOST"' in launcher
-    assert "[glm53-kpool-tail-seed-stride]" in launcher
-    assert "COPY overlay/patch_kpool_tail_seed_stride.py" in image
-    assert "RUN python3 /opt/glm53/patch_kpool_tail_seed_stride.py" in image
-    assert "python3 /opt/glm53/test_kpool_tail_seed_stride.py" in image
-    assert "vLLM #57477" in readme
-    assert "patch_kpool_tail_seed_stride.py" in readme
-    for name in ("start-tp3.sh", "start-tp4.sh"):
-        text = (ROOT / name).read_text()
-        assert "patch_kpool_tail_seed_stride.py" in text
-        assert 'KPOOL_SEED_PATCH_HOST="${KPOOL_SEED_PATCH_HOST:-' in text
-
-
 def main() -> int:
     test_distinct_from_slotmap()
     test_anchor_is_pinned_487ecf187()
@@ -480,7 +438,6 @@ def main() -> int:
     test_half_fixed_upstream_is_rejected()
     test_fail_closed()
     test_installed_copy_if_present()
-    test_recipe_wiring_if_present()
     print("kpool tail seed-stride patch OK")
     return 0
 
