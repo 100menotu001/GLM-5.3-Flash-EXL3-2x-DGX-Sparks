@@ -189,6 +189,11 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   dangling weight link with one dereferenced-file transfer and rechecks the
   complete snapshot before stamping the marker. This checks file presence and
   sizes, not content hashes. (#256)
+- Group #280's kpool patcher, test and fixture copies with existing recipe
+  copies, and run its tail-seed patch after slot-map in the same layer.
+  The separate #280 instructions produced a 128-layer image that Docker
+  overlay2 could build but could not instantiate on the target hosts;
+  grouping removes five layers without changing the patch order.
 
 - `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
