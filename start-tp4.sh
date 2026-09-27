@@ -66,6 +66,7 @@ _cli_temp_rows="${EXL3_TEMP_ROWS_FUSED-}"
 _cli_fat_sorted="${EXL3_FAT_SORTED-}"
 _cli_fat_batched="${EXL3_FAT_BATCHED-}"
 _cli_fat_kernel="${EXL3_FAT_KERNEL-}"
+_cli_fat_grouped="${EXL3_FAT_GROUPED-}"
 _cli_mnbt="${MAX_NUM_BATCHED_TOKENS-}"
 _cli_image="${IMAGE-}"
 _cli_util="${GPU_MEM_UTIL-}"
@@ -141,6 +142,7 @@ set +a
 [ -n "${_cli_fat_sorted}" ] && EXL3_FAT_SORTED="$_cli_fat_sorted"
 [ -n "${_cli_fat_batched}" ] && EXL3_FAT_BATCHED="$_cli_fat_batched"
 [ -n "${_cli_fat_kernel}" ] && EXL3_FAT_KERNEL="$_cli_fat_kernel"
+[ -n "${_cli_fat_grouped}" ] && EXL3_FAT_GROUPED="$_cli_fat_grouped"
 [ -n "${_cli_mnbt}" ] && MAX_NUM_BATCHED_TOKENS="$_cli_mnbt"
 [ -n "${_cli_image}" ] && IMAGE="$_cli_image"
 [ -n "${_cli_util}" ] && GPU_MEM_UTIL="$_cli_util"
@@ -333,6 +335,14 @@ EXL3_FAT_BATCHED="${EXL3_FAT_BATCHED:-0}"
 # Needs the patched extension — start.sh rebuilds when the recipe stamp drifts.
 # Set all three flags to 0 for the legacy fat-expert path.
 EXL3_FAT_KERNEL="${EXL3_FAT_KERNEL:-1}"
+# E3 grouped fat-expert prefill (overlay/exl3_fat_moe.cu), the start.sh / start-tp3.sh
+# default since 2026-09-07. It must reach every rank: overlay/exl3.py treats a missing
+# EXL3_FAT_GROUPED as off, so a host .env value is a no-op unless docker -e forwards it,
+# which this launcher did not do. Default 0 here keeps TP4's measured behavior (E2 tier);
+# set EXL3_FAT_GROUPED=1 in .env.tp4 for E3 (measured 2026-09-27 on 4 Sparks, 1M ctx:
+# cold prefill 1,316 / 1,761 / 1,940 -> 1,772 / 2,422 / 2,733 tok/s at 8K / 32K / 100K
+# with EXL3_TEMP_ROWS_FUSED=32; decode unchanged).
+EXL3_FAT_GROUPED="${EXL3_FAT_GROUPED:-0}"
 
 # --- abliteration (ablit/) --------------------------------------------------
 # Load-time o_proj orthogonalization (overlay/ablit_runtime.py). Published
@@ -1742,7 +1752,7 @@ TP4_SKIP_OLD_SCP
              GLM53_LOAD_CLONE GLM53_LOAD_PREFETCH \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
+             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              VLLM_SM120_SPARSE_MLA_SLICE_TOKENS; do
         serve_env+=" -e $v='${!v:-}'"
@@ -1870,6 +1880,7 @@ TP4_SKIP_OLD_SCP
         -e EXL3_FAT_SORTED="$EXL3_FAT_SORTED" \
         -e EXL3_FAT_BATCHED="$EXL3_FAT_BATCHED" \
         -e EXL3_FAT_KERNEL="$EXL3_FAT_KERNEL" \
+        -e EXL3_FAT_GROUPED="$EXL3_FAT_GROUPED" \
         -e ABLIT="$ABLIT" \
         -e ABLIT_METHOD="$ABLIT_METHOD" \
         -e ABLIT_DIRECTION="$ABLIT_DIRECTION" \
@@ -2042,7 +2053,7 @@ start() {
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} fat_kernel=${EXL3_FAT_KERNEL} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED} mnbt=${MAX_NUM_BATCHED_TOKENS}"
 
     launch_cluster
     if wait_for_health; then
