@@ -180,6 +180,16 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start.sh` verifies every shard named by the selected snapshot's index and
+  both sidecars against the worker's dereferenced file sizes before trusting
+  the sync marker. Pinned, non-NFS `SKIP_SYNC=1` verifies the target snapshot
+  without transferring it; unpinned and NFS paths retain their existing
+  behavior. An incomplete/invalid head snapshot fails before transfer;
+  interrupted transfers clear the marker before mutation. DFlash2 repairs a
+  dangling weight link with one dereferenced-file transfer and rechecks the
+  complete snapshot before stamping the marker. This checks file presence and
+  sizes, not content hashes. (#256)
+
 - `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
   `487ecf187` still uses a dense 2048 B stride in `_kpool_tail_seed_kernel`.
