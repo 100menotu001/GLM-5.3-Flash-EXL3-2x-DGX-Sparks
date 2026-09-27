@@ -155,8 +155,10 @@ def test_stop_takes_a_free_lock_and_removes_both_containers() -> None:
         result = _run_lifecycle(tmp, "stop", wait_seconds=1)
         assert result.returncode == 0, result.stderr
         record = (tmp / "record").read_text().splitlines()
+        assert "docker kill glm53-exl3-head" in record, record
         assert "docker rm -f glm53-exl3-head" in record, record
-        assert "ssh docker rm -f 'glm53-exl3-worker'" in record, record
+        assert "ssh docker kill 'glm53-exl3-worker' >/dev/null 2>&1; docker rm -f 'glm53-exl3-worker' >/dev/null 2>&1" in record, record
+        assert record.index("docker kill glm53-exl3-head") < record.index("docker rm -f glm53-exl3-head")
 
 
 def test_restart_holds_one_lock_across_stop_and_start() -> None:
@@ -165,11 +167,11 @@ def test_restart_holds_one_lock_across_stop_and_start() -> None:
         _locked_logs(tmp)
         result = _run_lifecycle(tmp, "restart", wait_seconds=1)
         assert result.returncode == 0, result.stderr
-        assert (tmp / "record").read_text().splitlines() == [
-            "docker rm -f glm53-exl3-head",
-            "ssh docker rm -f 'glm53-exl3-worker'",
-            "start_unlocked lock_held",
-        ]
+        record = (tmp / "record").read_text().splitlines()
+        assert record[-1] == "start_unlocked lock_held", record
+        assert "docker kill glm53-exl3-head" in record
+        assert "docker rm -f glm53-exl3-head" in record
+        assert any(line.startswith("ssh docker kill 'glm53-exl3-worker'") and "docker rm -f 'glm53-exl3-worker'" in line for line in record)
 
 
 # ------------------------------- health wait --------------------------------
