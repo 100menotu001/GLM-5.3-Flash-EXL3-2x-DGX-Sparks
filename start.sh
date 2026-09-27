@@ -1662,6 +1662,11 @@ download_only() {
 # over ~164 GiB / 120 shards on both ends for zero bytes of difference
 # (issue #22, item 2). FORCE_SYNC=1 bypasses the marker; deleting the
 # marker file on the worker has the same effect.
+# The marker is a claim, not proof: it is written only after the synced
+# snapshot passes worker_snapshot_complete, a matching marker is honored only
+# when that same probe passes, and a mutating sync clears the marker before the
+# transfer — so an interrupted sync is neither stamped complete nor skipped on
+# the next launch, and a marker left by an incomplete one is not trusted.
 sync_repo_marker_rev() {
     local src="$1" preferred="${2:-}"
     local rev
@@ -1675,20 +1680,100 @@ sync_repo_marker_rev() {
     printf '%s' "$rev"
 }
 
+# The files the loader opens in the selected snapshot — the two sidecars plus
+# every shard the snapshot's own index names (weight_map values), or the
+# drafter's config + weight — as "bytes name" lines, dereferenced as the loader
+# reads them. Fails closed instead of degrading to a weaker probe: a present
+# index that cannot be read or parsed, a required entry that is not a
+# dereferenced regular file, and a shard name that cannot be quoted into the
+# worker probe are errors, because the loader opens those same files.
+snapshot_required_sizes() {
+    python3 -S -c '
+import json, os, re, stat, sys
+snap, label = sys.argv[1], sys.argv[2]
+if label == "DFlash2 draft":
+    names = ["config.json", "model.safetensors"]
+else:
+    with open(os.path.join(snap, "model.safetensors.index.json"), encoding="utf-8") as fh:
+        weight_map = json.load(fh).get("weight_map") or {}
+    shards = sorted({n for n in weight_map.values() if isinstance(n, str) and n})
+    if not shards or any(not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]*", n) for n in shards):
+        sys.exit(1)
+    names = ["config.json", "model.safetensors.index.json", *shards]
+for name in names:
+    try:
+        st = os.stat(os.path.join(snap, name))
+    except OSError:
+        sys.exit(1)
+    if not stat.S_ISREG(st.st_mode):
+        sys.exit(1)
+    print(st.st_size, name)
+' "$1/snapshots/$2" "$3"
+}
+
+# Worker-side twin of the local completeness contract — model_tree_complete for
+# the target, resolve_dflash_dir for the drafter ("DFlash2 draft") — probed in
+# one ssh call: every entry of the expected inventory must dereference to a
+# regular file of the head's own byte size, so a nonempty partial shard, a
+# directory or a symlink to either is not mistaken for the synced file. The
+# names come from the snapshot's own index, so an unrelated *.safetensors file
+# cannot stand in for a missing required shard.
+worker_snapshot_complete() {
+    local cache_name="$1" rev="$2" sizes="$3"
+    local dir="${WORKER_CACHE_DIR}/hub/${cache_name}/snapshots/${rev}"
+    local -a names=()
+    local size name
+    [ -n "$sizes" ] || return 1
+    while read -r size name; do
+        names+=("$name")
+    done <<<"$sizes"
+    # -L + -type f prints the dereferenced size of entries that resolve to a
+    # regular file only; -printf reproduces the head's "bytes name" lines, so
+    # both sides compare as one string. The unquoted expansion is deliberate:
+    # snapshot_required_sizes validated each name as a single safe token.
+    [ "$(worker_ssh "cd '$dir' && find -L ${names[*]} -maxdepth 0 -type f -printf '%s %p\n' 2>/dev/null")" = "$sizes" ]
+}
+
 sync_repo_to_worker() {
     local src="$1" cache_name="$2" label="$3" preferred="${4:-}"
-    local marker rev
+    local marker rev remote_dir sizes
     marker="${WORKER_CACHE_DIR}/hub/${cache_name}/.glm53-exl3-synced"
     rev="$(sync_repo_marker_rev "$src" "$preferred")"
+    remote_dir="${WORKER_CACHE_DIR}/hub/${cache_name}/snapshots/${rev}"
+    # Verify against the head before touching the worker: a transfer cannot
+    # repair an unreadable index or a missing required entry, so refusing here
+    # keeps a ~164 GiB rsync from running to serve a tree that cannot load.
+    sizes="$(snapshot_required_sizes "$src" "$rev" "$label")" \
+        || die "${label} snapshot cannot be verified on the head: $src/snapshots/$rev — an index or required file is missing or unusable (REFRESH_WEIGHTS=1 re-downloads it)"
     if [ "${FORCE_SYNC:-0}" != "1" ] \
        && [ "$(worker_ssh "cat '$marker' 2>/dev/null" || true)" = "$rev" ]; then
-        log "worker ${cache_name} already at ${rev} — rsync skipped (FORCE_SYNC=1 to force)"
-        return 0
+        if worker_snapshot_complete "$cache_name" "$rev" "$sizes"; then
+            log "worker ${cache_name} already at ${rev} — rsync skipped (FORCE_SYNC=1 to force)"
+            return 0
+        fi
+        warn "worker ${cache_name} marker matches ${rev}, but its snapshot is incomplete — re-syncing"
     fi
     log "syncing ${label} to worker (first run moves ~164 GiB over the p2p link) ..."
-    worker_ssh "mkdir -p '${WORKER_CACHE_DIR}/hub/${cache_name}'"
+    # A mutating sync clears the marker first: --partial keeps half-written
+    # bytes, so a marker left over a failed transfer would describe a tree no
+    # completed sync produced.
+    worker_ssh "mkdir -p '${WORKER_CACHE_DIR}/hub/${cache_name}' && rm -f '$marker'"
     rsync -a --partial --info=progress2 \
         "$src/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${cache_name}/"
+    # HF cache snapshot entries are symlinks into blobs/, so a link whose target
+    # the worker never received stays dangling no matter how often the repo is
+    # re-synced. Repair only that case, and only the drafter's single weight:
+    # rsync -L dereferences the head's link, so the worker gets the 2.3 GiB of
+    # bytes instead of a second copy of the whole repo.
+    if [ "$label" = "DFlash2 draft" ] \
+       && ! worker_snapshot_complete "$cache_name" "$rev" "$sizes"; then
+        warn "DFlash2 model.safetensors is unreadable on worker — copying the weight by value"
+        worker_ssh "mkdir -p '$remote_dir'"
+        rsync -aL --partial --info=progress2 \
+            "$src/snapshots/$rev/model.safetensors" "${WORKER_SSH}:${remote_dir}/"
+    fi
+    worker_snapshot_complete "$cache_name" "$rev" "$sizes" \
+        || die "synced ${label} snapshot is incomplete on worker: $remote_dir"
     worker_ssh "printf '%s' '$rev' > '$marker'"
 }
 
@@ -1699,11 +1784,11 @@ verify_worker_model_snapshot() {
     # proves it can) — there is no worker copy to count, and the export is the
     # tree require_model_snapshot already validated on the head.
     [ "${NFS_SHARE:-0}" = "1" ] && return 0
-    local dir="${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/snapshots/${MODEL_SNAPSHOT}"
-    worker_ssh "test -f '$dir/config.json' \
-        && test -f '$dir/model.safetensors.index.json' \
-        && [ \"\$(find -L '$dir' -maxdepth 1 -type f -name '*.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]')\" -ge '$EXPECTED_SHARDS' ]" \
-        || die "pinned model snapshot is incomplete on worker: $dir"
+    local sizes
+    sizes="$(snapshot_required_sizes "$MODEL_PATH" "$MODEL_SNAPSHOT" "weights")" \
+        || die "pinned model snapshot cannot be verified on the head: $MODEL_PATH/snapshots/$MODEL_SNAPSHOT"
+    worker_snapshot_complete "$MODEL_CACHE_NAME" "$MODEL_SNAPSHOT" "$sizes" \
+        || die "pinned model snapshot is incomplete on worker: ${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/snapshots/${MODEL_SNAPSHOT}"
 }
 
 sync_weights() {
