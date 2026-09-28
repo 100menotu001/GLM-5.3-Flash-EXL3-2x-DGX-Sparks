@@ -64,17 +64,79 @@ K/V, selector, norms and convolution base kernels remain BF16. Target
 `kv_b_proj` and embeddings remain native; a pack may explicitly quantize
 the unpadded `language_model.lm_head`.
 
-Stage the target under
-`$HF_HOME/hub/$MODEL_CACHE_NAME/snapshots/<target-revision>/`, set that
-cache's `refs/main`, and stage the paired draft under
-`$HF_HOME/hub/models--<publisher>--<draft>/snapshots/<draft-revision>/`.
-Select the target with the existing `MODEL`/`MODEL_CACHE_NAME` settings;
-the usual sync copies the selected assets to the worker. Without
-`HF_HOME`, the root is `~/.cache/huggingface`. Symlinked shards must resolve
-on both ranks. No model weights or machine-local configuration belong in git.
+### Find and stage a compatible Hub pair
 
-`./start.sh download` does not fetch the paired draft; stage that pinned
-snapshot separately before starting or restarting this profile.
+For the ordinary FP8/BF16-draft setup today, use the public
+[TR3 4-bpw target](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
+and [BF16 DFlash2 draft](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2);
+`./start.sh download` fetches these defaults. **They do not activate the
+H3/6-bpw profile:** the public TR3 target has no `glm53_profile`, and the
+public IncoAI draft is BF16, not a 6-bpw EXL3 draft.
+
+For the optional H3 profile, search
+[Hugging Face GLM-5.3 EXL3 models](https://huggingface.co/models?search=GLM-5.3-Flash-EXL3).
+Open a candidate target's `config.json` under **Files and versions** and look
+for `glm53_profile.name=dense-exl3-h3-dflash2-6bpw` and
+`quantization_config.non_routed_exl3.layers`. Read its model card and license.
+**Do not select by repository name or bitrate alone.** The target metadata
+names its paired draft repository, immutable revision, and config SHA-256;
+follow that reference rather than searching for an arbitrary DFlash2 draft.
+Any publisher's pair may work if the staged files pass the profile validator.
+No publicly verified compatible H3/6-bpw pair is identified here yet.
+
+On the head node, after selecting a *real published* target and its 40-hex
+Hub commit, inspect its small config before downloading the full checkpoint:
+
+```bash
+export TARGET_REPO='publisher/compatible-target'  # replace with a real Hub id
+export TARGET_REV='0123456789abcdef0123456789abcdef01234567'  # replace with its commit
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+target_config="$(hf download "$TARGET_REPO" config.json --revision "$TARGET_REV")"
+python3 - "$target_config" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+profile = cfg.get("glm53_profile", {})
+if profile.get("name") != "dense-exl3-h3-dflash2-6bpw":
+    raise SystemExit("No H3/6-bpw profile; this pack uses the ordinary path")
+draft = profile["draft"]
+print("Paired draft:", draft["model"], "revision:", draft["revision"])
+print("Expected draft config SHA-256:", draft["config_sha256"])
+PY
+```
+
+Set `DRAFT_REPO` and `DRAFT_REV` to the values printed by that config, then
+stage **both complete revisions** in the same `$HF_HOME` cache:
+
+```bash
+hf download "$TARGET_REPO" --revision "$TARGET_REV"
+hf download "$DRAFT_REPO" --revision "$DRAFT_REV"
+target_cache="$HF_HOME/hub/models--${TARGET_REPO//\//--}"
+python3 tools/pack_profile.py "$target_cache/snapshots/$TARGET_REV" --hub "$HF_HOME/hub"
+```
+
+The last command must print the selected H3 settings, not an empty result or
+an error: it checks the draft's **exact config hash**, both packed inventories,
+BF16 K/V, and 6-bpw shapes. Check both Hub licenses before downloading or
+redistributing any derivative (the public BF16 IncoAI draft is
+CC BY-NC-ND 4.0). After validation, select the target and its exact snapshot
+for the launcher. It checks the profile before stopping existing containers;
+the usual weight sync to the worker happens during the subsequent startup:
+
+```bash
+install -d "$target_cache/refs"
+printf '%s' "$TARGET_REV" > "$target_cache/refs/main"
+MODEL="$TARGET_REPO" MODEL_CACHE_NAME="models--${TARGET_REPO//\//--}" \
+  MODEL_REVISION="$TARGET_REV" MODEL_FALLBACK="$TARGET_REPO" \
+  MODEL_FALLBACK_CACHE_NAME="models--${TARGET_REPO//\//--}" ./start.sh restart
+```
+
+This selection pins **the operator's chosen compatible pair**, not the
+private benchmark pair. Without `HF_HOME`, the cache is
+`~/.cache/huggingface`; symlinked shards must resolve on both ranks.
+`./start.sh download` does **not** discover or fetch a profile-paired draft,
+so stage it with `hf download` first. Missing or mismatched profile assets
+fail before a restart stops the existing containers. No model weights or
+machine-local configuration belong in git.
 
 Before a restart stops either container, `tools/pack_profile.py` validates
 the metadata, draft config hash, indexed files and packed tensor headers.
