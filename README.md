@@ -73,6 +73,9 @@ the usual sync copies the selected assets to the worker. Without
 `HF_HOME`, the root is `~/.cache/huggingface`. Symlinked shards must resolve
 on both ranks. No model weights or machine-local configuration belong in git.
 
+`./start.sh download` does not fetch the paired draft; stage that pinned
+snapshot separately before starting or restarting this profile.
+
 Before a restart stops either container, `tools/pack_profile.py` validates
 the metadata, draft config hash, indexed files and packed tensor headers.
 The target must have `model.safetensors.index.json`; the draft must have
