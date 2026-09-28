@@ -138,6 +138,12 @@ so stage it with `hf download` first. Missing or mismatched profile assets
 fail before a restart stops the existing containers. No model weights or
 machine-local configuration belong in git.
 
+If `EXL3_OVERLAY_HOST` selects a generated cooperative overlay, regenerate it
+from this checkout's `overlay/exl3.py` with the matching TP2 profile generator
+before restarting. The launcher refuses an older overlay without the dense
+loader even for an ordinary target, because an EXL3 draft can be selected
+independently. Native binary and adapter pins are unchanged.
+
 Before a restart stops either container, `tools/pack_profile.py` validates
 the metadata, draft config hash, indexed files and packed tensor headers.
 The target must have `model.safetensors.index.json`; the draft must have
