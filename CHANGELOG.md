@@ -28,6 +28,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   zero-acceptance and canary-off behavior;
   `tests/test_warmup_canary_launchers.py` covers all three launcher rc-3 paths
   and teardown-failure reporting.
+- Auto/lazy safetensors staging (`GLM53_LOAD_CLONE=1`) and optional bounded
+  local-shard read-ahead (`GLM53_LOAD_PREFETCH=0`, decimal `0..16`) on TP2/TP3/TP4.
+  Preserve InstantTensor selection, rank parity, PR230 safety and compact-draft
+  settings. The shard window is not a host-memory limit; GPU loader performance
+  and KV-capacity gains are not established for this combined candidate.
+  Motivated by [Alexbob0's mmap-load measurements](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md).
 - TP2 dense EXL3 target loading (including declared `lm_head`), mixed BF16
   projection tails, and six-group H3 BF16 prefill retention above 144 rows.
   Add 6-bpw EXL3 DFlash2 drafts with BF16 context K/V and target-only FP8
@@ -37,12 +43,6 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   retain #281 FP8 defaults; conflicting exports, missing shards, changed draft
   metadata and unsupported profiles refuse. No new pack URL or weights ship
   with this change; see README for the publisher metadata/staging contract.
-- Auto/lazy safetensors staging (`GLM53_LOAD_CLONE=1`) and optional bounded
-  local-shard read-ahead (`GLM53_LOAD_PREFETCH=0`, decimal `0..16`) on TP2/TP3/TP4.
-  Preserve InstantTensor selection, rank parity, PR230 safety and compact-draft
-  settings. The shard window is not a host-memory limit; GPU loader performance
-  and KV-capacity gains are not established for this combined candidate.
-  Motivated by [Alexbob0's mmap-load measurements](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md).
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not
