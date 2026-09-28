@@ -72,8 +72,10 @@ them), so they stay on.
 ## TP=3
 
 Nothing here was measured at TP=3.
-- `.env.tp3` pins its own `GLM53_DENSE_FP8=dense,kda`, its own KV pool (35 GiB), and already sets
-  `GLM53_KDA_BF16_LARGE_M=1`.
+- The measured cluster's `.env.tp3` pins `GLM53_DENSE_FP8=dense,kda`, its own KV pool (35 GiB), and already sets
+  `GLM53_KDA_BF16_LARGE_M=1`. These are cluster-local values, not all template defaults.
+- `start-tp3.sh` clears the shared TP2 KDA-retention flag before reading `.env.tp3`, so fresh TP3 setups keep
+  retention off. Set `GLM53_KDA_BF16_LARGE_M=1` in `.env.tp3` or the caller environment to opt in.
 - `start-tp3.sh` unsets the TP2 `EXL3_OVERLAY_HOST` because the TP2 cooperative adapter is the wrong ABI for TP3.
 - **Code-verified:** the #233 path lists the TP3 shape `8726×4096`.
 - Rolling FP8=all into TP3 needs its own A/B/A (different per-rank shapes, and every rank must agree on the FP8 set
