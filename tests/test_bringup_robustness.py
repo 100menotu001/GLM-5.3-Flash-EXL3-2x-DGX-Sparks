@@ -98,6 +98,7 @@ start_unlocked() {{
     fi
 }}
 banner() {{ :; }}
+select_dense_h3() {{ :; }}
 resolve_pack_profile() {{ :; }}
 validate_numeric_config() {{ :; }}
 configure_capture_sizes() {{ :; }}

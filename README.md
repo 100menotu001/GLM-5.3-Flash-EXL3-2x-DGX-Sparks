@@ -64,6 +64,52 @@ K/V, selector, norms and convolution base kernels remain BF16. Target
 `kv_b_proj` and embeddings remain native; a pack may explicitly quantize
 the unpadded `language_model.lm_head`.
 
+### Build the H3 pair on the head (`GLM53_MODEL_PRESET=dense-h3`)
+
+No Hub repository carries a ready H3/6-bpw pair. The preset builds one from
+three public inputs, each pinned in `start.sh`:
+
+| Part | Public input | Built by |
+|---|---|---|
+| Target base | [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw) (the default target; `config.json` and index SHA-256 pinned) | — |
+| Target dense EXL3 tensors | [turboderp/GLM-5.3-Flash-exl3 `4.05bpw`](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) at commit `2a30229e`, MIT | `tools/dense_overlay.py` range-reads only the non-routed linears (~5.3 GB) and links the TR3 shards |
+| Draft | [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) at `dc77ff1c` (BF16) | `tools/dflash2_exl3_quant.sh` quantizes it to 6 bpw with [MiaAI-Lab/exllamav3](https://github.com/MiaAI-Lab/exllamav3) at `63b32f0` on the head GPU, in the serve image |
+
+Opt in on a TP2 kit with one `.env` line, then start from a stopped serve:
+
+```bash
+echo 'GLM53_MODEL_PRESET=dense-h3' >> .env
+./start.sh stop && ./start.sh
+```
+
+The first start downloads TR3 and the BF16 draft if missing, quantizes the
+draft (~25 min on the head GB10, including a one-off extension compile),
+fetches the dense tensors (~2 min measured), and stages the pair:
+
+- **Target:** `<TR3 repo>/snapshots/<rev>` under `$HF_HOME/hub`. It shares
+  the TR3 blobs through relative links, so the usual worker rsync adds only
+  the one overlay file. `refs/glm53-dense-h3` names it; `refs/main` is not
+  touched, so removing the preset line restores the ordinary pack; the
+  launcher's newest-snapshot fallbacks skip this snapshot.
+- **Draft:** `models--local--GLM-5.3-Flash-DFlash2-EXL3-6bpw`.
+
+Both revisions are SHA-1s of the staged file identities. Both builds are
+byte-reproducible (two builds on different days and images matched), so
+`start.sh` pins the draft revision and the overlay file's SHA-256 and refuses
+a build that differs. Later starts adopt
+the built pair, and `tools/pack_profile.py` validates it on every start.
+`./start.sh download` builds it too.
+
+A `restart` refuses before stopping anything while the pair is not built. The
+draft build also refuses while the GLM head container runs, because
+quantization on the head GPU would compete with a live serve for unified
+memory. Build artifacts and the header cache live in `$HF_HOME/glm53-dense-h3`.
+
+The IncoAI draft is CC BY-NC-ND 4.0: the quantized draft is built for your
+own use on your own head node and is not redistributed. The preset is TP2
+only and is **opt-in**. It has not yet been A/B measured against this kit's
+default (`GLM53_DENSE_FP8=all` + KDA BF16 large-M) serve.
+
 ### Find and stage a compatible Hub pair
 
 For the ordinary FP8/BF16-draft setup today, use the public
@@ -82,7 +128,8 @@ for `glm53_profile.name=dense-exl3-h3-dflash2-6bpw` and
 names its paired draft repository, immutable revision, and config SHA-256;
 follow that reference rather than searching for an arbitrary DFlash2 draft.
 Any publisher's pair may work if the staged files pass the profile validator.
-No publicly verified compatible H3/6-bpw pair is identified here yet.
+No published compatible H3/6-bpw pair is identified here yet; the preset
+above builds one from public inputs.
 
 On the head node, after selecting a *real published* target and its 40-hex
 Hub commit, inspect its small config before downloading the full checkpoint:
@@ -133,8 +180,9 @@ MODEL="$TARGET_REPO" MODEL_CACHE_NAME="models--${TARGET_REPO//\//--}" \
 This selection pins **the operator's chosen compatible pair**, not the
 private benchmark pair. Without `HF_HOME`, the cache is
 `~/.cache/huggingface`; symlinked shards must resolve on both ranks.
-`./start.sh download` does **not** discover or fetch a profile-paired draft,
-so stage it with `hf download` first. Missing or mismatched profile assets
+`./start.sh download` does **not** discover or fetch a publisher's
+profile-paired draft (only the `dense-h3` preset builds its own), so stage
+it with `hf download` first. Missing or mismatched profile assets
 fail before a restart stops the existing containers. No model weights or
 machine-local configuration belong in git.
 
