@@ -83,7 +83,12 @@ run-to-run spread). Isolated layer bench: 7168-token MoE layer 77–91 ms (E2) �
 numerically indistinguishable from E2 vs the LinearEXL3 reference. Full receipts, gates and
 the memory caveat: `logs/overnight-20260906T164059Z/report.md`.
 
-**Context and headroom:** the shipped default is now **850k / util 0.85 / rightsize** (with `LOAD_FORMAT=` it boots with ~0.5 GiB of KV margin on the head; with the default InstantTensor loader the pool is reserved explicitly at 14 GiB via `EXTRA_ARGS`, without which 0.85 does **not** boot, see [InstantTensor and KV memory](#instanttensor-and-kv-memory); a 256k prefill ran at 900k / 0.87 with driver retries but no failure). E3 keeps a 560 MiB fat-row scratch that vLLM's profile run charges to
+**Current TP2 defaults:** `.env.example` selects FP8 `all`, KDA BF16 large-M retention,
+and an 11 GiB KV reservation with compact draft pages. See the
+[adoption finding](docs/adopt-fp8-all-kda-bf16-2026-09-26.md) for capacity, memory costs,
+numerical qualification and the non-compact rollback.
+
+**Historical context and headroom (before that adoption):** the default was **850k / util 0.85 / rightsize** (with `LOAD_FORMAT=` it booted with ~0.5 GiB of KV margin on the head; with the InstantTensor loader the pool was reserved explicitly at 14 GiB via `EXTRA_ARGS`, without which 0.85 did **not** boot, see [InstantTensor and KV memory](#instanttensor-and-kv-memory); a 256k prefill ran at 900k / 0.87 with driver retries but no failure). E3 keeps a 560 MiB fat-row scratch that vLLM's profile run charges to
 the KV budget, so at 1M / util 0.87 the pool no longer fits one 1M request on this kit
 (needs 14.52 GiB). 500k needs 10.98 GiB and boots reliably at 0.84 (1.2× at 500k). Prompts
 ≥ ~100k are near the head's host-memory limit at any setting (a 256k prefill at util 0.87
@@ -133,9 +138,9 @@ Live operator handoff (geometry 1, rollback, pins):
 The two-node opt-in and rollback sequence is
 [`docs/cooperative-moe-quickstart.md`](docs/cooperative-moe-quickstart.md).
 
-### Faster prose decode (opt-in, 2026-09-08)
+### Faster prose decode (2026-09-08 measurements)
 
-Two decode speed-ups ship in the overlay, both **off by default** (matched A/B/A at 131k and 850k, 8 runs per prompt, bootstrap 95 % CI; receipts in `logs/overnight-decode-20260907T224521Z/`):
+These measurements used the then-opt-in adaptive-k and FP8 paths (matched A/B/A at 131k and 850k, 8 runs per prompt, bootstrap 95 % CI; receipts in `logs/overnight-decode-20260907T224521Z/`). Adaptive-k remains off by default; new TP2 setups now select FP8 `all` as documented in the [adoption finding](docs/adopt-fp8-all-kda-bf16-2026-09-26.md). The settings and memory figures below describe the earlier comparison, not the current compact-page profile:
 
 - **Adaptive verification length** (`GLM53_ADAPTIVE_K=ema`): the DFlash2 drafter still proposes 7 tokens, but the scheduler verifies only a per-step prefix (2, 4 or 7) chosen from a running average of how many drafts have been surviving, batch-uniform so every decode step keeps its FULL CUDA graph. Lossless at temperature 0. Measured vs stock k=7 (8 runs/prompt, 131k and 850k): Silk Road essay +21 %, sky/sunset +13 %, hash-map +10 %, code +5–15 %, counting unchanged.
 - **FP8 weight-only dense projections** (`GLM53_DENSE_FP8=dense,kda`): KDA and dense-MLP projections quantised per output channel to FP8 at load and run through the Marlin kernel, ~11 ms less per step on everything (+10 % on counting, prose +12–19 % alone, **+37 % on hard prose stacked with adaptive-k**). PROVISIONAL: it changes target numerics by FP8 rounding (KL proxy vs stock 0.002–0.013 nats/position, argmax agreement 94–100 %; no full KLD panel yet).
@@ -146,7 +151,7 @@ Turn on (no rebuild; the patches apply at container start on both nodes):
 # .env
 GLM53_ADAPTIVE_K=ema
 GLM53_ADAPTIVE_K_SET=2,4,7
-GLM53_DENSE_FP8=dense,kda            # drop this line to keep BF16 dense weights (lossless config)
+GLM53_DENSE_FP8=dense,kda            # set off explicitly to keep BF16 dense weights
 EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"
 ```
 
@@ -1038,7 +1043,7 @@ does not boot with the loader on — the engine fails at KV allocation after the
 already loaded. `Model loading took 79.65 GiB` is identical either way; the difference shows
 up only in `Available KV cache memory`.
 
-Three ways to run it, in the order we recommend (the first is the shipped default as of this change):
+Historical alternatives from that comparison (the first was the shipped default then; the current compact-page reservation is in the [adoption finding](docs/adopt-fp8-all-kda-bf16-2026-09-26.md)):
 
 | setting | KV pool | boots on 2x GB10 | notes |
 |---|---|---|---|
@@ -1540,7 +1545,7 @@ that are now documented/enforced:
 | `ABLIT` | `0` (off) | opt-in. `1` = apply o_proj edit at load on both ranks. Unset leaves checkpoint weights unchanged |
 | `GLM53_ADAPTIVE_K` | `off` | `ema` = adaptive verification length (prose +13–21 %); needs the capture-size list in `EXTRA_ARGS`. See *Faster prose decode* |
 | `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1 |
-| `GLM53_DENSE_FP8` | `off` | `dense,kda` = FP8 weight-only (Marlin) dense projections, ~-11 ms/step; PROVISIONAL numerics. Groups: `shared,dense,kda,mla` |
+| `GLM53_DENSE_FP8` | `all` in `.env.example`; `off` if unset | FP8 weight-only (Marlin) dense projections. Groups: `shared,dense,kda,mla`; changes target numerics. See the [TP2 adoption finding](docs/adopt-fp8-all-kda-bf16-2026-09-26.md). TP3's template selects `dense,kda` |
 | `ABLIT_METHOD` | `auto` | `auto` = transplant when `ablit/transplant/` is populated, else `proj` |
 | `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
 | `ABLIT_DIRECTION` | `dealign` | proj-only: `dealign` \| `bf_oproj` \| path to a custom `.pt` |
