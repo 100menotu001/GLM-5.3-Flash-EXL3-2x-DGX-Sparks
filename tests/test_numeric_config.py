@@ -434,6 +434,24 @@ inspect_loader() {
                 assert not harness.host_touching_calls(), harness.calls()
 
 
+@pytest.mark.parametrize("launcher", ("start.sh", "start-tp3.sh", "start-tp4.sh"))
+def test_dense_exl3_conflicts_before_host_actions(launcher):
+    from test_launcher_rank_parity import Harness
+
+    with tempfile.TemporaryDirectory() as directory:
+        harness = Harness(Path(directory), launcher=launcher)
+        cases = [{"GLM53_DENSE_EXL3": "1", "GLM53_DENSE_FP8": "all"},
+                 {"GLM53_DENSE_EXL3": "1", "GLM53_DENSE_FP8": "off", "ABLIT": "1"}]
+        if launcher == "start.sh":
+            cases += [{"GLM53_DENSE_EXL3": ""},
+                      {"GLM53_DENSE_EXL3_PREFILL_BF16": "kda_in mla_q_b"},
+                      {"GLM53_DENSE_EXL3_PREFILL_BF16": ""}]
+        for env in cases:
+            result = harness.run("restart", **env)
+            assert result.returncode == 2, (launcher, env, result.stderr)
+            assert not harness.host_touching_calls(), harness.calls()
+
+
 if __name__ == "__main__":
     test_matrix()
     test_decimal_normalization()

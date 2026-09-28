@@ -217,6 +217,17 @@ def walk_o_proj(model: Any) -> list[tuple[str, int | None, Any]]:
     return found
 
 
+def _refuse_exl3_o_proj(name: str, mod: Any) -> None:
+    """ABLIT edits a BF16 o_proj; an EXL3-dense o_proj (pack non_routed_exl3)
+    has no BF16 weight to edit and trellis tensors cannot be transplanted.
+    The pack covers o_proj on every layer, so any enabled layer range hits
+    this. Fail loud instead of silently serving stock weights."""
+    if getattr(mod, "_exl3_linear_n_shards", None) is not None:
+        raise AblitError(
+            f"ablit: {name} is EXL3-dense (pack non_routed_exl3); ABLIT edits "
+            "BF16 o_proj only — unset ABLIT or serve a non-dense-EXL3 pack")
+
+
 def unwrap_text_model(model: Any) -> Any:
     """Accept the multimodal wrapper and hand back the text model."""
     lm = getattr(model, "language_model", None)
@@ -262,6 +273,7 @@ def apply_ablit(
         else:
             if idx not in want:
                 continue
+        _refuse_exl3_o_proj(name, mod)
         rep = apply_to_o_proj(mod, r, alpha)
         if rep.get("edited"):
             if is_mtp:
@@ -346,6 +358,7 @@ def apply_transplant(
                 f"ABLIT_METHOD=transplant has no donor tensor for layer {idx} "
                 "— fetch it with ablit/fetch_transplant.py")
         donor = donors[idx]
+        _refuse_exl3_o_proj(name, mod)
         weight = getattr(mod, "weight", None)
         if weight is None or not torch.is_tensor(weight) or weight.dim() != 2:
             raise AblitError(f"ablit transplant: {name} has no 2-D .weight")

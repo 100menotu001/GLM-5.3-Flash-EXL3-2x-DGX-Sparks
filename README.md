@@ -40,6 +40,85 @@ inside the draft block on this image and collapses later-position accept).
 Release notes from the initial 1.0.0 recipe through **1.6.0** are in
 [CHANGELOG.md](CHANGELOG.md).
 
+## Pack-selected dense EXL3 (TP2)
+
+Normal packs keep the #281 defaults: `GLM53_DENSE_FP8=all`, KDA large-M
+BF16 retention, and the pinned BF16 DFlash2 draft. Dense EXL3 is not inferred
+from a model name or enabled by downloading this code.
+
+A compatible **staged target pack** can select the H3/6-bpw-draft profile
+through a top-level `glm53_profile` object in its `config.json`:
+
+| Field | Required value |
+|---|---|
+| `name` | `dense-exl3-h3-dflash2-6bpw` |
+| `draft.model` | Publisher-supplied repository id for the paired EXL3 DFlash2 pack |
+| `draft.revision` | Immutable 40-hex snapshot revision |
+| `draft.config_sha256` | SHA-256 of the exact paired draft `config.json` bytes |
+
+The target must also declare `quantization_config.non_routed_exl3.layers`
+with the real served module prefixes and bitrates, including all H3 types.
+The paired 5-layer, 4096-wide DFlash2 pack must declare `scope=dflash2_draft`,
+6-bit EXL3 q/o/MLP/conv-kernel/fc projections, and QKV `bf16_shards=[1,2]`.
+K/V, selector, norms and convolution base kernels remain BF16. Target
+`kv_b_proj` and embeddings remain native; a pack may explicitly quantize
+the unpadded `language_model.lm_head`.
+
+Stage the target under
+`$HF_HOME/hub/$MODEL_CACHE_NAME/snapshots/<target-revision>/`, set that
+cache's `refs/main`, and stage the paired draft under
+`$HF_HOME/hub/models--<publisher>--<draft>/snapshots/<draft-revision>/`.
+Select the target with the existing `MODEL`/`MODEL_CACHE_NAME` settings;
+the usual sync copies the selected assets to the worker. Without
+`HF_HOME`, the root is `~/.cache/huggingface`. Symlinked shards must resolve
+on both ranks. No model weights or machine-local configuration belong in git.
+
+Before a restart stops either container, `tools/pack_profile.py` validates
+the metadata, draft config hash, indexed files and packed tensor headers.
+The target must have `model.safetensors.index.json`; the draft must have
+`model.safetensors`. The profile pins the selected target snapshot and its
+actual shard inventory, including refresh/sync, without an ordinary-pack
+fallback. An exported `MODEL_REVISION` must agree with that snapshot.
+Only then does the launcher select:
+
+```text
+GLM53_DENSE_EXL3=1
+GLM53_DENSE_FP8=off
+GLM53_DENSE_EXL3_PREFILL_BF16=kda_in,shared_down,mla_qkv_a,shared_gate_up,kda_o,mla_q_b
+GLM53_KDA_BF16_LARGE_M=0
+ABLIT=0
+SPEC_METHOD=dflash
+DFLASH_DRAFT_TP=2
+```
+
+The draft identity comes from metadata, not a built-in URL. Shipped `.env`
+FP8/BF16-draft defaults can be replaced by this explicit pack choice;
+conflicting caller exports or non-default `.env` settings fail closed.
+Remove a conflicting override rather than expecting the profile to ignore it.
+TP3/TP4 launchers do not support this profile. No TP3 trellis padding is added.
+
+The six H3 groups retain one reconstructed BF16 weight per module (2 bytes
+per retained weight per rank) for `M > 144`; smaller batches use EXL3.
+This changes arithmetic, not just storage, and consumes additional memory.
+Draft modules and the vocabulary head never receive target retention.
+The #281 FP8 KDA boundary remains `M > 512`. EXL3 bitcoder shapes are warmed
+before graph capture to avoid first-use autotuning inside a CUDA graph.
+
+Without profile metadata, manual dense activation requires
+`GLM53_DENSE_EXL3=1 GLM53_DENSE_FP8=off ABLIT=0` and a compatible target
+pack; retention defaults to off (the legacy KDA knob can still select
+`kda_in`). The retention selector accepts the six H3 names above plus
+`dense_gate_up,dense_down,mla_o`, or `off`/`all`. An EXL3 draft can also
+be selected manually via `DFLASH_MODEL`/`DFLASH_REVISION` while keeping the
+normal FP8 target: target FP8 selection excludes offset draft layers.
+
+**Asset prerequisite:** this change publishes neither a dense target pack
+with this metadata nor a compatible immutable 6-bpw draft snapshot.
+Publishers must supply those artifacts and the config hash before the
+single-pack selection path is usable. It never substitutes the BF16 draft
+for a missing paired asset. CPU loader/profile checks do not establish GPU
+quality, acceptance, speed or available KV capacity for a new pack.
+
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
 
 `EXL3_FAT_GROUPED=1` (launcher default since 2026-09-07) replaces the E2 per-expert host loop for "fat" experts with three
