@@ -40,6 +40,156 @@ inside the draft block on this image and collapses later-position accept).
 Release notes from the initial 1.0.0 recipe through **1.6.0** are in
 [CHANGELOG.md](CHANGELOG.md).
 
+## Pack-selected dense EXL3 (TP2)
+
+Normal packs keep the #281 defaults: `GLM53_DENSE_FP8=all`, KDA large-M
+BF16 retention, and the pinned BF16 DFlash2 draft. Dense EXL3 is not inferred
+from a model name or enabled by downloading this code.
+
+A compatible **staged target pack** can select the H3/6-bpw-draft profile
+through a top-level `glm53_profile` object in its `config.json`:
+
+| Field | Required value |
+|---|---|
+| `name` | `dense-exl3-h3-dflash2-6bpw` |
+| `draft.model` | Publisher-supplied repository id for the paired EXL3 DFlash2 pack |
+| `draft.revision` | Immutable 40-hex snapshot revision |
+| `draft.config_sha256` | SHA-256 of the exact paired draft `config.json` bytes |
+
+The target must also declare `quantization_config.non_routed_exl3.layers`
+with the real served module prefixes and bitrates, including all H3 types.
+The paired 5-layer, 4096-wide DFlash2 pack must declare `scope=dflash2_draft`,
+6-bit EXL3 q/o/MLP/conv-kernel/fc projections, and QKV `bf16_shards=[1,2]`.
+K/V, selector, norms and convolution base kernels remain BF16. Target
+`kv_b_proj` and embeddings remain native; a pack may explicitly quantize
+the unpadded `language_model.lm_head`.
+
+### Find and stage a compatible Hub pair
+
+For the ordinary FP8/BF16-draft setup today, use the public
+[TR3 4-bpw target](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
+and [BF16 DFlash2 draft](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2);
+`./start.sh download` fetches these defaults. **They do not activate the
+H3/6-bpw profile:** the public TR3 target has no `glm53_profile`, and the
+public IncoAI draft is BF16, not a 6-bpw EXL3 draft.
+
+For the optional H3 profile, search
+[Hugging Face GLM-5.3 EXL3 models](https://huggingface.co/models?search=GLM-5.3-Flash-EXL3).
+Open a candidate target's `config.json` under **Files and versions** and look
+for `glm53_profile.name=dense-exl3-h3-dflash2-6bpw` and
+`quantization_config.non_routed_exl3.layers`. Read its model card and license.
+**Do not select by repository name or bitrate alone.** The target metadata
+names its paired draft repository, immutable revision, and config SHA-256;
+follow that reference rather than searching for an arbitrary DFlash2 draft.
+Any publisher's pair may work if the staged files pass the profile validator.
+No publicly verified compatible H3/6-bpw pair is identified here yet.
+
+On the head node, after selecting a *real published* target and its 40-hex
+Hub commit, inspect its small config before downloading the full checkpoint:
+
+```bash
+export TARGET_REPO='publisher/compatible-target'  # replace with a real Hub id
+export TARGET_REV='0123456789abcdef0123456789abcdef01234567'  # replace with its commit
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+target_config="$(hf download "$TARGET_REPO" config.json --revision "$TARGET_REV")"
+python3 - "$target_config" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+profile = cfg.get("glm53_profile", {})
+if profile.get("name") != "dense-exl3-h3-dflash2-6bpw":
+    raise SystemExit("No H3/6-bpw profile; this pack uses the ordinary path")
+draft = profile["draft"]
+print("Paired draft:", draft["model"], "revision:", draft["revision"])
+print("Expected draft config SHA-256:", draft["config_sha256"])
+PY
+```
+
+Set `DRAFT_REPO` and `DRAFT_REV` to the values printed by that config, then
+stage **both complete revisions** in the same `$HF_HOME` cache:
+
+```bash
+hf download "$TARGET_REPO" --revision "$TARGET_REV"
+hf download "$DRAFT_REPO" --revision "$DRAFT_REV"
+target_cache="$HF_HOME/hub/models--${TARGET_REPO//\//--}"
+python3 tools/pack_profile.py "$target_cache/snapshots/$TARGET_REV" --hub "$HF_HOME/hub"
+```
+
+The last command must print the selected H3 settings, not an empty result or
+an error: it checks the draft's **exact config hash**, both packed inventories,
+BF16 K/V, and 6-bpw shapes. Check both Hub licenses before downloading or
+redistributing any derivative (the public BF16 IncoAI draft is
+CC BY-NC-ND 4.0). After validation, select the target and its exact snapshot
+for the launcher. It checks the profile before stopping existing containers;
+the usual weight sync to the worker happens during the subsequent startup:
+
+```bash
+install -d "$target_cache/refs"
+printf '%s' "$TARGET_REV" > "$target_cache/refs/main"
+MODEL="$TARGET_REPO" MODEL_CACHE_NAME="models--${TARGET_REPO//\//--}" \
+  MODEL_REVISION="$TARGET_REV" MODEL_FALLBACK="$TARGET_REPO" \
+  MODEL_FALLBACK_CACHE_NAME="models--${TARGET_REPO//\//--}" ./start.sh restart
+```
+
+This selection pins **the operator's chosen compatible pair**, not the
+private benchmark pair. Without `HF_HOME`, the cache is
+`~/.cache/huggingface`; symlinked shards must resolve on both ranks.
+`./start.sh download` does **not** discover or fetch a profile-paired draft,
+so stage it with `hf download` first. Missing or mismatched profile assets
+fail before a restart stops the existing containers. No model weights or
+machine-local configuration belong in git.
+
+If `EXL3_OVERLAY_HOST` selects a generated cooperative overlay, regenerate it
+from this checkout's `overlay/exl3.py` with the matching TP2 profile generator
+before restarting. The launcher refuses an older overlay without the dense
+loader even for an ordinary target, because an EXL3 draft can be selected
+independently. Native binary and adapter pins are unchanged.
+
+Before a restart stops either container, `tools/pack_profile.py` validates
+the metadata, draft config hash, indexed files and packed tensor headers.
+The target must have `model.safetensors.index.json`; the draft must have
+`model.safetensors`. The profile pins the selected target snapshot and its
+actual shard inventory, including refresh/sync, without an ordinary-pack
+fallback. An exported `MODEL_REVISION` must agree with that snapshot.
+Only then does the launcher select:
+
+```text
+GLM53_DENSE_EXL3=1
+GLM53_DENSE_FP8=off
+GLM53_DENSE_EXL3_PREFILL_BF16=kda_in,shared_down,mla_qkv_a,shared_gate_up,kda_o,mla_q_b
+GLM53_KDA_BF16_LARGE_M=0
+ABLIT=0
+SPEC_METHOD=dflash
+DFLASH_DRAFT_TP=2
+```
+
+The draft identity comes from metadata, not a built-in URL. Shipped `.env`
+FP8/BF16-draft defaults can be replaced by this explicit pack choice;
+conflicting caller exports or non-default `.env` settings fail closed.
+Remove a conflicting override rather than expecting the profile to ignore it.
+TP3/TP4 launchers do not support this profile. No TP3 trellis padding is added.
+
+The six H3 groups retain one reconstructed BF16 weight per module (2 bytes
+per retained weight per rank) for `M > 144`; smaller batches use EXL3.
+This changes arithmetic, not just storage, and consumes additional memory.
+Draft modules and the vocabulary head never receive target retention.
+The #281 FP8 KDA boundary remains `M > 512`. EXL3 bitcoder shapes are warmed
+before graph capture to avoid first-use autotuning inside a CUDA graph.
+
+Without profile metadata, manual dense activation requires
+`GLM53_DENSE_EXL3=1 GLM53_DENSE_FP8=off ABLIT=0` and a compatible target
+pack; retention defaults to off (the legacy KDA knob can still select
+`kda_in`). The retention selector accepts the six H3 names above plus
+`dense_gate_up,dense_down,mla_o`, or `off`/`all`. An EXL3 draft can also
+be selected manually via `DFLASH_MODEL`/`DFLASH_REVISION` while keeping the
+normal FP8 target: target FP8 selection excludes offset draft layers.
+
+**Asset prerequisite:** this change publishes neither a dense target pack
+with this metadata nor a compatible immutable 6-bpw draft snapshot.
+Publishers must supply those artifacts and the config hash before the
+single-pack selection path is usable. It never substitutes the BF16 draft
+for a missing paired asset. CPU loader/profile checks do not establish GPU
+quality, acceptance, speed or available KV capacity for a new pack.
+
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
 
 `EXL3_FAT_GROUPED=1` (launcher default since 2026-09-07) replaces the E2 per-expert host loop for "fat" experts with three
@@ -1825,6 +1975,9 @@ retains that license and the parent's third-party notices. DFlash2 stays [CC BY-
   (uniform-K4 routed-experts, ShapleyMCG License 1.0). Public mirror for this
   recipe: [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
 - **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
+- **Dense-EXL3 TP2 loader:** ported from
+  [Alexbob0/glm53-flash-dense-exl3-tp2](https://github.com/Alexbob0/glm53-flash-dense-exl3-tp2)
+  (MIT), itself based on [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3).
 - **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
   [GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)

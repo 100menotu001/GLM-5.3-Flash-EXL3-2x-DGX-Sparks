@@ -443,6 +443,7 @@ COPY overlay/patch_model_overrides.py /opt/glm53/patch_model_overrides.py
 COPY overlay/qwen3_dflash2.py /opt/glm53/qwen3_dflash2.py
 COPY overlay/dflash2_speculator.py /opt/glm53/dflash2_speculator.py
 COPY overlay/patch_dflash2.py /opt/glm53/patch_dflash2.py
+COPY overlay/patch_dflash2_exl3.py /opt/glm53/patch_dflash2_exl3.py
 COPY overlay/patch_glm_eagle3.py /opt/glm53/patch_glm_eagle3.py
 COPY overlay/patch_glm5_drafter_group.py /opt/glm53/patch_glm5_drafter_group.py
 COPY tests/test_exl3_overlay.py /opt/glm53/test_exl3_overlay.py
@@ -487,6 +488,10 @@ COPY tests/test_ablit.py /opt/glm53/test_ablit.py
 COPY ablit/LAYER_MAP.json ablit/fetch_transplant.py ablit/refusal_direction_glm53_bf_oproj.pt ablit/refusal_direction_glm53_dealign_late.pt /opt/glm53/ablit/
 RUN python3 /opt/glm53/patch_model_overrides.py
 RUN python3 /opt/glm53/patch_dflash2.py
+# Same bytes the GLM53_OVERLAY_ORDER slot applies at every container start;
+# running it here keeps a fresh build identical to a patched-at-boot image
+# (the boot run is then a no-op on its markers).
+RUN python3 /opt/glm53/patch_dflash2_exl3.py
 RUN python3 /opt/glm53/patch_glm_eagle3.py
 RUN python3 /opt/glm53/patch_glm5_drafter_group.py
 RUN python3 /opt/glm53/patch_suppress_stops_in_reasoning.py

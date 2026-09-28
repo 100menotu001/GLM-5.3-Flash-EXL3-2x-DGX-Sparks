@@ -87,10 +87,11 @@ THIN = "GLM53_EXL3_MOE_FAST"
 # one-rank miss would silently leave that rank on Marlin, so the scenarios
 # below always require it.
 LARGE_M = "GLM53_KDA_BF16_LARGE_M"
+PREFILL_BF16 = "GLM53_DENSE_EXL3_PREFILL_BF16"
 
 # Launcher knobs and the container-side names they map to.
 LAUNCHER_KNOBS = ("GLM53_APC_RETENTION_INTERVAL", SWA, NS, KV, THIN,
-                  LARGE_M)
+                  LARGE_M, PREFILL_BF16, "GLM53_DENSE_EXL3")
 CONTAINER_NAMES = LAUNCHER_KNOBS + (
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL",
     "VLLM_PREFIX_CACHE_RETENTION_INTERVAL_SWA",
@@ -908,6 +909,10 @@ def part_d(h: Harness) -> None:
     scenarios += [("FAST=0", {THIN: "0"}), ("FAST=1", {THIN: "1"})]
     scenarios += [("LARGEM=0", {LARGE_M: "0"}),
                   ("LARGEM=1", {LARGE_M: "1"})]
+    scenarios += [("H3 retention", {
+        "GLM53_DENSE_EXL3": "1", "GLM53_DENSE_FP8": "off",
+        PREFILL_BF16: "kda_in,shared_down,mla_qkv_a,shared_gate_up,kda_o,mla_q_b",
+    })]
 
     # UMA cold-load knobs (optional; docs/cold-load-uma.md): both ranks when
     # set, neither rank when unset — an exported empty would engage the
@@ -947,6 +952,8 @@ def part_d(h: Harness) -> None:
                 required[name] = value
         if LARGE_M in env:
             required[LARGE_M] = env[LARGE_M]
+        required[PREFILL_BF16] = env.get(PREFILL_BF16, "off")
+        required["GLM53_DENSE_EXL3"] = env.get("GLM53_DENSE_EXL3", "0")
         issues = parity_issues(head, worker, scp, required)
         check(not issues, f"D2 [{label}] rank parity: " + ("; ".join(issues) if issues else "no differences"))
         for name in CONTAINER_NAMES:

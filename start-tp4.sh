@@ -589,6 +589,12 @@ validate_numeric_config() {
         echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
+    if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
+        # start-tp4.sh is the experimental launcher and does not stage
+        # overlay/patch_dense_exl3.py or its GLM53_DENSE_EXL3 wiring.
+        echo "GLM53_DENSE_EXL3=1 is not wired on start-tp4.sh — serve dense EXL3 with start.sh (TP=2)" >&2
+        return 2
+    fi
 }
 # GLM53 numeric config guard (end)
 
