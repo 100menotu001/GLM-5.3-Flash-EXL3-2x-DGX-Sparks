@@ -162,7 +162,8 @@ ABLIT=0
 # line) to opt in to a TP3-generated overlay.
 unset EXL3_OVERLAY_HOST
 # Thin-decode FAST and the #182 W8A8 FAT path stay on start.sh (TP=2) only.
-# GLM53_KDA_BF16_LARGE_M (#233) is overlay-side and is valid on TP=3.
+# The TP2 example enables KDA retention; TP3 keeps its own opt-in.
+GLM53_KDA_BF16_LARGE_M=0
 unset GLM53_EXL3_MOE_FAST
 unset GLM53_KDA_FP8_FAT
 # TP=3 overlay wins over the 2× knobs in .env.

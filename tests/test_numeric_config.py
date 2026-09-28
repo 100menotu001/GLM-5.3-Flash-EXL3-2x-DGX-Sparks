@@ -271,6 +271,28 @@ def test_tp3_kda_bf16_large_m_flag_is_0_or_1() -> None:
             assert "GLM53_KDA_BF16_LARGE_M" in result.stderr
 
 
+def test_tp3_kda_retention_requires_topology_or_caller_opt_in() -> None:
+    from test_launcher_rank_parity import Harness
+
+    with tempfile.TemporaryDirectory() as directory:
+        harness = Harness(Path(directory), launcher="start-tp3.sh")
+        topology = harness.repo / ".env.tp3"
+        original = topology.read_text()
+        flag = "GLM53_KDA_BF16_LARGE_M"
+        for file_value, caller, expected in (
+            (None, {}, "0"),
+            ("1", {}, "1"),
+            ("1", {flag: "0"}, "0"),
+            ("0", {flag: "1"}, "1"),
+        ):
+            topology.write_text(original + (
+                "" if file_value is None else f"\n{flag}={file_value}\n"))
+            result = harness.run("env", entry="start.fn.sh", **caller)
+            assert result.returncode == 0, result.stderr
+            assert f"{flag}={expected}" in result.stdout.splitlines()
+            assert not harness.host_touching_calls()
+
+
 # #207 makes the prefix-cache retention intervals configurable on every launcher
 # (start.sh / start-tp3.sh / start-tp4.sh): "" (unset) and 0 pass, and a positive
 # value must sit on the 3584-token scheduler-block grid, at most 1e6.
@@ -444,6 +466,7 @@ if __name__ == "__main__":
     test_thin_decode_flag_rejects_bad_values_before_host_actions()
     test_kda_bf16_large_m_flag_rejects_bad_values_before_host_actions()
     test_tp3_kda_bf16_large_m_flag_is_0_or_1()
+    test_tp3_kda_retention_requires_topology_or_caller_opt_in()
     for _launcher in RETENTION_LAUNCHERS:
         test_global_retention_interval_contract(_launcher)
         test_swa_retention_interval_needs_the_dflash_drafter(_launcher)
