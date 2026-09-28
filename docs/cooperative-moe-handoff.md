@@ -72,8 +72,8 @@ does not require regenerating the overlay or rebuilding the `.so` (all three
 geometries are already in the binary). `prepare_profile.py` will refuse a
 `runtime.py` whose digest is not the pinned `ADAPTER_SHA`.
 
-`start.sh` accepts the cooperative footer if the stock `Exl3Config` closer
-`        )` is still in the body (guards a truncated copy).
+`start.sh` requires the `Exl3LinearMethod` identity and the stock `Exl3Config`
+closer `        )` in the generated overlay; these guards reject stale or truncated copies.
 
 ## Why the first boot looked like “no benefit”
 
