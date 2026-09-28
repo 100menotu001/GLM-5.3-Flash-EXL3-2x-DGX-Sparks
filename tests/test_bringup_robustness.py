@@ -68,6 +68,7 @@ start_unlocked() {{
     fi
 }}
 banner() {{ :; }}
+resolve_pack_profile() {{ :; }}
 validate_numeric_config() {{ :; }}
 configure_capture_sizes() {{ :; }}
 validate_overlay_artifacts() {{ :; }}
