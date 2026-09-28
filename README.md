@@ -1817,6 +1817,9 @@ retains that license and the parent's third-party notices. DFlash2 stays [CC BY-
   (uniform-K4 routed-experts, ShapleyMCG License 1.0). Public mirror for this
   recipe: [Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw)
 - **EXL3 format / kernels:** [turboderp](https://github.com/turboderp-org/exllamav3) (ExLlamaV3)
+- **Dense-EXL3 TP2 loader:** ported from
+  [Alexbob0/glm53-flash-dense-exl3-tp2](https://github.com/Alexbob0/glm53-flash-dense-exl3-tp2)
+  (MIT), itself based on [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3).
 - **Base model:** [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 - **DFlash2 drafter:** [IncoAI](https://huggingface.co/incoai) —
   [GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)
