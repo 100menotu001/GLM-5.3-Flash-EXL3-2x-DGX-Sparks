@@ -142,6 +142,11 @@ case "$GLM53_MODEL_PRESET" in
         # bytes) plus config.json / model.safetensors.index.json / ABLIT_META.json.
         MODEL_PINNED_SHARDS=120
         ;;
+    dense-h3)
+        # TP2 dense-EXL3 H3 target + 6-bpw DFlash2 draft, built on the head
+        # from pinned public inputs by build_dense_h3; the TR3 target above is
+        # its base, and tools/pack_profile.py selects the serving settings.
+        ;;
     *)
         printf 'FATAL: unknown GLM53_MODEL_PRESET: %s\n' "$GLM53_MODEL_PRESET" >&2
         exit 2
@@ -1018,13 +1023,21 @@ usage() {
         | sed -e '/^set -euo pipefail/d' -e '/^# =\{10,\}$/d' -e 's/^# \{0,1\}//'
 }
 
+# Newest snapshot, for a missing refs/main. A built dense-h3 target is never
+# an implicit fallback: only select_dense_h3 names it.
+newest_snapshot() {
+    local repo="$1" skip=/
+    [ -s "$repo/refs/$DENSE_H3_REF" ] && skip="$(<"$repo/refs/$DENSE_H3_REF")"
+    ls -1t "$repo/snapshots" 2>/dev/null | grep -vxF -- "$skip" | head -n 1 || true
+}
+
 count_shards() {
     local repo_path="$1" snapshot="${2:-}" ref
     if [ -n "$snapshot" ]; then
         ref="$snapshot"
     else
         ref="$(cat "$repo_path/refs/main" 2>/dev/null || true)"
-        [ -n "$ref" ] || ref="$(ls -1t "$repo_path/snapshots" 2>/dev/null | head -n 1 || true)"
+        [ -n "$ref" ] || ref="$(newest_snapshot "$repo_path")"
     fi
     if [ -z "$ref" ]; then
         printf '0'
@@ -1053,7 +1066,7 @@ model_tree_complete() {
 ensure_refs_main() {
     local ref="$MODEL_PATH/refs/main" snap
     [ -f "$ref" ] && [ -n "$(<"$ref")" ] && return 0
-    snap="$(ls -1t "$MODEL_PATH/snapshots" 2>/dev/null | head -n 1 || true)"
+    snap="$(newest_snapshot "$MODEL_PATH")"
     [ -n "$snap" ] || die "no snapshots under $MODEL_PATH — re-run download"
     mkdir -p "$MODEL_PATH/refs"
     printf '%s' "$snap" >"$ref"
@@ -1106,6 +1119,107 @@ resolve_dflash_dir() {
     printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$DFLASH_CACHE_NAME" "$hash"
 }
 
+
+# GLM53_MODEL_PRESET=dense-h3 inputs. All public and pinned; the pair itself
+# is built on the head (no Hub repo carries it: the IncoAI draft license is
+# CC BY-NC-ND 4.0, so its quantized derivative is not redistributed).
+DENSE_H3_TR3_CONFIG_SHA256=4f5341e048984459471bfb9c894e6bf87e69b9c67402672af901631d1349f265
+DENSE_H3_TR3_INDEX_SHA256=2f64d21c67c90bbafeb36c4e9b2f06f54063ed439e9f7cf95962d425a1d8515d
+DENSE_H3_QUANT_BRANCH=4.05bpw
+DENSE_H3_QUANT_REV=2a30229e67012798ba9f0cd832bb78abf4c363d5
+# Both builds are byte-reproducible (2026-09-26 and 2026-09-28 builds identical):
+# a build that differs is refused rather than served.
+DENSE_H3_OVERLAY_SHA256=1a1b0793bebfa273ed8f5307c5c6d8ebcdb3c7d1faabc9956304abd095bfdeac
+DENSE_H3_DRAFT_SRC=incoai/GLM-5.3-Flash-DFlash2
+DENSE_H3_DRAFT_SRC_REV=dc77ff1c99eeb2df044ee3d4f0094eb033fee410
+DENSE_H3_DRAFT_REPO=local/GLM-5.3-Flash-DFlash2-EXL3-6bpw
+DENSE_H3_DRAFT_REV=27d192863a9a167d443be34200861ed42b4557a7
+# refs/<name> in the TR3 repo names the built target; refs/main stays on the
+# ordinary snapshot so leaving the preset restores the ordinary pack.
+DENSE_H3_REF=glm53-dense-h3
+
+# Adopt an already built pair from the primary or fallback TR3 repo.
+select_dense_h3() {
+    [ "$GLM53_MODEL_PRESET" = "dense-h3" ] || return 0
+    local entry repo name rev
+    for entry in "$MODEL_PATH|$MODEL_CACHE_NAME" "$FALLBACK_MODEL_PATH|$MODEL_FALLBACK_CACHE_NAME"; do
+        repo="${entry%%|*}"; name="${entry#*|}"
+        [ -s "$repo/refs/$DENSE_H3_REF" ] || continue
+        rev="$(<"$repo/refs/$DENSE_H3_REF")"
+        [ -d "$repo/snapshots/$rev" ] || continue
+        MODEL_PATH="$repo"
+        MODEL_CACHE_NAME="$name"
+        MODEL_SNAPSHOT="$rev"
+        return 0
+    done
+    return 1
+}
+
+# Build the pair once: dense EXL3 tensors range-read from turboderp's quant
+# (~5.3 GB, CPU) over the downloaded TR3 snapshot, and the IncoAI BF16 draft
+# quantized to 6 bpw on the head GPU. resolve_pack_profile validates the result.
+build_dense_h3() {
+    [ "$GLM53_MODEL_PRESET" = "dense-h3" ] || return 0
+    if select_dense_h3; then
+        log "dense-h3 pair present: $MODEL_PATH/snapshots/$MODEL_SNAPSHOT"
+        return 0
+    fi
+    [ "${TP:-2}" = "2" ] || die "GLM53_MODEL_PRESET=dense-h3 requires TP=2"
+    [ "${SKIP_DOWNLOAD:-0}" != "1" ] || die "dense-h3 pair is not built and SKIP_DOWNLOAD=1 — unset it once to build"
+    local hub="$HF_CACHE_DIR/hub" work="$HF_CACHE_DIR/glm53-dense-h3"
+    local src overlay marker draft_root draft_rev rev sources
+    src="$MODEL_PATH/snapshots/$(<"$MODEL_PATH/refs/main")"
+    if [ "$(sha256sum <"$src/config.json" | cut -d' ' -f1)" != "$DENSE_H3_TR3_CONFIG_SHA256" ] \
+       || [ "$(sha256sum <"$src/model.safetensors.index.json" | cut -d' ' -f1)" != "$DENSE_H3_TR3_INDEX_SHA256" ]; then
+        die "dense-h3 builds on the pinned TR3 4-bpw pack; $src is a different checkpoint"
+    fi
+    resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
+    mkdir -p "$work"
+
+    draft_root="$hub/models--${DENSE_H3_DRAFT_REPO//\//--}"
+    draft_rev="$DENSE_H3_DRAFT_REV"
+    if [ -f "$draft_root/snapshots/$draft_rev/model.safetensors" ]; then
+        log "dense-h3: 6-bpw draft present: $draft_root/snapshots/$draft_rev"
+    else
+        if [ -n "$(docker ps -q --filter "name=^${CONTAINER_HEAD}\$")" ]; then
+            die "dense-h3: quantizing the draft needs the head GPU — stop the serve first (./start.sh stop && ./start.sh)"
+        fi
+        HF_HOME="$HF_CACHE_DIR" "${HF_BIN_CMD[@]}" download "$DENSE_H3_DRAFT_SRC" --revision "$DENSE_H3_DRAFT_SRC_REV" >/dev/null \
+            || die "dense-h3: download of ${DENSE_H3_DRAFT_SRC}@${DENSE_H3_DRAFT_SRC_REV} failed"
+        log "dense-h3: quantizing ${DENSE_H3_DRAFT_SRC} to 6 bpw on the head GPU (one-off, ~25 min on GB10) ..."
+        rm -rf "$work/draft-out"
+        IMG="$IMAGE" BUILD="$work/draft-build" OUT="$work/draft-out" \
+            DRAFT_SNAP="$hub/models--${DENSE_H3_DRAFT_SRC//\//--}/snapshots/$DENSE_H3_DRAFT_SRC_REV" \
+            bash "$SCRIPT_DIR/tools/dflash2_exl3_quant.sh" || die "dense-h3: draft quantization failed"
+        rev="$(python3 "$SCRIPT_DIR/tools/stage_dense_h3.py" draft --built "$work/draft-out" \
+            --hub "$hub" --repo "$DENSE_H3_DRAFT_REPO")" || die "dense-h3: staging the draft failed"
+        rm -rf "$work/draft-out"
+        [ "$rev" = "$draft_rev" ] \
+            || die "dense-h3: the draft build ($rev) does not match the pinned recipe ($draft_rev) — refusing to serve it"
+    fi
+
+    # A verified overlay survives a later failure; the marker names its inputs.
+    overlay="$MODEL_PATH/snapshots/.glm53-dense-h3-build"
+    marker="$work/overlay.complete"
+    if [ ! -d "$overlay" ] || [ "$(cat "$marker" 2>/dev/null)" != "$src|$DENSE_H3_QUANT_REV" ]; then
+        rm -rf "$overlay" "$marker"
+        log "dense-h3: fetching dense EXL3 tensors from turboderp/GLM-5.3-Flash-exl3@${DENSE_H3_QUANT_BRANCH} (${DENSE_H3_QUANT_REV:0:8}, ~5.3 GB, ~2 min) ..."
+        python3 "$SCRIPT_DIR/tools/dense_overlay.py" --branch "$DENSE_H3_QUANT_BRANCH" --revision "$DENSE_H3_QUANT_REV" \
+            --src "$src" --out "$overlay" --prefix-rewrite model.language_model.:language_model.model. \
+            --cache "$work/headers" || die "dense-h3: dense EXL3 overlay build failed (re-run to retry)"
+        [ "$(sha256sum <"$overlay/dense-exl3-${DENSE_H3_QUANT_BRANCH}.safetensors" | cut -d' ' -f1)" = "$DENSE_H3_OVERLAY_SHA256" ] \
+            || die "dense-h3: the dense EXL3 overlay does not match its pinned SHA-256 — refusing to serve it"
+        printf '%s' "$src|$DENSE_H3_QUANT_REV" > "$marker"
+    fi
+    sources="$(printf '{"tr3_config_sha256":"%s","dense_exl3":"turboderp/GLM-5.3-Flash-exl3@%s","draft":"%s@%s"}' \
+        "$DENSE_H3_TR3_CONFIG_SHA256" "$DENSE_H3_QUANT_REV" "$DENSE_H3_DRAFT_SRC" "$DENSE_H3_DRAFT_SRC_REV")"
+    rev="$(python3 "$SCRIPT_DIR/tools/stage_dense_h3.py" target --overlay "$overlay" --hub "$hub" \
+        --draft-repo "$DENSE_H3_DRAFT_REPO" --draft-rev "$draft_rev" --ref "$DENSE_H3_REF" \
+        --sources "$sources")" || die "dense-h3: staging the target failed"
+    rm -f "$marker"
+    select_dense_h3 || die "dense-h3: staged target $rev not found"
+    log "dense-h3: built target $MODEL_PATH/snapshots/$rev + draft $DENSE_H3_DRAFT_REPO@$draft_rev"
+}
 
 # Resolve only genuine, staged metadata; never infer a profile from a repo id.
 resolve_pack_profile() {
@@ -1749,6 +1863,7 @@ download_only() {
     # Explicit download: do not honor SKIP_DOWNLOAD from .env.
     SKIP_DOWNLOAD=0
     download_weights
+    build_dense_h3
     download_dflash
 
     have="$(count_shards "$MODEL_PATH" "$MODEL_SNAPSHOT")"
@@ -1788,7 +1903,7 @@ sync_repo_marker_rev() {
     else
         rev="$(cat "$src/refs/main" 2>/dev/null || true)"
     fi
-    [ -n "$rev" ] || rev="$(ls -1t "$src/snapshots" 2>/dev/null | head -n 1 || true)"
+    [ -n "$rev" ] || rev="$(newest_snapshot "$src")"
     [ -n "$rev" ] || rev="unknown"
     printf '%s' "$rev"
 }
@@ -2754,7 +2869,9 @@ on_ready() {
     log "GLM-5.3-Flash EXL3 is UP (TP=${TP}, nnodes=${NNODES})"
     log "  endpoints  : http://127.0.0.1:${PORT}/v1   (LAN: ${HEAD_IP}:${PORT})"
     log "  model name : ${SERVED_MODEL_NAME}"
-    log "  weights    : ${MODEL}  quant=${QUANTIZATION}  kv=${KV_CACHE_DTYPE}"
+    local weights="$MODEL"
+    [ "${GLM53_DENSE_EXL3-0}" = "1" ] && weights+=" + dense EXL3${MODEL_SNAPSHOT:+ (snapshot ${MODEL_SNAPSHOT:0:8})}"
+    log "  weights    : ${weights}  quant=${QUANTIZATION}  kv=${KV_CACHE_DTYPE}"
     local vision=on
     [ "${LANGUAGE_MODEL_ONLY}" = "1" ] && vision=off
     local spec="MTP k=${MTP_TOKENS}"
@@ -2792,6 +2909,7 @@ start_unlocked() {
     preflight
     ensure_image
     download_weights
+    build_dense_h3
     resolve_pack_profile
     validate_numeric_config
     download_dflash
@@ -2888,7 +3006,11 @@ logs() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) resolve_pack_profile; validate_numeric_config; configure_capture_sizes; validate_overlay_artifacts ;;
+        start|restart)
+            # A pair built after a restart's stop would skip the pre-stop profile check.
+            select_dense_h3 || [ "$cmd" = start ] \
+                || die "GLM53_MODEL_PRESET=dense-h3: the pair is not built yet — ./start.sh stop && ./start.sh builds it (the draft needs the head GPU)"
+            resolve_pack_profile; validate_numeric_config; configure_capture_sizes; validate_overlay_artifacts ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;

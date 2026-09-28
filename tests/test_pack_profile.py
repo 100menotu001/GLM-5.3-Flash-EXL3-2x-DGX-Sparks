@@ -148,7 +148,7 @@ def test_launcher_resolves_before_restart_stops(tmp_path):
         functions.append(re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}", launcher).group())
     script = "\n".join(functions) + '''
 set -eu
-log() { :; }; banner() { :; }; validate_numeric_config() { :; }
+log() { :; }; banner() { :; }; validate_numeric_config() { :; }; select_dense_h3() { :; }
 configure_capture_sizes() { :; }; validate_overlay_artifacts() { :; }
 with_cluster_lock() { :; }
 stop_containers() { printf 'STOP\n'; }
