@@ -302,7 +302,7 @@ def _load_all(mod, method, layer, shard_tensor_map, shard_ids):
 
 def geometry_tests(mod, stubs):
     Exl3LinearMethod = mod.Exl3LinearMethod
-    
+
     def method_for(prefix, bits=6, bf16=None):
         c = _nr_config(mod, layers={prefix: {"bits": bits, **({"bf16_shards": bf16} if bf16 else {})}})
         return Exl3LinearMethod(c, prefix, bits=bits)
