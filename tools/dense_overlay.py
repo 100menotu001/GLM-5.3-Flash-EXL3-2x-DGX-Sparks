@@ -15,7 +15,9 @@
 #   - relative pack links, so the overlay resolves inside a container that
 #     mounts the HF cache at a different path and survives an rsync -a
 #   - --jobs: concurrent range reads written at their header offsets (serial
-#     reads were round-trip bound at ~1 request/s); verify reads concurrently too
+#   reads were round-trip bound at ~1 request/s); verify reads concurrently too
+#   - --keep-bf16: leave one module type native BF16 on chosen layers (the
+#     dense-h3 ABLIT variant keeps o_proj L15-44 editable by the runtime hook)
 """Build a dense-EXL3 overlay pack for GLM-5.3-Flash.
 
 The source pack (routed experts already EXL3, everything else BF16) is left untouched:
@@ -31,6 +33,8 @@ vllm-exl3 reads. No shard of the source pack is rewritten and nothing is quantiz
     dense_overlay.py --branch 2.05bpw --src <overlay> --out <overlay-mtp> --tag -mtp --skip-layers ""         --draft-layers 45 --draft-prefix-rewrite model.language_model.:model.
     # also carry the EXL3 lm_head (served key language_model.lm_head; boots report 192 modules)
     dense_overlay.py --branch 4.05bpw --src <pack> --out <overlay>         --prefix-rewrite model.language_model.:language_model.model. --lm-head
+    # keep o_proj native BF16 on layers 15-44 (runtime ABLIT edits them)
+    dense_overlay.py --branch 4.05bpw --src <pack> --out <overlay> --keep-bf16 self_attn.o_proj:15-44
 """
 
 import argparse
@@ -253,7 +257,7 @@ def build_plan(args, local_idx, local_hdr, remote):
         rest = name[len(layer_re):]
         layer, suffix = rest.split(".", 1)
         suffix = suffix[: -len(".weight")]
-        if int(layer) in args.skip_layers or suffix not in FORK:
+        if int(layer) in args.skip_layers or suffix not in FORK or int(layer) in args.keep_bf16.get(suffix, ()):
             continue
         base = name[: -len(".weight")]
         src_suffix, block, nblocks = FUSED_SOURCE.get(suffix, (suffix, 0, 1))
@@ -457,8 +461,20 @@ def main():
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--probe-remote-only", action="store_true")
     ap.add_argument("--local-quant", help="directory holding a full download of the branch (read instead of the Hub)")
+    ap.add_argument("--keep-bf16", action="append", default=[], metavar="SUFFIX:LAYERS",
+                    help="leave a pack tensor suffix native BF16 on inclusive layer ranges, "
+                    "e.g. self_attn.o_proj:15-44 (repeatable)")
     args = ap.parse_args()
     args.skip_layers = {int(x) for x in args.skip_layers.split(",") if x}
+    keep = {}
+    for spec in args.keep_bf16:
+        suffix, _, ranges = spec.partition(":")
+        if suffix not in FORK or not ranges:
+            ap.error("--keep-bf16 %r: want SUFFIX:LAYERS with SUFFIX one of %s" % (spec, ", ".join(sorted(FORK))))
+        for part in ranges.split(","):
+            lo, _, hi = part.partition("-")
+            keep.setdefault(suffix, set()).update(range(int(lo), int(hi or lo) + 1))
+    args.keep_bf16 = keep
     args.prefix_rewrite = tuple(args.prefix_rewrite.split(":", 1)) if args.prefix_rewrite else None
     args.draft_layers = {int(x) for x in args.draft_layers.split(",") if x}
     args.draft_prefix_rewrite = tuple(args.draft_prefix_rewrite.split(":", 1)) if args.draft_prefix_rewrite else None

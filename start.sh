@@ -146,6 +146,7 @@ case "$GLM53_MODEL_PRESET" in
         # TP2 dense-EXL3 H3 target + 6-bpw DFlash2 draft, built on the head
         # from pinned public inputs by build_dense_h3; the TR3 target above is
         # its base, and tools/pack_profile.py selects the serving settings.
+        # With ABLIT=1 the target keeps o_proj L15-44 BF16 for the runtime edit.
         ;;
     *)
         printf 'FATAL: unknown GLM53_MODEL_PRESET: %s\n' "$GLM53_MODEL_PRESET" >&2
@@ -439,7 +440,8 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # (see docs/kda-bf16-large-m.md); default off.
 GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
 # Dense-EXL3 for the non-routed linears (overlay/exl3.py [dense-exl3]; README
-# env table). Mutually exclusive with GLM53_DENSE_FP8 and ABLIT; TP=2 only.
+# env table). Mutually exclusive with GLM53_DENSE_FP8; ABLIT only on layers
+# whose o_proj the pack leaves BF16. TP=2 only.
 GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}"
 # Manual mode retains no BF16 copy unless selected. A validated pack profile
 # selects the six H3 groups before numeric validation and lifecycle operations.
@@ -784,8 +786,18 @@ validate_numeric_config() {
                return 2 ;;
         esac
         if [ "${ABLIT-0}" = "1" ]; then
-            echo "GLM53_DENSE_EXL3=1 requires ABLIT=0 — a dense-EXL3 pack quantizes o_proj on every layer; ABLIT edits BF16 o_proj only" >&2
-            return 2
+            # The pack decides which o_proj stay BF16; ablit_runtime.py refuses
+            # an EXL3 o_proj per module as the in-container backstop.
+            local _asnap="${MODEL_SNAPSHOT:-}"
+            if [ -z "$_asnap" ] && [ -n "${MODEL_PATH:-}" ] && [ -f "$MODEL_PATH/refs/main" ]; then
+                _asnap="$(<"$MODEL_PATH/refs/main")"
+            fi
+            if [ -z "$_asnap" ] || [ ! -f "$MODEL_PATH/snapshots/$_asnap/config.json" ]; then
+                echo "GLM53_DENSE_EXL3=1 with ABLIT=1 needs the staged pack's config.json to check which o_proj stay BF16" >&2
+                return 2
+            fi
+            python3 "$SCRIPT_DIR/tools/pack_profile.py" "$MODEL_PATH/snapshots/$_asnap" \
+                --check-ablit "$ABLIT_LAYERS" || return 2
         fi
     else
         # Pre-stop mirror of the in-container pack/flag refusal
@@ -1026,9 +1038,11 @@ usage() {
 # Newest snapshot, for a missing refs/main. A built dense-h3 target is never
 # an implicit fallback: only select_dense_h3 names it.
 newest_snapshot() {
-    local repo="$1" skip=/
-    [ -s "$repo/refs/$DENSE_H3_REF" ] && skip="$(<"$repo/refs/$DENSE_H3_REF")"
-    ls -1t "$repo/snapshots" 2>/dev/null | grep -vxF -- "$skip" | head -n 1 || true
+    local repo="$1" ref skip=()
+    for ref in "$DENSE_H3_REF" "$DENSE_H3_ABLIT_REF"; do
+        [ -f "$repo/refs/$ref" ] && [ -s "$repo/refs/$ref" ] && skip+=(-e "$(<"$repo/refs/$ref")")
+    done
+    ls -1t "$repo/snapshots" 2>/dev/null | grep -vxF "${skip[@]:--e/}" | head -n 1 || true
 }
 
 count_shards() {
@@ -1130,6 +1144,11 @@ DENSE_H3_QUANT_REV=2a30229e67012798ba9f0cd832bb78abf4c363d5
 # Both builds are byte-reproducible (2026-09-26 and 2026-09-28 builds identical):
 # a build that differs is refused rather than served.
 DENSE_H3_OVERLAY_SHA256=1a1b0793bebfa273ed8f5307c5c6d8ebcdb3c7d1faabc9956304abd095bfdeac
+# ABLIT=1 variant: the same overlay minus o_proj on layers 15-44, which stay
+# native BF16 from TR3 so the runtime hook (overlay/ablit_runtime.py) can edit
+# them. ABLIT_LAYERS must stay inside 15-45 (45 = the MTP block, unloaded here).
+DENSE_H3_ABLIT_BF16=self_attn.o_proj:15-44
+DENSE_H3_ABLIT_OVERLAY_SHA256=0623ec344b5ae4dc0926480f12c236c84606a9c97b9b4094275dca15be219e2f
 DENSE_H3_DRAFT_SRC=incoai/GLM-5.3-Flash-DFlash2
 DENSE_H3_DRAFT_SRC_REV=dc77ff1c99eeb2df044ee3d4f0094eb033fee410
 DENSE_H3_DRAFT_REPO=local/GLM-5.3-Flash-DFlash2-EXL3-6bpw
@@ -1137,15 +1156,22 @@ DENSE_H3_DRAFT_REV=27d192863a9a167d443be34200861ed42b4557a7
 # refs/<name> in the TR3 repo names the built target; refs/main stays on the
 # ordinary snapshot so leaving the preset restores the ordinary pack.
 DENSE_H3_REF=glm53-dense-h3
+DENSE_H3_ABLIT_REF=glm53-dense-h3-ablit
+
+# The target variant this start serves: stock, or o_proj L15-44 BF16 for ABLIT=1.
+dense_h3_ref() {
+    if [ "${ABLIT:-0}" = "1" ]; then printf '%s' "$DENSE_H3_ABLIT_REF"; else printf '%s' "$DENSE_H3_REF"; fi
+}
 
 # Adopt an already built pair from the primary or fallback TR3 repo.
 select_dense_h3() {
     [ "$GLM53_MODEL_PRESET" = "dense-h3" ] || return 0
-    local entry repo name rev
+    local entry repo name rev ref
+    ref="$(dense_h3_ref)"
     for entry in "$MODEL_PATH|$MODEL_CACHE_NAME" "$FALLBACK_MODEL_PATH|$MODEL_FALLBACK_CACHE_NAME"; do
         repo="${entry%%|*}"; name="${entry#*|}"
-        [ -s "$repo/refs/$DENSE_H3_REF" ] || continue
-        rev="$(<"$repo/refs/$DENSE_H3_REF")"
+        [ -s "$repo/refs/$ref" ] || continue
+        rev="$(<"$repo/refs/$ref")"
         [ -d "$repo/snapshots/$rev" ] || continue
         MODEL_PATH="$repo"
         MODEL_CACHE_NAME="$name"
@@ -1199,22 +1225,30 @@ build_dense_h3() {
     fi
 
     # A verified overlay survives a later failure; the marker names its inputs.
-    overlay="$MODEL_PATH/snapshots/.glm53-dense-h3-build"
-    marker="$work/overlay.complete"
+    local ref keep=() want_sha="$DENSE_H3_OVERLAY_SHA256" tag=""
+    ref="$(dense_h3_ref)"
+    if [ "$ref" = "$DENSE_H3_ABLIT_REF" ]; then
+        keep=(--keep-bf16 "$DENSE_H3_ABLIT_BF16")
+        want_sha="$DENSE_H3_ABLIT_OVERLAY_SHA256"
+        tag="-ablit"
+    fi
+    overlay="$MODEL_PATH/snapshots/.glm53-dense-h3${tag}-build"
+    marker="$work/overlay${tag}.complete"
     if [ ! -d "$overlay" ] || [ "$(cat "$marker" 2>/dev/null)" != "$src|$DENSE_H3_QUANT_REV" ]; then
         rm -rf "$overlay" "$marker"
         log "dense-h3: fetching dense EXL3 tensors from turboderp/GLM-5.3-Flash-exl3@${DENSE_H3_QUANT_BRANCH} (${DENSE_H3_QUANT_REV:0:8}, ~5.3 GB, ~2 min) ..."
         python3 "$SCRIPT_DIR/tools/dense_overlay.py" --branch "$DENSE_H3_QUANT_BRANCH" --revision "$DENSE_H3_QUANT_REV" \
             --src "$src" --out "$overlay" --prefix-rewrite model.language_model.:language_model.model. \
-            --cache "$work/headers" || die "dense-h3: dense EXL3 overlay build failed (re-run to retry)"
-        [ "$(sha256sum <"$overlay/dense-exl3-${DENSE_H3_QUANT_BRANCH}.safetensors" | cut -d' ' -f1)" = "$DENSE_H3_OVERLAY_SHA256" ] \
+            "${keep[@]}" --cache "$work/headers" || die "dense-h3: dense EXL3 overlay build failed (re-run to retry)"
+        [ "$(sha256sum <"$overlay/dense-exl3-${DENSE_H3_QUANT_BRANCH}.safetensors" | cut -d' ' -f1)" = "$want_sha" ] \
             || die "dense-h3: the dense EXL3 overlay does not match its pinned SHA-256 — refusing to serve it"
         printf '%s' "$src|$DENSE_H3_QUANT_REV" > "$marker"
     fi
-    sources="$(printf '{"tr3_config_sha256":"%s","dense_exl3":"turboderp/GLM-5.3-Flash-exl3@%s","draft":"%s@%s"}' \
-        "$DENSE_H3_TR3_CONFIG_SHA256" "$DENSE_H3_QUANT_REV" "$DENSE_H3_DRAFT_SRC" "$DENSE_H3_DRAFT_SRC_REV")"
+    sources="$(printf '{"tr3_config_sha256":"%s","dense_exl3":"turboderp/GLM-5.3-Flash-exl3@%s","draft":"%s@%s"%s}' \
+        "$DENSE_H3_TR3_CONFIG_SHA256" "$DENSE_H3_QUANT_REV" "$DENSE_H3_DRAFT_SRC" "$DENSE_H3_DRAFT_SRC_REV" \
+        "${keep[1]:+,\"keep_bf16\":\"${keep[1]}\"}")"
     rev="$(python3 "$SCRIPT_DIR/tools/stage_dense_h3.py" target --overlay "$overlay" --hub "$hub" \
-        --draft-repo "$DENSE_H3_DRAFT_REPO" --draft-rev "$draft_rev" --ref "$DENSE_H3_REF" \
+        --draft-repo "$DENSE_H3_DRAFT_REPO" --draft-rev "$draft_rev" --ref "$ref" \
         --sources "$sources")" || die "dense-h3: staging the target failed"
     rm -f "$marker"
     select_dense_h3 || die "dense-h3: staged target $rev not found"
@@ -1230,7 +1264,7 @@ resolve_pack_profile() {
     [ -n "$snap" ] || return 0
     values="$(
         export TP GLM53_DENSE_EXL3 GLM53_DENSE_FP8 GLM53_DENSE_EXL3_PREFILL_BF16
-        export GLM53_KDA_BF16_LARGE_M ABLIT SPEC_METHOD DFLASH_DRAFT_TP
+        export GLM53_KDA_BF16_LARGE_M ABLIT ABLIT_LAYERS SPEC_METHOD DFLASH_DRAFT_TP
         export DFLASH_MODEL DFLASH_REVISION DFLASH_CACHE_NAME EXPECTED_SHARDS
         python3 "$SCRIPT_DIR/tools/pack_profile.py" "$MODEL_PATH/snapshots/$snap" \
             --hub "$HF_CACHE_DIR/hub" --explicit "$_GLM53_PROFILE_EXPLICIT"

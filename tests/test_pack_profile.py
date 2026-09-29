@@ -100,7 +100,7 @@ def test_asset_backed_profile_and_normal_pack(tmp_path):
 
 
 @pytest.mark.parametrize("env,explicit", [
-    ({"TP": "3"}, set()), ({"ABLIT": "1"}, set()),
+    ({"TP": "3"}, set()), ({"ABLIT": "1", "ABLIT_LAYERS": "0-3"}, set()),
     ({"GLM53_DENSE_FP8": "all"}, {"GLM53_DENSE_FP8"}),
     ({"GLM53_DENSE_EXL3": "0"}, {"GLM53_DENSE_EXL3"}),
     ({"GLM53_DENSE_EXL3_PREFILL_BF16": "dense_gate_up"}, set()),
@@ -110,6 +110,24 @@ def test_conflicts_refuse(tmp_path, env, explicit):
     hub, target, _ = stage(tmp_path)
     with pytest.raises(ValueError):
         profile.resolve(target, hub, env, explicit)
+
+
+def test_ablit_selects_only_layers_whose_o_proj_stays_bf16(tmp_path):
+    hub, target, _ = stage(tmp_path)  # the fixture declares EXL3 o_proj on layer 0 only
+    assert profile.resolve(target, hub, {"ABLIT": "1"}, set())["ABLIT"] == "1"  # default 15-45
+    assert profile.resolve(target, hub, {"ABLIT": "0", "ABLIT_LAYERS": "0"}, set())["ABLIT"] == "0"
+    tc = json.loads((target / "config.json").read_text())
+    layers = tc["quantization_config"]["non_routed_exl3"]["layers"]
+    layers["language_model.model.layers.15.self_attn.o_proj"] = {"bits": 6}
+    (target / "config.json").write_text(json.dumps(tc))
+    with pytest.raises(ValueError, match=r"layers \[15\]"):
+        profile.resolve(target, hub, {"ABLIT": "1"}, set())
+    profile.check_ablit(tc, "16-45")  # layer 45 is the MTP block, never a target o_proj
+    with pytest.raises(ValueError):
+        profile.check_ablit(tc, "15")
+    for bad in ("", "20-15", "x"):
+        with pytest.raises(ValueError):
+            profile.parse_layers(bad)
 
 
 @pytest.mark.parametrize("damage", ["missing", "truncated", "hash", "bitrate", "missing_part"])

@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -84,7 +85,7 @@ def launcher_functions(*names):
 
 def test_restart_refuses_an_unbuilt_pair_before_stopping(tmp_path):
     hub, repo, overlay, draft = hf_repo(tmp_path)
-    script = launcher_functions("select_dense_h3", "main") + '''
+    script = launcher_functions("dense_h3_ref", "select_dense_h3", "main") + '''
 set -eu
 die() { printf 'DIE %s\\n' "$*"; exit 1; }
 log() { :; }; banner() { :; }; resolve_pack_profile() { :; }; validate_numeric_config() { :; }
@@ -112,7 +113,7 @@ main "$CMD"
 
 
 def build_script(tmp_path, repo, docker_running):
-    return launcher_functions("select_dense_h3", "build_dense_h3") + f'''
+    return launcher_functions("dense_h3_ref", "select_dense_h3", "build_dense_h3") + f'''
 set -eu
 die() {{ printf 'DIE %s\\n' "$*"; exit 1; }}
 log() {{ :; }}
@@ -158,19 +159,90 @@ def test_build_refuses_a_draft_that_misses_the_pin(tmp_path):
     assert "dense_overlay" not in out  # refused before the target is fetched
 
 
-def test_newest_snapshot_fallback_skips_the_built_target(tmp_path):
+def test_ablit_build_keeps_o_proj_bf16_under_its_own_pin(tmp_path):
+    _hub, repo, _overlay, _draft = hf_repo(tmp_path)
+    base = repo / "snapshots" / ("b" * 40)
+    for name in ("config.json", "model.safetensors.index.json"):
+        (base / name).write_text("{}")
+    empty = hashlib.sha256(b"{}").hexdigest()
+    source = (ROOT / "start.sh").read_text()
+    draft_rev = re.search(r"^DENSE_H3_DRAFT_REV=(\w+)$", source, re.M).group(1)
+    draft = tmp_path / "hub/models--local--GLM-5.3-Flash-DFlash2-EXL3-6bpw/snapshots" / draft_rev
+    draft.mkdir(parents=True)
+    (draft / "model.safetensors").write_text("")
+
+    def build(ablit):
+        script = re.sub(r"^(DENSE_H3_TR3_(CONFIG|INDEX)_SHA256)=\w+$", rf"\1={empty}",
+                        build_script(tmp_path, repo, False), flags=re.M)
+        script = script.replace("printf 'PY %s\\n' \"$2\"", "printf 'PY %s\\n' \"$*\"")
+        return subprocess.run(["bash", "-c", f"ABLIT={ablit}\n" + script], capture_output=True, text=True).stdout
+
+    out = build(1)
+    assert "--keep-bf16 self_attn.o_proj:15-44" in out and "/.glm53-dense-h3-ablit-build" in out
+    assert "does not match its pinned SHA-256" in out  # nothing fetched: the pin refuses it
+    stock = build(0)
+    assert "--keep-bf16" not in stock and "/.glm53-dense-h3-build" in stock
+
+
+def test_newest_snapshot_fallback_skips_both_built_targets(tmp_path):
     hub, repo, overlay, draft = hf_repo(tmp_path)
     draft_rev = stage_tool.stage_draft(draft, hub, "local/draft")
     rev = stage_tool.stage_target(overlay, hub, "local/draft", draft_rev, "glm53-dense-h3", {})
+    (repo / "refs/glm53-dense-h3-ablit").write_text("b" * 40)  # both refs set; neither is a fallback
     os.utime(repo / "snapshots" / ("b" * 40), (1, 1))  # the built target is the newest entry
     script = launcher_functions("newest_snapshot") + f"""
-DENSE_H3_REF=glm53-dense-h3
-newest_snapshot {repo}
+DENSE_H3_REF=glm53-dense-h3 DENSE_H3_ABLIT_REF=glm53-dense-h3-ablit
+echo "[$(newest_snapshot {repo})]"
+rm {repo}/refs/glm53-dense-h3-ablit
+echo "[$(newest_snapshot {repo})]"
 rm {repo}/refs/glm53-dense-h3
-newest_snapshot {repo}
+echo "[$(newest_snapshot {repo})]"
 """
     lines = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout.splitlines()
-    assert lines == ["b" * 40, rev]
+    assert lines == ["[]", f"[{'b' * 40}]", f"[{rev}]"]
+
+
+def test_ablit_serves_its_own_variant_never_the_stock_target(tmp_path):
+    hub, repo, overlay, draft = hf_repo(tmp_path)
+    draft_rev = stage_tool.stage_draft(draft, hub, "local/draft")
+    stock = stage_tool.stage_target(overlay, hub, "local/draft", draft_rev, "glm53-dense-h3", {})
+    script = launcher_functions("dense_h3_ref", "select_dense_h3") + f'''
+DENSE_H3_REF=glm53-dense-h3 DENSE_H3_ABLIT_REF=glm53-dense-h3-ablit GLM53_MODEL_PRESET=dense-h3
+MODEL_PATH={repo} MODEL_CACHE_NAME={repo.name} FALLBACK_MODEL_PATH={repo} MODEL_FALLBACK_CACHE_NAME={repo.name}
+select_dense_h3 && echo "SEL $MODEL_SNAPSHOT" || echo NONE
+'''
+    run = lambda ablit: subprocess.run(["bash", "-c", f"ABLIT={ablit}\n" + script],
+                                       capture_output=True, text=True).stdout.strip()
+    assert run(0) == f"SEL {stock}"
+    assert run(1) == "NONE"  # the stock target quantizes o_proj: never an ABLIT fallback
+    (repo / "refs/glm53-dense-h3-ablit").write_text("b" * 40)
+    assert run(1) == "SEL " + "b" * 40
+
+
+def test_keep_bf16_leaves_only_the_named_layers_native():
+    names = [f"model.language_model.layers.{i}.self_attn.{s}.weight"
+             for i in (14, 15, 44) for s in ("o_proj", "q_b_proj")]
+    local_idx = {"weight_map": {n: "a.safetensors" for n in names}}
+    local_hdr = {"a.safetensors": (0, {n: {"shape": [32, 32]} for n in names})}
+    rhdr, rmap = {}, {}
+    for n in names:
+        base = n[: -len(".weight")]
+        for part, shape in (("trellis", [2, 2, 64]), ("suh", [32]), ("svh", [32]), ("mcg", [])):
+            rmap[base + "." + part] = "r.safetensors"
+            rhdr[base + "." + part] = {"shape": shape, "dtype": "I16", "data_offsets": [0, 0]}
+    remote = {"weight_map": rmap, "headers": {"r.safetensors": (0, rhdr)}}
+
+    def plan(keep):
+        args = SimpleNamespace(root="model.language_model.", skip_layers={45}, draft_layers=set(),
+                               prefix_rewrite=None, draft_prefix_rewrite=None, lm_head=False,
+                               keep_bf16=keep)
+        entries, _keys, problems = overlay_tool.build_plan(args, local_idx, local_hdr, remote)
+        assert not problems
+        return {e["name"].split("layers.")[1][: -len(".weight")] for e in entries}
+
+    assert len(plan({})) == 6
+    assert plan({"self_attn.o_proj": set(range(15, 45))}) == {
+        "14.self_attn.o_proj", "14.self_attn.q_b_proj", "15.self_attn.q_b_proj", "44.self_attn.q_b_proj"}
 
 
 def test_quant_script_mounts_the_whole_hf_repo(tmp_path):

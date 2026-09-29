@@ -63,6 +63,46 @@ def require_packed(tensors: dict, base: str, bits: int) -> None:
         raise ValueError(f"missing or incompatible packed tensor: {base}")
 
 
+def parse_layers(spec: str) -> set[int]:
+    """ABLIT_LAYERS syntax ("15-45", "15,17-19"), as overlay/ablit_runtime.py parses it."""
+    layers: set[int] = set()
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        if not lo.isdigit() or (hi and not hi.isdigit()) or int(hi or lo) < int(lo):
+            raise ValueError(f"ABLIT_LAYERS: bad range {part!r}")
+        layers.update(range(int(lo), int(hi or lo) + 1))
+    if not layers:
+        raise ValueError(f"ABLIT_LAYERS {spec!r} names no layers")
+    return layers
+
+
+def exl3_o_proj_layers(cfg: dict) -> set[int]:
+    """Target layers whose o_proj the pack declares EXL3. ABLIT edits a BF16
+    o_proj only, so these must stay out of ABLIT_LAYERS."""
+    layers = cfg.get("quantization_config", {}).get("non_routed_exl3", {}).get("layers", {})
+    out = set()
+    for prefix in layers:
+        m = re.search(r"(?:^|\.)layers\.(\d+)\.self_attn\.o_proj$", prefix)
+        if m:
+            out.add(int(m.group(1)))
+    return out
+
+
+def check_ablit(cfg: dict, spec: str) -> None:
+    """Refuse ABLIT_LAYERS that reach an EXL3 o_proj. Layer 45 is the
+    checkpoint MTP block, outside the 45 target layers; the runtime hook
+    edits it only when that block is loaded."""
+    text = cfg.get("text_config", cfg)
+    targets = set(range(int(text.get("num_hidden_layers", 45))))
+    clash = sorted(parse_layers(spec) & targets & exl3_o_proj_layers(cfg))
+    if clash:
+        raise ValueError(
+            f"ABLIT_LAYERS={spec} reaches EXL3 o_proj on layers {clash}; this pack keeps "
+            "o_proj BF16 only on the other layers (ABLIT edits BF16 o_proj only)")
+
+
 def resolve(snapshot: Path, hub: Path, env: dict[str, str], explicit: set[str]) -> dict[str, str]:
     config_path = snapshot / "config.json"
     if not config_path.is_file():
@@ -87,6 +127,8 @@ def resolve(snapshot: Path, hub: Path, env: dict[str, str], explicit: set[str]) 
                    "self_attn.o_proj", "self_attn.q_b_proj"):
         if not any(p.endswith("." + suffix) for p in layers):
             raise ValueError(f"H3 target is missing {suffix}")
+    if env.get("ABLIT") == "1":
+        check_ablit(cfg, env.get("ABLIT_LAYERS") or "15-45")
     if not (snapshot / "model.safetensors.index.json").is_file():
         raise ValueError("profile target requires model.safetensors.index.json")
     target_tensors, target_shards = inventory(snapshot)
@@ -142,10 +184,11 @@ def resolve(snapshot: Path, hub: Path, env: dict[str, str], explicit: set[str]) 
                        "mlp.up_proj", "mlp.down_proj", "attention_conv.kernel_projection",
                        "mlp_conv.kernel_projection"):
             require_packed(tensors, f"layers.{i}.{suffix}", 6)
+    ablit = env.get("ABLIT") == "1"
     selected = {
         "GLM53_DENSE_EXL3": "1", "GLM53_DENSE_FP8": "off",
         "GLM53_DENSE_EXL3_PREFILL_BF16": H3, "GLM53_KDA_BF16_LARGE_M": "0",
-        "ABLIT": "0", "SPEC_METHOD": "dflash", "DFLASH_DRAFT_TP": "2",
+        "ABLIT": "1" if ablit else "0", "SPEC_METHOD": "dflash", "DFLASH_DRAFT_TP": "2",
         "DFLASH_MODEL": model, "DFLASH_REVISION": revision,
         "DFLASH_CACHE_NAME": "models--" + model.replace("/", "--"),
         "EXPECTED_SHARDS": str(target_shards),
@@ -168,10 +211,17 @@ def resolve(snapshot: Path, hub: Path, env: dict[str, str], explicit: set[str]) 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--hub", required=True, type=Path)
+    parser.add_argument("--hub", type=Path)
     parser.add_argument("--explicit", default="")
+    parser.add_argument("--check-ablit", metavar="LAYERS",
+                        help="only check that ABLIT_LAYERS avoid the pack's EXL3 o_proj")
     args = parser.parse_args()
     try:
+        if args.check_ablit is not None:
+            check_ablit(json.loads((args.snapshot / "config.json").read_text()), args.check_ablit)
+            return 0
+        if args.hub is None:
+            parser.error("--hub is required")
         values = resolve(args.snapshot, args.hub, dict(os.environ), set(args.explicit.split()))
     except (OSError, ValueError, KeyError, TypeError, struct.error) as exc:
         print(f"pack profile refused: {exc}", file=sys.stderr)

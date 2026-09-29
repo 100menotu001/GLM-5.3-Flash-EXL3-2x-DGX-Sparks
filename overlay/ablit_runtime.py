@@ -220,12 +220,13 @@ def walk_o_proj(model: Any) -> list[tuple[str, int | None, Any]]:
 def _refuse_exl3_o_proj(name: str, mod: Any) -> None:
     """ABLIT edits a BF16 o_proj; an EXL3-dense o_proj (pack non_routed_exl3)
     has no BF16 weight to edit and trellis tensors cannot be transplanted.
-    The pack covers o_proj on every layer, so any enabled layer range hits
-    this. Fail loud instead of silently serving stock weights."""
+    A pack that keeps some o_proj BF16 (the dense-h3 ABLIT variant keeps
+    L15-44) serves ABLIT on those layers only; fail loud on any other layer
+    instead of silently serving stock weights."""
     if getattr(mod, "_exl3_linear_n_shards", None) is not None:
         raise AblitError(
             f"ablit: {name} is EXL3-dense (pack non_routed_exl3); ABLIT edits "
-            "BF16 o_proj only — unset ABLIT or serve a non-dense-EXL3 pack")
+            "BF16 o_proj only — narrow ABLIT_LAYERS to the pack's BF16 o_proj or unset ABLIT")
 
 
 def unwrap_text_model(model: Any) -> Any:
