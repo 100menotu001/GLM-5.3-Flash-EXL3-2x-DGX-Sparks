@@ -163,7 +163,13 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 - `start-tp4.sh` forwards adaptive verification length (`GLM53_ADAPTIVE_K` and
   its six companion knobs) to every rank and extends the DFlash capture-size list
   the way `start.sh` has since 2026-09-08; the four-node launcher previously
-  ignored the knobs silently. Defaults unchanged (`off`).
+  ignored the knobs silently. TP4 now requires its own opt-in (caller or
+  `.env.tp4`), preserves caller setness for all seven knobs, validates enabled
+  settings before host actions, and reports the effective mode source.
+  Capture generation runs only on start/restart after validation; disabled mode
+  skips both the generator and rank patch. Space/equals capture overrides win.
+  CPU tests compare both launcher generators with runtime query lengths; TP4
+  cluster performance measurement remains separate.
 - Opt-in SM121 **thin-decode** kernels for the EXL3 routed experts
   (`GLM53_EXL3_MOE_FAST`, default `0`): `overlay/patch_exl3_decode_pipeline.py`
   adds two K4/N256 fast kernels (shared / independent gate-up input transform)
