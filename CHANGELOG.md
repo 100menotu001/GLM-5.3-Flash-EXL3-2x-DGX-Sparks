@@ -11,12 +11,58 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- `GLM53_MODEL_PRESET=dense-h3` (TP2, opt-in): the first start builds the
+  H3/6-bpw pair on the head from pinned public inputs and stages it in the HF
+  cache: the TR3 target plus dense EXL3 tensors range-read from
+  `turboderp/GLM-5.3-Flash-exl3@4.05bpw` (`2a30229e`), and the IncoAI BF16
+  DFlash2 draft quantized to 6 bpw with MiaAI-Lab/exllamav3 `63b32f0`. The
+  pack builders move from the #281 branch into `tools/`, and
+  `tools/stage_dense_h3.py` stages both halves under content-derived
+  revisions. `tools/pack_profile.py` validates the pair as for any
+  profile pack. A `restart` refuses before stopping while the pair is
+  unbuilt, and the GPU draft build refuses while the GLM serve runs.
+  `dflash2_exl3_quant.sh` now mounts the whole HF repo for a snapshot input:
+  its relative blob links dangled inside the container. It also hands the
+  packaged draft to the invoking user, not root with mode 0600.
+  `dense_overlay.py` gains `--revision`, writes relative pack links, and
+  reads ranges concurrently (`--jobs`, default 16). The 5.3 GB fetch took
+  66 s instead of 1261 s serially, with byte-identical output. The draft
+  revision and the overlay SHA-256 are pinned; both builds reproduce byte
+  for byte. Newest-snapshot fallbacks for a missing `refs/main` skip the
+  built target.
+
+- Boot correctness canary in `scripts/boot-shape-warmup.sh`
+  (`GLM53_WARMUP_CANARY`, default `1`): the post-ready sweep now keeps the
+  reply bodies and scrapes the DFlash counters. If the bounded temperature-0
+  `c1` arm ("Reply with OK.", thinking off) does not answer OK, or DFlash
+  accepts 0 of at least `GLM53_WARMUP_CANARY_MIN_DRAFTS` (64) drafted tokens,
+  the script exits 3 with `DEGENERATE ENGINE`; `start.sh` / `start-tp3.sh` /
+  `start-tp4.sh` collect logs and attempt to take an engine just judged
+  degenerate off the port before failing without READY. Teardown is
+  best-effort: a failed attempt is reported explicitly, and neither its result
+  nor any lingering reachability changes the fatal verdict. Before this, such
+  a boot (#249 signature: garbage output, ~0 acceptance) showed up only as
+  unbounded warmup arms timing out after 240 s, reported as "uncovered shapes
+  may JIT mid-serve", and went into service. Other warmup failures stay
+  nonfatal. `tests/test_boot_shape_warmup.py` covers degenerate,
+  zero-acceptance and canary-off behavior;
+  `tests/test_warmup_canary_launchers.py` covers all three launcher rc-3 paths
+  and teardown-failure reporting.
 - Auto/lazy safetensors staging (`GLM53_LOAD_CLONE=1`) and optional bounded
   local-shard read-ahead (`GLM53_LOAD_PREFETCH=0`, decimal `0..16`) on TP2/TP3/TP4.
   Preserve InstantTensor selection, rank parity, PR230 safety and compact-draft
   settings. The shard window is not a host-memory limit; GPU loader performance
   and KV-capacity gains are not established for this combined candidate.
   Motivated by [Alexbob0's mmap-load measurements](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md).
+- TP2 dense EXL3 target loading (including declared `lm_head`), mixed BF16
+  projection tails, and six-group H3 BF16 prefill retention above 144 rows.
+  Add 6-bpw EXL3 DFlash2 drafts with BF16 context K/V and target-only FP8
+  classification. Packed parts and unsupported TP3 geometry fail closed.
+- Asset-backed `glm53_profile` selection pairs a dense target with an immutable
+  6-bpw draft and H3 settings before restart stops containers. Normal packs
+  retain #281 FP8 defaults; conflicting exports, missing shards, changed draft
+  metadata and unsupported profiles refuse. No new pack URL or weights ship
+  with this change; see README for the publisher metadata/staging contract.
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not
@@ -180,6 +226,31 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start.sh` verifies every shard named by the selected snapshot's index and
+  both sidecars against the worker's dereferenced file sizes before trusting
+  the sync marker. Pinned, non-NFS `SKIP_SYNC=1` verifies the target snapshot
+  without transferring it; unpinned and NFS paths retain their existing
+  behavior. An incomplete/invalid head snapshot fails before transfer;
+  interrupted transfers clear the marker before mutation. DFlash2 repairs a
+  dangling weight link with one dereferenced-file transfer and rechecks the
+  complete snapshot before stamping the marker. This checks file presence and
+  sizes, not content hashes. (#256)
+- Group #280's kpool patcher, test and fixture copies with existing recipe
+  copies, and run its tail-seed patch after slot-map in the same layer.
+  The separate #280 instructions produced a 128-layer image that Docker
+  overlay2 could build but could not instantiate on the target hosts;
+  grouping removes five layers without changing the patch order.
+
+- `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
+  prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
+  `487ecf187` still uses a dense 2048 B stride in `_kpool_tail_seed_kernel`.
+  This is separate from `patch_kpool_tail_slotmap.py` (block-table row clamp).
+  An unmarked file counts as already fixed upstream only when every seed
+  launch passes the tail tensor's real strides; a half-fixed file fails the
+  boot. Dependency-gated tests now report as skipped, not passed
+  (`GLM53_REQUIRE_KERNEL_TESTS=1` makes them required). Issue #264.
+- `README.md`: the Context row's KV pool is the measured 1,572,073 tokens at
+  the 850k default (14 GiB reservation, compact draft KV), not "~1M".
 - `start.sh`, `start-tp3.sh`, and `start-tp4.sh`: a GHCR pull could replace a
   local image whose recipe stamp already matched the repo, then launch the
   published image (no locally compiled artifacts; `GLM53_EXL3_MOE_FAST=1`

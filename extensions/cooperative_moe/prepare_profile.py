@@ -9,12 +9,10 @@ import argparse
 import hashlib
 from pathlib import Path, PurePosixPath
 
-# Reviewed repin: overlay/exl3.py gained the opt-in GLM53_EXL3_MOE_FAST
-# dispatch (#217) and the KDA large-M BF16 path (#233, TP2+TP3). With both
-# flags unset the module builds the same pointer tables and takes the same
-# Marlin paths as before, so a generated profile behaves as it did. Refusal
-# on any further drift is unchanged.
-STOCK_SHA = "849e25882ab7901fbdd7227990a4f125809e1f79288ce6506311b6e6a53e6fb2"
+# Dense EXL3 leaves the cooperative routed-expert ABI and pointer tables
+# unchanged. Regenerate from this source so a dense pack cannot select an
+# older overlay that ignores its non_routed_exl3 declarations.
+STOCK_SHA = "da7dd6540d402f53d8a1af0f17eac5570ec37041bd2e1029017bea4ed44f87e4"
 BINARY_SHA = "aa3fe5e9387c7e0d42d685fb2ca8a5fb959ad956600236baac078a9076c17a1c"
 ADAPTER_SHA = "9427f6a65def09ebdbea231e42f735236e145f3d02c19cf5e5276c2e704ce1ca"
 

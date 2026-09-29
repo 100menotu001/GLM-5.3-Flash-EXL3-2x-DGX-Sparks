@@ -76,6 +76,7 @@ fi
 # Caller exports, including explicit empties, must win over .env.
 # Snapshot exports rather than parsing .env: it is sourced as shell code.
 _caller_overrides=()
+_GLM53_PROFILE_EXPLICIT=""
 while IFS= read -r _k; do
     _flags="$(declare -p "$_k")"
     _flags="${_flags#declare -}"; _flags="${_flags%% *}"
@@ -99,6 +100,7 @@ _glm53_env_watch=" HF_HOME MODEL MODEL_REVISION IMAGE PORT TP NNODES "
 # shellcheck disable=SC2163
 for _kv in ${_caller_overrides[@]+"${_caller_overrides[@]}"}; do
     _name="${_kv%%=*}"; _cval="${_kv#*=}"
+    _GLM53_PROFILE_EXPLICIT+=" $_name"
     case "$_glm53_env_watch" in
       *" $_name "*)
         if [ -n "${!_name+x}" ] && [ "${!_name}" != "$_cval" ]; then
@@ -139,6 +141,11 @@ case "$GLM53_MODEL_PRESET" in
         # Published manifest at the pin: 120 safetensors shards (175642157752
         # bytes) plus config.json / model.safetensors.index.json / ABLIT_META.json.
         MODEL_PINNED_SHARDS=120
+        ;;
+    dense-h3)
+        # TP2 dense-EXL3 H3 target + 6-bpw DFlash2 draft, built on the head
+        # from pinned public inputs by build_dense_h3; the TR3 target above is
+        # its base, and tools/pack_profile.py selects the serving settings.
         ;;
     *)
         printf 'FATAL: unknown GLM53_MODEL_PRESET: %s\n' "$GLM53_MODEL_PRESET" >&2
@@ -251,6 +258,9 @@ CACHE_RESET_PATCH_HOST="${CACHE_RESET_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cach
 COLD_LOAD_PATCH_HOST="${COLD_LOAD_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_cold_load_uma.py}"
 SKIP_CGPROF_PATCH_HOST="${SKIP_CGPROF_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_skip_cudagraph_profile.py}"
 KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_slotmap.py}"
+# vLLM #57477. Different file from the slot-map clamp above: kpool_compress.py
+# prefill seed stride, not block_table.py.
+KPOOL_SEED_PATCH_HOST="${KPOOL_SEED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_seed_stride.py}"
 MAMBA_STATE_PATCH_HOST="${MAMBA_STATE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_state_free.py}"
 MAMBA_CHUNK_PATCH_HOST="${MAMBA_CHUNK_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_chunking.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
@@ -259,6 +269,8 @@ DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp
 LOADCLONE_PATCH_HOST="${LOADCLONE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_loadclone.py}"
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
+DFLASH2_EXL3_PATCH_HOST="${DFLASH2_EXL3_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dflash2_exl3.py}"
+DFLASH2_MODEL_OVERLAY_HOST="${DFLASH2_MODEL_OVERLAY_HOST:-$SCRIPT_DIR/overlay/qwen3_dflash2.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
 # IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
@@ -426,6 +438,12 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # TP=3 local shape [8726x4096] (64→66 head pad). Changes target numerics
 # (see docs/kda-bf16-large-m.md); default off.
 GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"
+# Dense-EXL3 for the non-routed linears (overlay/exl3.py [dense-exl3]; README
+# env table). Mutually exclusive with GLM53_DENSE_FP8 and ABLIT; TP=2 only.
+GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}"
+# Manual mode retains no BF16 copy unless selected. A validated pack profile
+# selects the six H3 groups before numeric validation and lifecycle operations.
+GLM53_DENSE_EXL3_PREFILL_BF16="${GLM53_DENSE_EXL3_PREFILL_BF16-off}"
 # Cooperative MoE tile geometry (0 both-narrow, 1 both-wide, 2 A-wide/B-narrow).
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
@@ -686,6 +704,35 @@ _glm53_validate_mixed_prefill() {
     fi
 }
 
+# overlay/exl3.py parses the same vocabulary at weight load (lowercased,
+# comma-separated); a typo must fail here, pre-stop, not after a stop.
+_glm53_validate_dense_exl3_prefill_bf16() {
+    local raw tok
+    # Unset inherits the configuration-block default; an explicitly empty
+    # value is an operator error, not off.
+    if [ -n "${GLM53_DENSE_EXL3_PREFILL_BF16+x}" ] && [ -z "$GLM53_DENSE_EXL3_PREFILL_BF16" ]; then
+        echo "GLM53_DENSE_EXL3_PREFILL_BF16: empty is not a value; set off/all/a comma list" >&2
+        return 2
+    fi
+    raw="$(printf '%s' "${GLM53_DENSE_EXL3_PREFILL_BF16:-off}" | tr '[:upper:]' '[:lower:]')"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    local -a toks
+    IFS=, read -r -a toks <<< "$raw"
+    case "$raw" in
+        ""|off|0|no|none|all|on|1) return 0 ;;
+    esac
+    for tok in "${toks[@]}"; do
+        tok="${tok#"${tok%%[![:space:]]*}"}"
+        tok="${tok%"${tok##*[![:space:]]}"}"
+        case "$tok" in
+            kda_in|kda_o|mla_qkv_a|mla_q_b|mla_o|shared_gate_up|shared_down|dense_gate_up|dense_down) ;;
+            *) echo "GLM53_DENSE_EXL3_PREFILL_BF16: unknown module type '$tok' (allowed: kda_in,kda_o,mla_qkv_a,mla_q_b,mla_o,shared_gate_up,shared_down,dense_gate_up,dense_down; or all/off)" >&2
+               return 2 ;;
+        esac
+    done
+}
+
 validate_numeric_config() {
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
@@ -722,6 +769,40 @@ validate_numeric_config() {
         echo "GLM53_DRAFT_KV_COMPACT=1 requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
     fi
+    _glm53_validate_bool_flag GLM53_DENSE_EXL3 "${GLM53_DENSE_EXL3-0}" || return
+    # Dense EXL3 owns the same dense modules the FP8/BF16 overlays target and
+    # every o_proj; refuse the mix here (pre-stop) — overlay/exl3.py raises
+    # per module at load as the in-container backstop.
+    if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
+        if [ "${TP:-2}" != "2" ]; then
+            echo "GLM53_DENSE_EXL3=1 requires TP=2" >&2
+            return 2
+        fi
+        case "${GLM53_DENSE_FP8:-off}" in
+            ""|off|0|no|none) ;;
+            *) echo "GLM53_DENSE_EXL3=1 requires GLM53_DENSE_FP8=off (got: ${GLM53_DENSE_FP8}) — the dense-EXL3 pack covers every FP8 group's modules" >&2
+               return 2 ;;
+        esac
+        if [ "${ABLIT-0}" = "1" ]; then
+            echo "GLM53_DENSE_EXL3=1 requires ABLIT=0 — a dense-EXL3 pack quantizes o_proj on every layer; ABLIT edits BF16 o_proj only" >&2
+            return 2
+        fi
+    else
+        # Pre-stop mirror of the in-container pack/flag refusal
+        # (overlay/patch_dense_fp8.py): a non_routed_exl3 pack must not boot
+        # with the flag off. Best-effort on the host snapshot; the container
+        # re-checks.
+        local _snap="${MODEL_SNAPSHOT:-}"
+        if [ -z "$_snap" ] && [ -n "${MODEL_PATH:-}" ] && [ -f "$MODEL_PATH/refs/main" ]; then
+            _snap="$(<"$MODEL_PATH/refs/main")"
+        fi
+        if [ -n "$_snap" ] && [ -f "$MODEL_PATH/snapshots/$_snap/config.json" ] \
+           && grep -q '"non_routed_exl3"' "$MODEL_PATH/snapshots/$_snap/config.json"; then
+            echo "GLM53_DENSE_EXL3=0 but the model pack carries non_routed_exl3 — set GLM53_DENSE_EXL3=1 or serve a non-dense pack" >&2
+            return 2
+        fi
+    fi
+    _glm53_validate_dense_exl3_prefill_bf16 || return
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
     _glm53_validate_spinwait_ms || return
@@ -786,7 +867,8 @@ validate_overlay_artifacts() {
     local video_end='    print("glm53: overlay install ok aligned=True", file=sys.stderr)'
     local ablit_marker='MARKER = "ABLIT-HOOK"'
     local -a artifacts=(
-        "$EXL3_OVERLAY_HOST|class Exl3Config(QuantizationConfig):|        )"
+        # Old generated overlays silently ignore dense target/draft metadata.
+        "$EXL3_OVERLAY_HOST|class Exl3LinearMethod(LinearMethodBase):|        )"
         "$VIDEO_PATCH_HOST|vllm/model_executor/layers/|$video_end"
         "$STOP_PATCH_HOST|[suppress-stops-in-reasoning]|    raise SystemExit(main(sys.argv))"
         "$SCHED_PATCH_HOST|[glm53-decode-floor]|$main_guard"
@@ -798,6 +880,7 @@ validate_overlay_artifacts() {
         "$TOOLCHOICE_PATCH_HOST|[glm53-tool-choice-none]|$main_guard"
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
+        "$KPOOL_SEED_PATCH_HOST|[glm53-kpool-tail-seed-stride]|$main_guard"
         "$MAMBA_STATE_PATCH_HOST|[glm53-mamba-align-state-free-v1]|$main_guard"
         "$MAMBA_CHUNK_PATCH_HOST|[glm53-mamba-align-chunking-v1]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
@@ -810,6 +893,8 @@ validate_overlay_artifacts() {
         "$SKIP_CGPROF_PATCH_HOST|[glm53-skip-cudagraph-profile]|    sys.exit(main())"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
+        "$DFLASH2_EXL3_PATCH_HOST|[dense-exl3-dflash2]|$main_guard"
+        "$DFLASH2_MODEL_OVERLAY_HOST|DFlash2Qwen3ForCausalLM|EntryClass = DFlash2Qwen3ForCausalLM"
     )
     local entry path rest tag tail last stock_last
     if [ "${#artifacts[@]}" -eq 0 ]; then
@@ -938,13 +1023,21 @@ usage() {
         | sed -e '/^set -euo pipefail/d' -e '/^# =\{10,\}$/d' -e 's/^# \{0,1\}//'
 }
 
+# Newest snapshot, for a missing refs/main. A built dense-h3 target is never
+# an implicit fallback: only select_dense_h3 names it.
+newest_snapshot() {
+    local repo="$1" skip=/
+    [ -s "$repo/refs/$DENSE_H3_REF" ] && skip="$(<"$repo/refs/$DENSE_H3_REF")"
+    ls -1t "$repo/snapshots" 2>/dev/null | grep -vxF -- "$skip" | head -n 1 || true
+}
+
 count_shards() {
     local repo_path="$1" snapshot="${2:-}" ref
     if [ -n "$snapshot" ]; then
         ref="$snapshot"
     else
         ref="$(cat "$repo_path/refs/main" 2>/dev/null || true)"
-        [ -n "$ref" ] || ref="$(ls -1t "$repo_path/snapshots" 2>/dev/null | head -n 1 || true)"
+        [ -n "$ref" ] || ref="$(newest_snapshot "$repo_path")"
     fi
     if [ -z "$ref" ]; then
         printf '0'
@@ -973,7 +1066,7 @@ model_tree_complete() {
 ensure_refs_main() {
     local ref="$MODEL_PATH/refs/main" snap
     [ -f "$ref" ] && [ -n "$(<"$ref")" ] && return 0
-    snap="$(ls -1t "$MODEL_PATH/snapshots" 2>/dev/null | head -n 1 || true)"
+    snap="$(newest_snapshot "$MODEL_PATH")"
     [ -n "$snap" ] || die "no snapshots under $MODEL_PATH — re-run download"
     mkdir -p "$MODEL_PATH/refs"
     printf '%s' "$snap" >"$ref"
@@ -1024,6 +1117,144 @@ resolve_dflash_dir() {
     [ -f "$dir/config.json" ] || die "DFlash2 config.json missing in $dir"
     [ -f "$dir/model.safetensors" ] || die "DFlash2 model.safetensors missing in $dir"
     printf '/root/.cache/huggingface/hub/%s/snapshots/%s' "$DFLASH_CACHE_NAME" "$hash"
+}
+
+
+# GLM53_MODEL_PRESET=dense-h3 inputs. All public and pinned; the pair itself
+# is built on the head (no Hub repo carries it: the IncoAI draft license is
+# CC BY-NC-ND 4.0, so its quantized derivative is not redistributed).
+DENSE_H3_TR3_CONFIG_SHA256=4f5341e048984459471bfb9c894e6bf87e69b9c67402672af901631d1349f265
+DENSE_H3_TR3_INDEX_SHA256=2f64d21c67c90bbafeb36c4e9b2f06f54063ed439e9f7cf95962d425a1d8515d
+DENSE_H3_QUANT_BRANCH=4.05bpw
+DENSE_H3_QUANT_REV=2a30229e67012798ba9f0cd832bb78abf4c363d5
+# Both builds are byte-reproducible (2026-09-26 and 2026-09-28 builds identical):
+# a build that differs is refused rather than served.
+DENSE_H3_OVERLAY_SHA256=1a1b0793bebfa273ed8f5307c5c6d8ebcdb3c7d1faabc9956304abd095bfdeac
+DENSE_H3_DRAFT_SRC=incoai/GLM-5.3-Flash-DFlash2
+DENSE_H3_DRAFT_SRC_REV=dc77ff1c99eeb2df044ee3d4f0094eb033fee410
+DENSE_H3_DRAFT_REPO=local/GLM-5.3-Flash-DFlash2-EXL3-6bpw
+DENSE_H3_DRAFT_REV=27d192863a9a167d443be34200861ed42b4557a7
+# refs/<name> in the TR3 repo names the built target; refs/main stays on the
+# ordinary snapshot so leaving the preset restores the ordinary pack.
+DENSE_H3_REF=glm53-dense-h3
+
+# Adopt an already built pair from the primary or fallback TR3 repo.
+select_dense_h3() {
+    [ "$GLM53_MODEL_PRESET" = "dense-h3" ] || return 0
+    local entry repo name rev
+    for entry in "$MODEL_PATH|$MODEL_CACHE_NAME" "$FALLBACK_MODEL_PATH|$MODEL_FALLBACK_CACHE_NAME"; do
+        repo="${entry%%|*}"; name="${entry#*|}"
+        [ -s "$repo/refs/$DENSE_H3_REF" ] || continue
+        rev="$(<"$repo/refs/$DENSE_H3_REF")"
+        [ -d "$repo/snapshots/$rev" ] || continue
+        MODEL_PATH="$repo"
+        MODEL_CACHE_NAME="$name"
+        MODEL_SNAPSHOT="$rev"
+        return 0
+    done
+    return 1
+}
+
+# Build the pair once: dense EXL3 tensors range-read from turboderp's quant
+# (~5.3 GB, CPU) over the downloaded TR3 snapshot, and the IncoAI BF16 draft
+# quantized to 6 bpw on the head GPU. resolve_pack_profile validates the result.
+build_dense_h3() {
+    [ "$GLM53_MODEL_PRESET" = "dense-h3" ] || return 0
+    if select_dense_h3; then
+        log "dense-h3 pair present: $MODEL_PATH/snapshots/$MODEL_SNAPSHOT"
+        return 0
+    fi
+    [ "${TP:-2}" = "2" ] || die "GLM53_MODEL_PRESET=dense-h3 requires TP=2"
+    [ "${SKIP_DOWNLOAD:-0}" != "1" ] || die "dense-h3 pair is not built and SKIP_DOWNLOAD=1 — unset it once to build"
+    local hub="$HF_CACHE_DIR/hub" work="$HF_CACHE_DIR/glm53-dense-h3"
+    local src overlay marker draft_root draft_rev rev sources
+    src="$MODEL_PATH/snapshots/$(<"$MODEL_PATH/refs/main")"
+    if [ "$(sha256sum <"$src/config.json" | cut -d' ' -f1)" != "$DENSE_H3_TR3_CONFIG_SHA256" ] \
+       || [ "$(sha256sum <"$src/model.safetensors.index.json" | cut -d' ' -f1)" != "$DENSE_H3_TR3_INDEX_SHA256" ]; then
+        die "dense-h3 builds on the pinned TR3 4-bpw pack; $src is a different checkpoint"
+    fi
+    resolve_hf_bin || die "no 'hf' / 'huggingface-cli' on PATH and no python huggingface_hub — pip install --user -U 'huggingface_hub[cli]' (or set HF_BIN=/path/to/hf)"
+    mkdir -p "$work"
+
+    draft_root="$hub/models--${DENSE_H3_DRAFT_REPO//\//--}"
+    draft_rev="$DENSE_H3_DRAFT_REV"
+    if [ -f "$draft_root/snapshots/$draft_rev/model.safetensors" ]; then
+        log "dense-h3: 6-bpw draft present: $draft_root/snapshots/$draft_rev"
+    else
+        if [ -n "$(docker ps -q --filter "name=^${CONTAINER_HEAD}\$")" ]; then
+            die "dense-h3: quantizing the draft needs the head GPU — stop the serve first (./start.sh stop && ./start.sh)"
+        fi
+        HF_HOME="$HF_CACHE_DIR" "${HF_BIN_CMD[@]}" download "$DENSE_H3_DRAFT_SRC" --revision "$DENSE_H3_DRAFT_SRC_REV" >/dev/null \
+            || die "dense-h3: download of ${DENSE_H3_DRAFT_SRC}@${DENSE_H3_DRAFT_SRC_REV} failed"
+        log "dense-h3: quantizing ${DENSE_H3_DRAFT_SRC} to 6 bpw on the head GPU (one-off, ~25 min on GB10) ..."
+        rm -rf "$work/draft-out"
+        IMG="$IMAGE" BUILD="$work/draft-build" OUT="$work/draft-out" \
+            DRAFT_SNAP="$hub/models--${DENSE_H3_DRAFT_SRC//\//--}/snapshots/$DENSE_H3_DRAFT_SRC_REV" \
+            bash "$SCRIPT_DIR/tools/dflash2_exl3_quant.sh" || die "dense-h3: draft quantization failed"
+        rev="$(python3 "$SCRIPT_DIR/tools/stage_dense_h3.py" draft --built "$work/draft-out" \
+            --hub "$hub" --repo "$DENSE_H3_DRAFT_REPO")" || die "dense-h3: staging the draft failed"
+        rm -rf "$work/draft-out"
+        [ "$rev" = "$draft_rev" ] \
+            || die "dense-h3: the draft build ($rev) does not match the pinned recipe ($draft_rev) — refusing to serve it"
+    fi
+
+    # A verified overlay survives a later failure; the marker names its inputs.
+    overlay="$MODEL_PATH/snapshots/.glm53-dense-h3-build"
+    marker="$work/overlay.complete"
+    if [ ! -d "$overlay" ] || [ "$(cat "$marker" 2>/dev/null)" != "$src|$DENSE_H3_QUANT_REV" ]; then
+        rm -rf "$overlay" "$marker"
+        log "dense-h3: fetching dense EXL3 tensors from turboderp/GLM-5.3-Flash-exl3@${DENSE_H3_QUANT_BRANCH} (${DENSE_H3_QUANT_REV:0:8}, ~5.3 GB, ~2 min) ..."
+        python3 "$SCRIPT_DIR/tools/dense_overlay.py" --branch "$DENSE_H3_QUANT_BRANCH" --revision "$DENSE_H3_QUANT_REV" \
+            --src "$src" --out "$overlay" --prefix-rewrite model.language_model.:language_model.model. \
+            --cache "$work/headers" || die "dense-h3: dense EXL3 overlay build failed (re-run to retry)"
+        [ "$(sha256sum <"$overlay/dense-exl3-${DENSE_H3_QUANT_BRANCH}.safetensors" | cut -d' ' -f1)" = "$DENSE_H3_OVERLAY_SHA256" ] \
+            || die "dense-h3: the dense EXL3 overlay does not match its pinned SHA-256 — refusing to serve it"
+        printf '%s' "$src|$DENSE_H3_QUANT_REV" > "$marker"
+    fi
+    sources="$(printf '{"tr3_config_sha256":"%s","dense_exl3":"turboderp/GLM-5.3-Flash-exl3@%s","draft":"%s@%s"}' \
+        "$DENSE_H3_TR3_CONFIG_SHA256" "$DENSE_H3_QUANT_REV" "$DENSE_H3_DRAFT_SRC" "$DENSE_H3_DRAFT_SRC_REV")"
+    rev="$(python3 "$SCRIPT_DIR/tools/stage_dense_h3.py" target --overlay "$overlay" --hub "$hub" \
+        --draft-repo "$DENSE_H3_DRAFT_REPO" --draft-rev "$draft_rev" --ref "$DENSE_H3_REF" \
+        --sources "$sources")" || die "dense-h3: staging the target failed"
+    rm -f "$marker"
+    select_dense_h3 || die "dense-h3: staged target $rev not found"
+    log "dense-h3: built target $MODEL_PATH/snapshots/$rev + draft $DENSE_H3_DRAFT_REPO@$draft_rev"
+}
+
+# Resolve only genuine, staged metadata; never infer a profile from a repo id.
+resolve_pack_profile() {
+    local snap="${MODEL_SNAPSHOT:-}" values key value
+    if [ -z "$snap" ] && [ -f "$MODEL_PATH/refs/main" ]; then
+        snap="$(<"$MODEL_PATH/refs/main")"
+    fi
+    [ -n "$snap" ] || return 0
+    values="$(
+        export TP GLM53_DENSE_EXL3 GLM53_DENSE_FP8 GLM53_DENSE_EXL3_PREFILL_BF16
+        export GLM53_KDA_BF16_LARGE_M ABLIT SPEC_METHOD DFLASH_DRAFT_TP
+        export DFLASH_MODEL DFLASH_REVISION DFLASH_CACHE_NAME EXPECTED_SHARDS
+        python3 "$SCRIPT_DIR/tools/pack_profile.py" "$MODEL_PATH/snapshots/$snap" \
+            --hub "$HF_CACHE_DIR/hub" --explicit "$_GLM53_PROFILE_EXPLICIT"
+    )" || return 2
+    [ -n "$values" ] || return 0
+    case " $_GLM53_PROFILE_EXPLICIT " in
+        *" MODEL_REVISION "*)
+            if [ "$MODEL_REVISION" != "$snap" ]; then
+                echo "pack profile conflicts with MODEL_REVISION=$MODEL_REVISION (selected snapshot: $snap)" >&2
+                return 2
+            fi ;;
+    esac
+    while IFS=$'\t' read -r key value; do
+        printf -v "$key" '%s' "$value"
+    done <<< "$values"
+    MODEL_SNAPSHOT="$snap"
+    MODEL_REVISION="$snap"
+    # Never fall back from a selected dense profile to the ordinary target.
+    MODEL_FALLBACK="$MODEL"
+    MODEL_FALLBACK_CACHE_NAME="$MODEL_CACHE_NAME"
+    FALLBACK_MODEL_PATH="$MODEL_PATH"
+    MODEL_FALLBACK_SNAPSHOT="$snap"
+    DFLASH_PATH="$HF_CACHE_DIR/hub/$DFLASH_CACHE_NAME"
+    log "pack profile: dense-exl3 H3 / DFlash2 6-bpw ($DFLASH_MODEL@$DFLASH_REVISION)"
 }
 
 check_port_free() {
@@ -1197,6 +1428,7 @@ preflight() {
     [ -f "$COLD_LOAD_PATCH_HOST" ] || die "$COLD_LOAD_PATCH_HOST missing"
     [ -f "$SKIP_CGPROF_PATCH_HOST" ] || die "$SKIP_CGPROF_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
+    [ -f "$KPOOL_SEED_PATCH_HOST" ] || die "$KPOOL_SEED_PATCH_HOST missing"
     [ -f "$MAMBA_STATE_PATCH_HOST" ] || die "$MAMBA_STATE_PATCH_HOST missing"
     [ -f "$MAMBA_CHUNK_PATCH_HOST" ] || die "$MAMBA_CHUNK_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
@@ -1631,6 +1863,7 @@ download_only() {
     # Explicit download: do not honor SKIP_DOWNLOAD from .env.
     SKIP_DOWNLOAD=0
     download_weights
+    build_dense_h3
     download_dflash
 
     have="$(count_shards "$MODEL_PATH" "$MODEL_SNAPSHOT")"
@@ -1657,6 +1890,11 @@ download_only() {
 # over ~164 GiB / 120 shards on both ends for zero bytes of difference
 # (issue #22, item 2). FORCE_SYNC=1 bypasses the marker; deleting the
 # marker file on the worker has the same effect.
+# The marker is a claim, not proof: it is written only after the synced
+# snapshot passes worker_snapshot_complete, a matching marker is honored only
+# when that same probe passes, and a mutating sync clears the marker before the
+# transfer — so an interrupted sync is neither stamped complete nor skipped on
+# the next launch, and a marker left by an incomplete one is not trusted.
 sync_repo_marker_rev() {
     local src="$1" preferred="${2:-}"
     local rev
@@ -1665,25 +1903,105 @@ sync_repo_marker_rev() {
     else
         rev="$(cat "$src/refs/main" 2>/dev/null || true)"
     fi
-    [ -n "$rev" ] || rev="$(ls -1t "$src/snapshots" 2>/dev/null | head -n 1 || true)"
+    [ -n "$rev" ] || rev="$(newest_snapshot "$src")"
     [ -n "$rev" ] || rev="unknown"
     printf '%s' "$rev"
 }
 
+# The files the loader opens in the selected snapshot — the two sidecars plus
+# every shard the snapshot's own index names (weight_map values), or the
+# drafter's config + weight — as "bytes name" lines, dereferenced as the loader
+# reads them. Fails closed instead of degrading to a weaker probe: a present
+# index that cannot be read or parsed, a required entry that is not a
+# dereferenced regular file, and a shard name that cannot be quoted into the
+# worker probe are errors, because the loader opens those same files.
+snapshot_required_sizes() {
+    python3 -S -c '
+import json, os, re, stat, sys
+snap, label = sys.argv[1], sys.argv[2]
+if label == "DFlash2 draft":
+    names = ["config.json", "model.safetensors"]
+else:
+    with open(os.path.join(snap, "model.safetensors.index.json"), encoding="utf-8") as fh:
+        weight_map = json.load(fh).get("weight_map") or {}
+    shards = sorted({n for n in weight_map.values() if isinstance(n, str) and n})
+    if not shards or any(not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._-]*", n) for n in shards):
+        sys.exit(1)
+    names = ["config.json", "model.safetensors.index.json", *shards]
+for name in names:
+    try:
+        st = os.stat(os.path.join(snap, name))
+    except OSError:
+        sys.exit(1)
+    if not stat.S_ISREG(st.st_mode):
+        sys.exit(1)
+    print(st.st_size, name)
+' "$1/snapshots/$2" "$3"
+}
+
+# Worker-side twin of the local completeness contract — model_tree_complete for
+# the target, resolve_dflash_dir for the drafter ("DFlash2 draft") — probed in
+# one ssh call: every entry of the expected inventory must dereference to a
+# regular file of the head's own byte size, so a nonempty partial shard, a
+# directory or a symlink to either is not mistaken for the synced file. The
+# names come from the snapshot's own index, so an unrelated *.safetensors file
+# cannot stand in for a missing required shard.
+worker_snapshot_complete() {
+    local cache_name="$1" rev="$2" sizes="$3"
+    local dir="${WORKER_CACHE_DIR}/hub/${cache_name}/snapshots/${rev}"
+    local -a names=()
+    local size name
+    [ -n "$sizes" ] || return 1
+    while read -r size name; do
+        names+=("$name")
+    done <<<"$sizes"
+    # -L + -type f prints the dereferenced size of entries that resolve to a
+    # regular file only; -printf reproduces the head's "bytes name" lines, so
+    # both sides compare as one string. The unquoted expansion is deliberate:
+    # snapshot_required_sizes validated each name as a single safe token.
+    [ "$(worker_ssh "cd '$dir' && find -L ${names[*]} -maxdepth 0 -type f -printf '%s %p\n' 2>/dev/null")" = "$sizes" ]
+}
+
 sync_repo_to_worker() {
     local src="$1" cache_name="$2" label="$3" preferred="${4:-}"
-    local marker rev
+    local marker rev remote_dir sizes
     marker="${WORKER_CACHE_DIR}/hub/${cache_name}/.glm53-exl3-synced"
     rev="$(sync_repo_marker_rev "$src" "$preferred")"
+    remote_dir="${WORKER_CACHE_DIR}/hub/${cache_name}/snapshots/${rev}"
+    # Verify against the head before touching the worker: a transfer cannot
+    # repair an unreadable index or a missing required entry, so refusing here
+    # keeps a ~164 GiB rsync from running to serve a tree that cannot load.
+    sizes="$(snapshot_required_sizes "$src" "$rev" "$label")" \
+        || die "${label} snapshot cannot be verified on the head: $src/snapshots/$rev — an index or required file is missing or unusable (REFRESH_WEIGHTS=1 re-downloads it)"
     if [ "${FORCE_SYNC:-0}" != "1" ] \
        && [ "$(worker_ssh "cat '$marker' 2>/dev/null" || true)" = "$rev" ]; then
-        log "worker ${cache_name} already at ${rev} — rsync skipped (FORCE_SYNC=1 to force)"
-        return 0
+        if worker_snapshot_complete "$cache_name" "$rev" "$sizes"; then
+            log "worker ${cache_name} already at ${rev} — rsync skipped (FORCE_SYNC=1 to force)"
+            return 0
+        fi
+        warn "worker ${cache_name} marker matches ${rev}, but its snapshot is incomplete — re-syncing"
     fi
     log "syncing ${label} to worker (first run moves ~164 GiB over the p2p link) ..."
-    worker_ssh "mkdir -p '${WORKER_CACHE_DIR}/hub/${cache_name}'"
+    # A mutating sync clears the marker first: --partial keeps half-written
+    # bytes, so a marker left over a failed transfer would describe a tree no
+    # completed sync produced.
+    worker_ssh "mkdir -p '${WORKER_CACHE_DIR}/hub/${cache_name}' && rm -f '$marker'"
     rsync -a --partial --info=progress2 \
         "$src/" "${WORKER_SSH}:${WORKER_CACHE_DIR}/hub/${cache_name}/"
+    # HF cache snapshot entries are symlinks into blobs/, so a link whose target
+    # the worker never received stays dangling no matter how often the repo is
+    # re-synced. Repair only that case, and only the drafter's single weight:
+    # rsync -L dereferences the head's link, so the worker gets the 2.3 GiB of
+    # bytes instead of a second copy of the whole repo.
+    if [ "$label" = "DFlash2 draft" ] \
+       && ! worker_snapshot_complete "$cache_name" "$rev" "$sizes"; then
+        warn "DFlash2 model.safetensors is unreadable on worker — copying the weight by value"
+        worker_ssh "mkdir -p '$remote_dir'"
+        rsync -aL --partial --info=progress2 \
+            "$src/snapshots/$rev/model.safetensors" "${WORKER_SSH}:${remote_dir}/"
+    fi
+    worker_snapshot_complete "$cache_name" "$rev" "$sizes" \
+        || die "synced ${label} snapshot is incomplete on worker: $remote_dir"
     worker_ssh "printf '%s' '$rev' > '$marker'"
 }
 
@@ -1694,11 +2012,11 @@ verify_worker_model_snapshot() {
     # proves it can) — there is no worker copy to count, and the export is the
     # tree require_model_snapshot already validated on the head.
     [ "${NFS_SHARE:-0}" = "1" ] && return 0
-    local dir="${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/snapshots/${MODEL_SNAPSHOT}"
-    worker_ssh "test -f '$dir/config.json' \
-        && test -f '$dir/model.safetensors.index.json' \
-        && [ \"\$(find -L '$dir' -maxdepth 1 -type f -name '*.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]')\" -ge '$EXPECTED_SHARDS' ]" \
-        || die "pinned model snapshot is incomplete on worker: $dir"
+    local sizes
+    sizes="$(snapshot_required_sizes "$MODEL_PATH" "$MODEL_SNAPSHOT" "weights")" \
+        || die "pinned model snapshot cannot be verified on the head: $MODEL_PATH/snapshots/$MODEL_SNAPSHOT"
+    worker_snapshot_complete "$MODEL_CACHE_NAME" "$MODEL_SNAPSHOT" "$sizes" \
+        || die "pinned model snapshot is incomplete on worker: ${WORKER_CACHE_DIR}/hub/${MODEL_CACHE_NAME}/snapshots/${MODEL_SNAPSHOT}"
 }
 
 sync_weights() {
@@ -1748,9 +2066,14 @@ GLM53_OVERLAY_ORDER=(
     patch_tool_choice_none.py
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
+    patch_kpool_tail_seed_stride.py
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    # patch_dflash2_exl3.py installs the mounted qwen3_dflash2.py and anchors
+    # the image's qwen3_dflash.py — no shared anchors with any overlay here;
+    # inert for BF16 drafts.
+    patch_dflash2_exl3.py
     patch_loadclone.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
@@ -2063,6 +2386,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$SKIP_CGPROF_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_skip_cudagraph_profile.py"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "missing $KPOOL_TAIL_PATCH_HOST"
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
+    [ -f "$KPOOL_SEED_PATCH_HOST" ] || die "missing $KPOOL_SEED_PATCH_HOST"
+    scp -q -o BatchMode=yes "$KPOOL_SEED_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_seed_stride.py"
     [ -f "$MAMBA_STATE_PATCH_HOST" ] || die "missing $MAMBA_STATE_PATCH_HOST"
     scp -q -o BatchMode=yes "$MAMBA_STATE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_mamba_align_state_free.py"
     [ -f "$MAMBA_CHUNK_PATCH_HOST" ] || die "missing $MAMBA_CHUNK_PATCH_HOST"
@@ -2075,6 +2400,10 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    [ -f "$DFLASH2_EXL3_PATCH_HOST" ] || die "missing $DFLASH2_EXL3_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DFLASH2_EXL3_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dflash2_exl3.py"
+    [ -f "$DFLASH2_MODEL_OVERLAY_HOST" ] || die "missing $DFLASH2_MODEL_OVERLAY_HOST"
+    scp -q -o BatchMode=yes "$DFLASH2_MODEL_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-qwen3_dflash2.py"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
@@ -2203,8 +2532,8 @@ launch_cluster() {
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 \
-             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M \
-             GLM53_COOP_GEOMETRY; do
+             GLM53_EXL3_MOE_FAST GLM53_KDA_BF16_LARGE_M GLM53_DENSE_EXL3 \
+             GLM53_DENSE_EXL3_PREFILL_BF16 GLM53_COOP_GEOMETRY; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2288,12 +2617,15 @@ launch_cluster() {
         -v '/tmp/patch_cold_load_uma.py:/opt/glm53/patch_cold_load_uma.py:ro' \
         -v '/tmp/patch_skip_cudagraph_profile.py:/opt/glm53/patch_skip_cudagraph_profile.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
+        -v '/tmp/patch_kpool_tail_seed_stride.py:/opt/glm53/patch_kpool_tail_seed_stride.py:ro' \
         -v '/tmp/patch_mamba_align_state_free.py:/opt/glm53/patch_mamba_align_state_free.py:ro' \
         -v '/tmp/patch_mamba_align_chunking.py:/opt/glm53/patch_mamba_align_chunking.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_loadclone.py:/opt/glm53/patch_loadclone.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_dflash2_exl3.py:/opt/glm53/patch_dflash2_exl3.py:ro' \
+        -v '/tmp/glm53-qwen3_dflash2.py:/opt/glm53/qwen3_dflash2.py:ro' \
         -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
@@ -2335,12 +2667,15 @@ launch_cluster() {
         -v "$COLD_LOAD_PATCH_HOST:/opt/glm53/patch_cold_load_uma.py:ro" \
         -v "$SKIP_CGPROF_PATCH_HOST:/opt/glm53/patch_skip_cudagraph_profile.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
+        -v "$KPOOL_SEED_PATCH_HOST:/opt/glm53/patch_kpool_tail_seed_stride.py:ro" \
         -v "$MAMBA_STATE_PATCH_HOST:/opt/glm53/patch_mamba_align_state_free.py:ro" \
         -v "$MAMBA_CHUNK_PATCH_HOST:/opt/glm53/patch_mamba_align_chunking.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$LOADCLONE_PATCH_HOST:/opt/glm53/patch_loadclone.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$DFLASH2_EXL3_PATCH_HOST:/opt/glm53/patch_dflash2_exl3.py:ro" \
+        -v "$DFLASH2_MODEL_OVERLAY_HOST:/opt/glm53/qwen3_dflash2.py:ro" \
         -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
@@ -2401,6 +2736,8 @@ launch_cluster() {
         -e GLM53_ADAPTIVE_K_SATURATE="$GLM53_ADAPTIVE_K_SATURATE" \
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
+        -e GLM53_DENSE_EXL3="${GLM53_DENSE_EXL3-0}" \
+        -e GLM53_DENSE_EXL3_PREFILL_BF16="$GLM53_DENSE_EXL3_PREFILL_BF16" \
         -e GLM53_EXL3_MOE_FAST="$GLM53_EXL3_MOE_FAST" \
         -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
@@ -2494,14 +2831,31 @@ post_ready_warmup() {
     [ -f "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" ] \
         || { warn "boot-shape-warmup.sh missing — skipping"; return 0; }
     log "post-ready DFlash2/sampler warmup (nonfatal; timeout ${GLM53_WARMUP_REQ_TIMEOUT}s/req) ..."
+    local rc=0
     GLM53_WARMUP_MAX_CONCURRENCY="$MAX_NUM_SEQS" \
     GLM53_WARMUP_REQ_TIMEOUT="$GLM53_WARMUP_REQ_TIMEOUT" \
     GLM53_WARMUP_DFLASH_K="${DFLASH_TOKENS:-7}" \
     GLM53_WARMUP_TRITON_CACHE_DIR="$TRITON_HOST_CACHE" \
     GLM53_WARMUP_BEARER="${VLLM_API_KEY:-}" \
+    GLM53_WARMUP_CANARY="${GLM53_WARMUP_CANARY:-1}" \
         bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
             "http://127.0.0.1:${PORT}" "$SERVED_MODEL_NAME" \
-        || warn "boot shape warmup incomplete — uncovered shapes may JIT mid-serve on TP=2"
+        || rc=$?
+    if [ "$rc" = "3" ]; then
+        # Degenerate-engine canary: /health is green but the engine generates
+        # garbage or accepted none of its drafts (#249). Keep the evidence, then
+        # take the engine off the port: a client must not reach an engine we
+        # just judged broken. Teardown is best-effort — its result never
+        # replaces the verdict, and this message claims only that a shutdown
+        # was attempted.
+        collect_failure_logs 2>/dev/null || true
+        local stop_rc=0
+        local teardown="shutdown attempted"
+        stop_containers || stop_rc=$?
+        [ "$stop_rc" = "0" ] || teardown="shutdown attempt failed (rc=${stop_rc}; containers may still be up)"
+        die "engine failed the post-ready correctness canary (degenerate output / zero DFlash acceptance); logs in $LOGDIR/; ${teardown} — start again (a later boot is usually fine); GLM53_WARMUP_CANARY=0 skips the check"
+    fi
+    [ "$rc" = "0" ] || warn "boot shape warmup incomplete — uncovered shapes may JIT mid-serve on TP=2"
 }
 
 collect_failure_logs() {
@@ -2515,7 +2869,9 @@ on_ready() {
     log "GLM-5.3-Flash EXL3 is UP (TP=${TP}, nnodes=${NNODES})"
     log "  endpoints  : http://127.0.0.1:${PORT}/v1   (LAN: ${HEAD_IP}:${PORT})"
     log "  model name : ${SERVED_MODEL_NAME}"
-    log "  weights    : ${MODEL}  quant=${QUANTIZATION}  kv=${KV_CACHE_DTYPE}"
+    local weights="$MODEL"
+    [ "${GLM53_DENSE_EXL3-0}" = "1" ] && weights+=" + dense EXL3${MODEL_SNAPSHOT:+ (snapshot ${MODEL_SNAPSHOT:0:8})}"
+    log "  weights    : ${weights}  quant=${QUANTIZATION}  kv=${KV_CACHE_DTYPE}"
     local vision=on
     [ "${LANGUAGE_MODEL_ONLY}" = "1" ] && vision=off
     local spec="MTP k=${MTP_TOKENS}"
@@ -2553,14 +2909,17 @@ start_unlocked() {
     preflight
     ensure_image
     download_weights
+    build_dense_h3
+    resolve_pack_profile
+    validate_numeric_config
     download_dflash
     sync_weights
     write_inner_scripts
 
     MODEL_DIR="$(resolve_model_dir)"
     DFLASH_MODEL_DIR=""
+    [ "$SPEC_METHOD" != "dflash" ] || DFLASH_MODEL_DIR="$(resolve_dflash_dir)"
     if [ "$SPEC_METHOD" = "dflash" ]; then
-        DFLASH_MODEL_DIR="$(resolve_dflash_dir)"
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
@@ -2647,7 +3006,11 @@ logs() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) validate_numeric_config; configure_capture_sizes; validate_overlay_artifacts ;;
+        start|restart)
+            # A pair built after a restart's stop would skip the pre-stop profile check.
+            select_dense_h3 || [ "$cmd" = start ] \
+                || die "GLM53_MODEL_PRESET=dense-h3: the pair is not built yet — ./start.sh stop && ./start.sh builds it (the draft needs the head GPU)"
+            resolve_pack_profile; validate_numeric_config; configure_capture_sizes; validate_overlay_artifacts ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;
