@@ -66,6 +66,7 @@ _cli_temp_rows="${EXL3_TEMP_ROWS_FUSED-}"
 _cli_fat_sorted="${EXL3_FAT_SORTED-}"
 _cli_fat_batched="${EXL3_FAT_BATCHED-}"
 _cli_fat_kernel="${EXL3_FAT_KERNEL-}"
+_cli_fat_grouped="${EXL3_FAT_GROUPED-}"
 _cli_mnbt="${MAX_NUM_BATCHED_TOKENS-}"
 _cli_image="${IMAGE-}"
 _cli_util="${GPU_MEM_UTIL-}"
@@ -173,6 +174,7 @@ set +a
 [ -n "${_cli_fat_sorted}" ] && EXL3_FAT_SORTED="$_cli_fat_sorted"
 [ -n "${_cli_fat_batched}" ] && EXL3_FAT_BATCHED="$_cli_fat_batched"
 [ -n "${_cli_fat_kernel}" ] && EXL3_FAT_KERNEL="$_cli_fat_kernel"
+[ -n "${_cli_fat_grouped}" ] && EXL3_FAT_GROUPED="$_cli_fat_grouped"
 [ -n "${_cli_mnbt}" ] && MAX_NUM_BATCHED_TOKENS="$_cli_mnbt"
 [ -n "${_cli_image}" ] && IMAGE="$_cli_image"
 [ -n "${_cli_util}" ] && GPU_MEM_UTIL="$_cli_util"
@@ -374,8 +376,19 @@ EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 # 1 = GPU row tiles for fat experts (prefill). 0 = LinearEXL3 fallback.
 # Tile (P2a) and TEMP_ROWS=1024 (P2b) both lost at MNBT=1024 — leave 128.
 EXL3_MOE_ROW_TILE="${EXL3_MOE_ROW_TILE:-0}"
-# Fused exl3_moe temp rows/expert. 1024 was slower than 128+fallback (P2b).
-EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-128}"
+# E3 grouped fat-expert prefill (overlay/exl3_fat_moe.cu), the TP4 default, as on
+# start.sh / start-tp3.sh. It must reach every rank: overlay/exl3.py treats a missing
+# EXL3_FAT_GROUPED as off, so docker -e forwards it. Measured 2026-09-27 on 4 Sparks,
+# 1M ctx: cold prefill 1,316 / 1,761 / 1,940 -> 1,772 / 2,422 / 2,733 tok/s at
+# 8K / 32K / 100K with EXL3_TEMP_ROWS_FUSED=32; decode unchanged. 0 = E2 tier.
+EXL3_FAT_GROUPED="${EXL3_FAT_GROUPED:-1}"
+# Fused exl3_moe temp rows/expert; experts above it are "fat". E3 wants 32
+# (>= MAX_NUM_SEQS x (DFLASH_TOKENS+1)), E2 wants 256, as on start.sh. Explicit wins.
+if [ "${EXL3_FAT_GROUPED}" != "0" ]; then
+    EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-32}"
+else
+    EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-256}"
+fi
 # Sorted routing tier; higher tiers imply it even when this is 0.
 EXL3_FAT_SORTED="${EXL3_FAT_SORTED:-0}"
 # E1 batched tier: persistent scratch + combined gate/up; implies SORTED=1.
@@ -1869,7 +1882,7 @@ TP4_SKIP_OLD_SCP
              GLM53_LOAD_CLONE GLM53_LOAD_PREFETCH \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
-             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
+             LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              VLLM_SM120_SPARSE_MLA_SLICE_TOKENS \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
@@ -2001,6 +2014,7 @@ TP4_SKIP_OLD_SCP
         -e EXL3_FAT_SORTED="$EXL3_FAT_SORTED" \
         -e EXL3_FAT_BATCHED="$EXL3_FAT_BATCHED" \
         -e EXL3_FAT_KERNEL="$EXL3_FAT_KERNEL" \
+        -e EXL3_FAT_GROUPED="$EXL3_FAT_GROUPED" \
         -e ABLIT="$ABLIT" \
         -e ABLIT_METHOD="$ABLIT_METHOD" \
         -e ABLIT_DIRECTION="$ABLIT_DIRECTION" \
@@ -2173,7 +2187,7 @@ start() {
         log "DFlash2 load path (in-container): ${DFLASH_MODEL_DIR}"
     fi
     log "model load path (in-container): ${MODEL_DIR}"
-    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT}"
+    log "config: image=${IMAGE} tp=${TP} nnodes=${NNODES} quant=${QUANTIZATION} spec=${SPEC_METHOD} mtp=${MTP_TOKENS} dflash_k=${DFLASH_TOKENS} max-len=${MAX_MODEL_LEN} gpu-util=${GPU_MEM_UTIL} kv=${KV_CACHE_DTYPE} lm-only=${LANGUAGE_MODEL_ONLY} port=${PORT} fat_kernel=${EXL3_FAT_KERNEL} fat_grouped=${EXL3_FAT_GROUPED} temp_rows=${EXL3_TEMP_ROWS_FUSED} mnbt=${MAX_NUM_BATCHED_TOKENS}"
 
     launch_cluster
     if wait_for_health; then

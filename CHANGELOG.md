@@ -247,6 +247,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start-tp4.sh` forwards `EXL3_FAT_GROUPED` to all four ranks (#286) and
+  defaults it to `1` (E3) with the coupled `EXL3_TEMP_ROWS_FUSED` default (32
+  with E3, 256 with E2), matching `start.sh` and `start-tp3.sh`. Before, the
+  value never reached a TP4 rank, so TP4 silently ran the E2 tier. Measured on
+  4 Sparks (1M ctx): cold prefill +35/+38/+41% at 8K/32K/100K, decode
+  unchanged. `EXL3_FAT_GROUPED=0` in `.env.tp4` restores E2.
 - `start-tp4.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, matching
   `start.sh` and `start-tp3.sh`. TP=4 ignored it, so clients that sent no
   `reasoning_effort` got the template's `max` fallback. The launcher now
