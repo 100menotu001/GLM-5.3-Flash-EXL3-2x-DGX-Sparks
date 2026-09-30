@@ -2121,6 +2121,7 @@ GLM53_OVERLAY_ORDER=(
     patch_loadclone.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
+    patch_indexer_warmup_range.py
     patch_cache_reset.py
     patch_ablit.py
 )

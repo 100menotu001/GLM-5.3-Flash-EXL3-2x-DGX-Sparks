@@ -482,6 +482,8 @@ COPY overlay/patch_loadclone.py /opt/glm53/patch_loadclone.py
 COPY tests/test_loadclone.py /opt/glm53/test_loadclone.py
 COPY tests/fixtures/loadclone_weight_utils.py.txt tests/fixtures/kpool_tail_seed_kernel-487ecf187.py.txt tests/fixtures/kpool_tail_seed_kernel-db1bfdd.py.txt /opt/glm53/fixtures/
 COPY tests/test_tool_choice_none.py /opt/glm53/test_tool_choice_none.py
+COPY overlay/patch_indexer_warmup_range.py /opt/glm53/patch_indexer_warmup_range.py
+COPY tests/test_indexer_warmup_range.py /opt/glm53/test_indexer_warmup_range.py
 COPY overlay/ablit_runtime.py /opt/glm53/ablit_runtime.py
 COPY overlay/patch_ablit.py /opt/glm53/patch_ablit.py
 COPY tests/test_ablit.py /opt/glm53/test_ablit.py
@@ -535,6 +537,7 @@ RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py \
 # Applied unconditionally; the injected sizing reads GLM53_INDEXER_WORKSPACE
 # at runtime and returns the stock expression unless it is "rightsize".
 RUN python3 /opt/glm53/patch_indexer_workspace.py
+RUN python3 /opt/glm53/patch_indexer_warmup_range.py
 RUN python3 /opt/glm53/patch_spinwait.py --preflight
 RUN python3 /opt/glm53/patch_cache_reset.py
 RUN python3 /opt/glm53/patch_tool_choice_none.py
@@ -555,6 +558,7 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
     && python3 /opt/glm53/test_tool_choice_none.py \
+    && python3 /opt/glm53/test_indexer_warmup_range.py \
     && python3 /opt/glm53/test_ablit.py \
     && python3 /opt/glm53/test_cache_reset_endpoint.py
 
