@@ -1371,6 +1371,7 @@ ARGS=(
     --tensor-parallel-size "${TP}"
     --nnodes "${NNODES}"
     --node-rank 0
+    --enable-prompt-tokens-details
     --master-addr "${HEAD_IP}"
     --master-port "${MASTER_PORT}"
     --distributed-executor-backend mp
@@ -1488,6 +1489,7 @@ ARGS=(
     --tensor-parallel-size "${TP}"
     --nnodes "${NNODES}"
     --node-rank "${NODE_RANK}"
+    --enable-prompt-tokens-details
     --master-addr "${HEAD_IP}"
     --master-port "${MASTER_PORT}"
     --distributed-executor-backend mp
