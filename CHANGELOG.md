@@ -261,6 +261,13 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   The separate #280 instructions produced a 128-layer image that Docker
   overlay2 could build but could not instantiate on the target hosts;
   grouping removes five layers without changing the patch order.
+- Fold the `patch_dflash2_exl3` (#289) and indexer warmup-range (#203) COPY
+  and RUN steps into the existing dflash2/indexer layers. The five separate
+  instructions added since the kpool grouping produced a 126-layer image —
+  over overlay2's practical ~125-layer mount budget (moby/moby#46740) — so
+  `docker load` on the worker failed with `max depth exceeded` while the
+  head built and saved the same image fine; grouping removes five layers
+  without changing the patch order. (#301)
 
 - `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
