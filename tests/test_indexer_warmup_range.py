@@ -366,9 +366,21 @@ def test_recipe_wiring_if_present() -> None:
     assert order.index("patch_indexer_workspace.py") < order.index(
         "patch_indexer_warmup_range.py"
     )
-    assert "COPY overlay/patch_indexer_warmup_range.py" in image
-    assert "COPY tests/test_indexer_warmup_range.py" in image
-    assert "RUN python3 /opt/glm53/patch_indexer_warmup_range.py" in image
+    # The recipe keeps the indexer pair in one COPY per kind and one RUN
+    # (#301: separate steps pushed the image past overlay2's runnable
+    # layer depth on the two-node hosts), so assert the merged lines.
+    assert (
+        "COPY overlay/patch_indexer_workspace.py"
+        " overlay/patch_indexer_warmup_range.py /opt/glm53/" in image
+    )
+    assert (
+        "COPY tests/test_indexer_workspace.py"
+        " tests/test_indexer_warmup_range.py /opt/glm53/" in image
+    )
+    assert (
+        "RUN python3 /opt/glm53/patch_indexer_workspace.py"
+        " && python3 /opt/glm53/patch_indexer_warmup_range.py" in image
+    )
     assert "python3 /opt/glm53/test_indexer_warmup_range.py" in image
     if readme.is_file():
         text = readme.read_text()
