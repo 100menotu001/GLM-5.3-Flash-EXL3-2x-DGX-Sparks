@@ -376,8 +376,19 @@ EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 # 1 = GPU row tiles for fat experts (prefill). 0 = LinearEXL3 fallback.
 # Tile (P2a) and TEMP_ROWS=1024 (P2b) both lost at MNBT=1024 — leave 128.
 EXL3_MOE_ROW_TILE="${EXL3_MOE_ROW_TILE:-0}"
-# Fused exl3_moe temp rows/expert. 1024 was slower than 128+fallback (P2b).
-EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-128}"
+# E3 grouped fat-expert prefill (overlay/exl3_fat_moe.cu), the TP4 default, as on
+# start.sh / start-tp3.sh. It must reach every rank: overlay/exl3.py treats a missing
+# EXL3_FAT_GROUPED as off, so docker -e forwards it. Measured 2026-09-27 on 4 Sparks,
+# 1M ctx: cold prefill 1,316 / 1,761 / 1,940 -> 1,772 / 2,422 / 2,733 tok/s at
+# 8K / 32K / 100K with EXL3_TEMP_ROWS_FUSED=32; decode unchanged. 0 = E2 tier.
+EXL3_FAT_GROUPED="${EXL3_FAT_GROUPED:-1}"
+# Fused exl3_moe temp rows/expert; experts above it are "fat". E3 wants 32
+# (>= MAX_NUM_SEQS x (DFLASH_TOKENS+1)), E2 wants 256, as on start.sh. Explicit wins.
+if [ "${EXL3_FAT_GROUPED}" != "0" ]; then
+    EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-32}"
+else
+    EXL3_TEMP_ROWS_FUSED="${EXL3_TEMP_ROWS_FUSED:-256}"
+fi
 # Sorted routing tier; higher tiers imply it even when this is 0.
 EXL3_FAT_SORTED="${EXL3_FAT_SORTED:-0}"
 # E1 batched tier: persistent scratch + combined gate/up; implies SORTED=1.
@@ -386,14 +397,6 @@ EXL3_FAT_BATCHED="${EXL3_FAT_BATCHED:-0}"
 # Needs the patched extension — start.sh rebuilds when the recipe stamp drifts.
 # Set all three flags to 0 for the legacy fat-expert path.
 EXL3_FAT_KERNEL="${EXL3_FAT_KERNEL:-1}"
-# E3 grouped fat-expert prefill (overlay/exl3_fat_moe.cu), the start.sh / start-tp3.sh
-# default since 2026-09-07. It must reach every rank: overlay/exl3.py treats a missing
-# EXL3_FAT_GROUPED as off, so a host .env value is a no-op unless docker -e forwards it,
-# which this launcher did not do. Default 0 here keeps TP4's measured behavior (E2 tier);
-# set EXL3_FAT_GROUPED=1 in .env.tp4 for E3 (measured 2026-09-27 on 4 Sparks, 1M ctx:
-# cold prefill 1,316 / 1,761 / 1,940 -> 1,772 / 2,422 / 2,733 tok/s at 8K / 32K / 100K
-# with EXL3_TEMP_ROWS_FUSED=32; decode unchanged).
-EXL3_FAT_GROUPED="${EXL3_FAT_GROUPED:-0}"
 
 # --- abliteration (ablit/) --------------------------------------------------
 # Load-time o_proj orthogonalization (overlay/ablit_runtime.py). Published
