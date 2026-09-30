@@ -5,7 +5,7 @@
 #
 # Optional sibling of start.sh. Does not change the supported 2× TP=2 path,
 # and start.sh never reads anything this script writes. Booted on this kit
-# 2026-09-14 (see README "3x Spark (TP=3)").
+# 2026-09-14 (see docs/REFERENCE.md "3x Spark (TP=3)").
 #
 #   ./start-tp3.sh
 #

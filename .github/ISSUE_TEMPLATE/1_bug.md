@@ -83,7 +83,7 @@ curl -s http://localhost:8888/v1/chat/completions \
           (7168 is the validated default), DFLASH_DRAFT_TP, and whether
           EXL3_FAT_KERNEL applied (boot log).
         * Lower context than 1M -> do not reduce MAX_MODEL_LEN; pool size depends on
-          MNBT and graph reservations (README "Context").
+          MNBT and graph reservations (docs/REFERENCE.md "Context").
         * Vision requests rejected -> LANGUAGE_MODEL_ONLY=1 disables image/video;
           check --limit-mm-per-prompt shape {image:100,video:1}.
 -->

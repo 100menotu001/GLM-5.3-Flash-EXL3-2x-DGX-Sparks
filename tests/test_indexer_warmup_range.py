@@ -354,7 +354,7 @@ def test_live_src_baked_if_present() -> None:
 def test_recipe_wiring_if_present() -> None:
     start = ROOT / "start.sh"
     dockerfile = ROOT / "Dockerfile"
-    readme = ROOT / "README.md"
+    readme = ROOT / "docs" / "REFERENCE.md"
     if not start.is_file() or not dockerfile.is_file():
         return
     launcher = start.read_text()

@@ -228,7 +228,7 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   supported for the tested geometry. CPU real-function metadata/composition
   checks are not GPU state/logit parity or TTFT measurements; GPU qualification
   remains outstanding. Reproduction uses the Dockerfile-pinned source probe
-  described in [README](README.md#reproduce-the-pinned-source-cpu-probe).
+  described in [the reference](docs/REFERENCE.md#reproduce-the-pinned-source-cpu-probe).
   The four-token Kpool replay floor remains conservative and kernel-unverified;
   coarse-only lookup can lose a whole page within three tokens of a boundary.
 - TP3/TP4 now preserve an explicitly exported `LOAD_FORMAT=` through shared and
