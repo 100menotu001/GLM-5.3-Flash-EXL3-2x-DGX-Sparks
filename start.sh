@@ -1390,7 +1390,7 @@ preflight() {
     # Each rank's GID index must be populated on EVERY selected CX7 device.
     # HEAD_CX7_IB / WORKER_CX7_IB are literal names or comma-separated lists;
     # pass the original values unchanged to NCCL below.
-    local gid_head=ok gid_worker=ok gid_path hca i
+    local gid_head=ok gid_worker=ok gid_path hca i _ndev
     local -a head_hcas worker_hcas
     IFS=, read -r -a head_hcas <<< "$HEAD_CX7_IB"
     IFS=, read -r -a worker_hcas <<< "$WORKER_CX7_IB"
@@ -1399,6 +1399,8 @@ preflight() {
         if [ -z "$(cat "$gid_path" 2>/dev/null | tr -d ':0' || true)" ]; then
             gid_head=""
             warn "head GID index ${HEAD_GID} is EMPTY on ${hca}"
+            _ndev=$(cat "/sys/class/infiniband/${hca}/ports/1/gid_attrs/ndevs/0" 2>/dev/null || true)
+            [ -n "$_ndev" ] && warn "  ${hca} -> ${_ndev}: $(ip -o addr show dev "$_ndev" 2>/dev/null | awk '{printf "%s=%s ", $3, $4}')"
         fi
     done
     for hca in "${worker_hcas[@]}"; do
@@ -1406,11 +1408,19 @@ preflight() {
         if [ -z "$(worker_ssh "cat '$gid_path' 2>/dev/null" | tr -d ':0' || true)" ]; then
             gid_worker=""
             warn "worker GID index ${WORKER_GID} is EMPTY on ${hca}"
+            _ndev=$(worker_ssh "cat /sys/class/infiniband/${hca}/ports/1/gid_attrs/ndevs/0 2>/dev/null" || true)
+            [ -n "$_ndev" ] && warn "  ${hca} -> ${_ndev}: $(worker_ssh "ip -o addr show dev '${_ndev}' 2>/dev/null | awk '{printf \"%s=%s \", \$3, \$4}'" || true)"
         fi
     done
     if [ -z "$gid_head" ] || [ -z "$gid_worker" ]; then
         warn "GID tables — pick each node's ::ffff:<ip> entry whose type is RoCE v2;"
         warn "the two indices need not match, and a v1 entry at the same index will not work:"
+        warn "if an index moved after a reboot, look for a second IPv6 address on that"
+        warn "interface: NetworkManager's default ipv6.addr-gen-mode=stable-privacy adds one,"
+        warn "which pushes the IPv4 GID later in the table. Check with:"
+        warn "  nmcli -g ipv6.addr-gen-mode connection show <con>; ip -o addr show dev <if>"
+        warn "Fixing it means one link-local only (addr-gen-mode eui64) and/or a driver"
+        warn "rebind so the GID table is rebuilt from the current addresses."
         for hca in "${head_hcas[@]}"; do
             for i in 0 1 2 3 4 5 6 7; do
                 printf '    head   %s gid%s: %-40s %s\n' "$hca" "$i" \
