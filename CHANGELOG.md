@@ -11,6 +11,37 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- `GLM53_MODEL_PRESET=dense-h3` with `ABLIT=1` (TP2): builds and serves a
+  second target variant whose `o_proj` on layers 15–44 stay native BF16, so
+  the runtime abliteration edit applies to them; layers 0–14 keep EXL3
+  `o_proj`. `tools/dense_overlay.py --keep-bf16 SUFFIX:LAYERS` leaves chosen
+  modules native. The variant has its own ref (`glm53-dense-h3-ablit`) and
+  pinned overlay SHA-256, shares the 6-bpw draft, and is never an ABLIT
+  fallback for the ordinary target. `tools/pack_profile.py` now accepts
+  `ABLIT=1` when `ABLIT_LAYERS` avoid every EXL3 `o_proj` of the pack (was:
+  always refused), and `start.sh` applies the same check pre-stop to manual
+  dense packs.
+
+- `GLM53_MODEL_PRESET=dense-h3` (TP2, opt-in): the first start builds the
+  H3/6-bpw pair on the head from pinned public inputs and stages it in the HF
+  cache: the TR3 target plus dense EXL3 tensors range-read from
+  `turboderp/GLM-5.3-Flash-exl3@4.05bpw` (`2a30229e`), and the IncoAI BF16
+  DFlash2 draft quantized to 6 bpw with MiaAI-Lab/exllamav3 `63b32f0`. The
+  pack builders move from the #281 branch into `tools/`, and
+  `tools/stage_dense_h3.py` stages both halves under content-derived
+  revisions. `tools/pack_profile.py` validates the pair as for any
+  profile pack. A `restart` refuses before stopping while the pair is
+  unbuilt, and the GPU draft build refuses while the GLM serve runs.
+  `dflash2_exl3_quant.sh` now mounts the whole HF repo for a snapshot input:
+  its relative blob links dangled inside the container. It also hands the
+  packaged draft to the invoking user, not root with mode 0600.
+  `dense_overlay.py` gains `--revision`, writes relative pack links, and
+  reads ranges concurrently (`--jobs`, default 16). The 5.3 GB fetch took
+  66 s instead of 1261 s serially, with byte-identical output. The draft
+  revision and the overlay SHA-256 are pinned; both builds reproduce byte
+  for byte. Newest-snapshot fallbacks for a missing `refs/main` skip the
+  built target.
+
 - Boot correctness canary in `scripts/boot-shape-warmup.sh`
   (`GLM53_WARMUP_CANARY`, default `1`): the post-ready sweep now keeps the
   reply bodies and scrapes the DFlash counters. If the bounded temperature-0
@@ -34,6 +65,15 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   settings. The shard window is not a host-memory limit; GPU loader performance
   and KV-capacity gains are not established for this combined candidate.
   Motivated by [Alexbob0's mmap-load measurements](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/bc3891aed74a1f4ccd679e5205ab9bd2605cf283/README.md).
+- TP2 dense EXL3 target loading (including declared `lm_head`), mixed BF16
+  projection tails, and six-group H3 BF16 prefill retention above 144 rows.
+  Add 6-bpw EXL3 DFlash2 drafts with BF16 context K/V and target-only FP8
+  classification. Packed parts and unsupported TP3 geometry fail closed.
+- Asset-backed `glm53_profile` selection pairs a dense target with an immutable
+  6-bpw draft and H3 settings before restart stops containers. Normal packs
+  retain #281 FP8 defaults; conflicting exports, missing shards, changed draft
+  metadata and unsupported profiles refuse. No new pack URL or weights ship
+  with this change; see README for the publisher metadata/staging contract.
 - `examples/tp2-long-coding.env`: the maintainer's TP=2 long-coding profile
   (262k context, two sequences, 1,024-token prefill batches) with each
   default-off option it enables, its measured benefit, and its cost. Not
@@ -131,6 +171,16 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   dry-capture when `CG_ESTIMATE=0` discards it anyway (KV profile 18 → 7 s);
   kill-first parallel stop and a 1 s `/health` poll. Receipts in
   `docs/cold-load-uma.md`.
+- `start-tp4.sh` forwards adaptive verification length (`GLM53_ADAPTIVE_K` and
+  its six companion knobs) to every rank and extends the DFlash capture-size list
+  the way `start.sh` has since 2026-09-08; the four-node launcher previously
+  ignored the knobs silently. TP4 now requires its own opt-in (caller or
+  `.env.tp4`), preserves caller setness for all seven knobs, validates enabled
+  settings before host actions, and reports the effective mode source.
+  Capture generation runs only on start/restart after validation; disabled mode
+  skips both the generator and rank patch. Space/equals capture overrides win.
+  CPU tests compare both launcher generators with runtime query lengths; TP4
+  cluster performance measurement remains separate.
 - Opt-in SM121 **thin-decode** kernels for the EXL3 routed experts
   (`GLM53_EXL3_MOE_FAST`, default `0`): `overlay/patch_exl3_decode_pipeline.py`
   adds two K4/N256 fast kernels (shared / independent gate-up input transform)
@@ -197,6 +247,29 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start-tp4.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, matching
+  `start.sh` and `start-tp3.sh`. TP=4 ignored it, so clients that sent no
+  `reasoning_effort` got the template's `max` fallback. The launcher now
+  declares it (empty default, so nothing changes until an operator sets
+  it), accepts only `low|high|max`, passes
+  `--default-chat-template-kwargs` on every rank, and forwards the value to
+  all four containers. `tests/test_default_reasoning_effort_tp4.sh` runs
+  the guard and each rank's argument construction; no TP=4 GPU boot was
+  run. On both `start-tp3.sh` and `start-tp4.sh`, a caller export
+  (`GLM53_DEFAULT_REASONING_EFFORT=low ./start-tp4.sh`) now wins over
+  `.env` and `.env.tpX`, setness-aware as on `start.sh`; before, the
+  `.env.example` line silently replaced it.
+- `start-tp3.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, a knob only
+  `start.sh` (TP=2) declared, guarded and forwarded. A TP3 seat ignored it
+  entirely, so a value set in the shared `.env` reached neither rank and
+  every client that sent no `reasoning_effort` fell through to
+  `files/chat_template.jinja`, which resolves an absent effort to `max`
+  rather than the intended `high`. The TP3 launcher now carries the
+  declaration (empty default, so no seat changes behaviour until an
+  operator opts in), the `low|high|max` guard, and
+  `--default-chat-template-kwargs` in both inner scripts, and the knob is
+  forwarded through the shared `serve_env` loop to worker ranks 1 and 2
+  and to the head's own `-e` list.
 - `start.sh` verifies every shard named by the selected snapshot's index and
   both sidecars against the worker's dereferenced file sizes before trusting
   the sync marker. Pinned, non-NFS `SKIP_SYNC=1` verifies the target snapshot
@@ -211,6 +284,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   The separate #280 instructions produced a 128-layer image that Docker
   overlay2 could build but could not instantiate on the target hosts;
   grouping removes five layers without changing the patch order.
+- Fold the `patch_dflash2_exl3` (#289) and indexer warmup-range (#203) COPY
+  and RUN steps into the existing dflash2/indexer layers. The five separate
+  instructions added since the kpool grouping produced a 126-layer image —
+  over overlay2's practical ~125-layer mount budget (moby/moby#46740) — so
+  `docker load` on the worker failed with `max depth exceeded` while the
+  head built and saved the same image fine; grouping removes five layers
+  without changing the patch order. (#301)
+- `tests/test_image_layer_budget.py` fails when the base image's 32 layers
+  plus the Dockerfile's COPY/RUN/ADD steps exceed 123, the largest depth
+  observed to load on a worker, so a PR that would repeat #301 fails on CPU
+  before merge instead of at the worker's `docker load`.
 
 - `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM

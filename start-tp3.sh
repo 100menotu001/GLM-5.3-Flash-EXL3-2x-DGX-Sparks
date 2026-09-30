@@ -106,6 +106,8 @@ _cli_ablit_mtp="${ABLIT_INCLUDE_MTP-}"
 # must reach validate_numeric_config, not be swallowed by a .env value.
 _cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
 _cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
+_cli_default_reasoning_effort_set="${GLM53_DEFAULT_REASONING_EFFORT+1}"
+_cli_default_reasoning_effort="${GLM53_DEFAULT_REASONING_EFFORT-}"
 _cli_draft_kv_compact_set="${GLM53_DRAFT_KV_COMPACT+1}"
 _cli_draft_kv_compact="${GLM53_DRAFT_KV_COMPACT-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
@@ -162,9 +164,17 @@ ABLIT=0
 # line) to opt in to a TP3-generated overlay.
 unset EXL3_OVERLAY_HOST
 # Thin-decode FAST and the #182 W8A8 FAT path stay on start.sh (TP=2) only.
-# GLM53_KDA_BF16_LARGE_M (#233) is overlay-side and is valid on TP=3.
+# The TP2 example enables KDA retention; TP3 keeps its own opt-in.
+GLM53_KDA_BF16_LARGE_M=0
 unset GLM53_EXL3_MOE_FAST
 unset GLM53_KDA_FP8_FAT
+# Server-side default reasoning effort for clients that send none.
+# start.sh (TP=2) wires this into --default-chat-template-kwargs;
+# TP3 did not, so a value set in the shared .env never reached the
+# engine and the template's own fallback (which resolves an absent
+# effort to `max`) answered instead. Empty leaves that fallback
+# unchanged: this is an opt-in, and unset must stay unset.
+GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # TP=3 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp3"
@@ -194,6 +204,7 @@ set +a
 [ -n "${_cli_ablit_alpha}" ] && ABLIT_ALPHA="$_cli_ablit_alpha"
 [ -n "${_cli_ablit_mtp}" ] && ABLIT_INCLUDE_MTP="$_cli_ablit_mtp"
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
+[ -n "${_cli_default_reasoning_effort_set}" ] && GLM53_DEFAULT_REASONING_EFFORT="$_cli_default_reasoning_effort"
 [ -n "${_cli_draft_kv_compact_set}" ] && GLM53_DRAFT_KV_COMPACT="$_cli_draft_kv_compact"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_load_clone_set}" ] && GLM53_LOAD_CLONE="$_cli_load_clone"
@@ -250,8 +261,11 @@ SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 HEAD_SOCKET_IFNAME="${HEAD_SOCKET_IFNAME:-$SOCKET_IFNAME}"
 WORKER_SOCKET_IFNAME="${WORKER_SOCKET_IFNAME:-$SOCKET_IFNAME}"
 WORKER2_SOCKET_IFNAME="${WORKER2_SOCKET_IFNAME:-$SOCKET_IFNAME}"
-# The address each rank advertises for the process group. Must live on the
-# socket interface above. Empty = the rank's 10.0.0.x address.
+# VLLM_HOST_IP for each rank, including the TCP worker message queues. These
+# addresses must be mutually reachable, but need not live on SOCKET_IFNAME:
+# Gloo/NCCL bootstrap can stay on management while bulk RPC uses routed CX7.
+# Empty = the rank's HEAD_IP / WORKER_IP / WORKER2_IP address.
+# See docs/tp3-cx7-rpc.md before selecting addresses on a switchless triangle.
 HEAD_HOST_IP="${HEAD_HOST_IP:-}"
 WORKER_HOST_IP="${WORKER_HOST_IP:-}"
 WORKER2_HOST_IP="${WORKER2_HOST_IP:-}"
@@ -746,6 +760,19 @@ validate_numeric_config() {
         fi
     done
     _glm53_validate_enum GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" 0 1 || return
+    # The template treats medium as max, so do not advertise it as a level.
+    if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
+        _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
+            "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
+    fi
+    if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
+        # Geometry, not policy: the dense pack shards shared_experts
+        # (2048 columns) which is not divisible by 3, and the TP=3 64->66
+        # head padding (overlay/tp3/patch_tp3_glm.py) covers only BF16
+        # tensors, not EXL3 trellis. start.sh (TP=2) serves dense EXL3.
+        echo "GLM53_DENSE_EXL3=1 is unsupported on TP=3 — serve it with start.sh (TP=2)" >&2
+        return 2
+    fi
     _glm53_validate_enum HAREM_KDA_FLASHKDA "$HAREM_KDA_FLASHKDA" 0 1 || return
     if [ "$HAREM_KDA_FLASHKDA" = 1 ] && [ ! -f "$FLASHKDA_PATCH_HOST" ]; then
         echo "FlashKDA patch missing: $FLASHKDA_PATCH_HOST" >&2; return 2
@@ -1605,6 +1632,7 @@ ARGS=(
     --tensor-parallel-size "${TP}"
     --nnodes "${NNODES}"
     --node-rank 0
+    --enable-prompt-tokens-details
     --master-addr "${HEAD_IP}"
     --master-port "${MASTER_PORT}"
     --distributed-executor-backend mp
@@ -1647,6 +1675,9 @@ elif [ "${MTP_TOKENS:-0}" != "0" ]; then
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
@@ -1754,6 +1785,7 @@ ARGS=(
     --tensor-parallel-size "${TP}"
     --nnodes "${NNODES}"
     --node-rank "${NODE_RANK}"
+    --enable-prompt-tokens-details
     --master-addr "${HEAD_IP}"
     --master-port "${MASTER_PORT}"
     --distributed-executor-backend mp
@@ -1797,6 +1829,9 @@ elif [ "${MTP_TOKENS:-0}" != "0" ]; then
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
@@ -2134,6 +2169,7 @@ TP3_SKIP_OLD_SCP
              TP3_HEAD_OVERRIDE ENABLE_EXPERT_PARALLEL \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
              LOAD_FORMAT PREFIX_MATCH_UNIT \
+             GLM53_DEFAULT_REASONING_EFFORT \
              GLM53_LOAD_CLONE GLM53_LOAD_PREFETCH \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
@@ -2293,6 +2329,7 @@ TP3_SKIP_OLD_SCP
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
         -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
+        -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
         -e MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS:-}" \
         -e VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES:-}" \
