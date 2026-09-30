@@ -11,6 +11,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- `GLM53_MODEL_PRESET=dense-h3` with `ABLIT=1` (TP2): builds and serves a
+  second target variant whose `o_proj` on layers 15–44 stay native BF16, so
+  the runtime abliteration edit applies to them; layers 0–14 keep EXL3
+  `o_proj`. `tools/dense_overlay.py --keep-bf16 SUFFIX:LAYERS` leaves chosen
+  modules native. The variant has its own ref (`glm53-dense-h3-ablit`) and
+  pinned overlay SHA-256, shares the 6-bpw draft, and is never an ABLIT
+  fallback for the ordinary target. `tools/pack_profile.py` now accepts
+  `ABLIT=1` when `ABLIT_LAYERS` avoid every EXL3 `o_proj` of the pack (was:
+  always refused), and `start.sh` applies the same check pre-stop to manual
+  dense packs.
+
 - `GLM53_MODEL_PRESET=dense-h3` (TP2, opt-in): the first start builds the
   H3/6-bpw pair on the head from pinned public inputs and stages it in the HF
   cache: the TR3 target plus dense EXL3 tensors range-read from

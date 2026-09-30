@@ -110,6 +110,33 @@ own use on your own head node and is not redistributed. The preset is TP2
 only and is **opt-in**. It has not yet been A/B measured against this kit's
 default (`GLM53_DENSE_FP8=all` + KDA BF16 large-M) serve.
 
+#### With abliteration (`ABLIT=1`)
+
+The ordinary dense-h3 target quantizes every `o_proj`, and
+[`ABLIT=1`](#abliteration-ablit1) edits BF16 `o_proj` only. With the preset
+and `ABLIT=1`, the first start therefore builds a **second target variant**:
+the same overlay minus `o_proj` on layers 15–44, which stay native BF16 from
+TR3 so the runtime edit applies to them exactly as on the ordinary pack.
+Layers 0–14 keep EXL3 `o_proj`; they are the recipe's stock safety anchors and
+are not edited. The paired 6-bpw draft is shared, so a kit that already built
+the ordinary pair only fetches the overlay again (~2 min, CPU):
+
+```bash
+python3 ablit/fetch_transplant.py          # once; donor o_proj L15-45
+./start.sh stop && ABLIT=1 ./start.sh      # builds the variant on first start
+ABLIT=1 ./start.sh restart                 # later starts reuse it
+```
+
+The variant is named by `refs/glm53-dense-h3-ablit` and pinned by its own
+overlay SHA-256. `ABLIT=1` never falls back to the ordinary dense-h3 target,
+and without `ABLIT=1` the preset keeps serving the ordinary target.
+`ABLIT_LAYERS` must stay inside 15–45 (45 is the MTP block, not loaded under
+DFlash2); a range reaching an EXL3 `o_proj` is refused before anything
+stops. The 30 BF16 `o_proj` read more bytes per decode step than their EXL3
+form, and the DFlash2 draft was trained against the stock target, so decode
+speed and draft acceptance must be measured separately from the ordinary
+preset.
+
 ### Find and stage a compatible Hub pair
 
 For the ordinary FP8/BF16-draft setup today, use the public
