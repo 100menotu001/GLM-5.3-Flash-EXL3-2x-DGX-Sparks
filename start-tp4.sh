@@ -81,6 +81,8 @@ _cli_ablit_mtp="${ABLIT_INCLUDE_MTP-}"
 # must reach validate_numeric_config, not be swallowed by a .env value.
 _cli_indexer_workspace_set="${GLM53_INDEXER_WORKSPACE+1}"
 _cli_indexer_workspace="${GLM53_INDEXER_WORKSPACE-}"
+_cli_default_reasoning_effort_set="${GLM53_DEFAULT_REASONING_EFFORT+1}"
+_cli_default_reasoning_effort="${GLM53_DEFAULT_REASONING_EFFORT-}"
 _cli_draft_kv_compact_set="${GLM53_DRAFT_KV_COMPACT+1}"
 _cli_draft_kv_compact="${GLM53_DRAFT_KV_COMPACT-}"
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
@@ -145,6 +147,11 @@ fi
 # Adaptive-k requires a TP4 opt-in, even for existing .env.tp4 files.
 GLM53_ADAPTIVE_K=off
 _adaptive_k_source=".env.tp4"
+# Server-side default reasoning effort for clients that send none, as on
+# start.sh (TP=2) and start-tp3.sh. Empty leaves the chat template's own
+# fallback (an absent effort resolves to `max`) unchanged: opt-in only.
+# Declared before .env.tp4 is sourced so the TP=4 env file still wins.
+GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # TP=4 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp4"
@@ -178,6 +185,7 @@ set +a
 [ -n "${_cli_ablit_alpha}" ] && ABLIT_ALPHA="$_cli_ablit_alpha"
 [ -n "${_cli_ablit_mtp}" ] && ABLIT_INCLUDE_MTP="$_cli_ablit_mtp"
 [ -n "${_cli_indexer_workspace_set}" ] && GLM53_INDEXER_WORKSPACE="$_cli_indexer_workspace"
+[ -n "${_cli_default_reasoning_effort_set}" ] && GLM53_DEFAULT_REASONING_EFFORT="$_cli_default_reasoning_effort"
 [ -n "${_cli_draft_kv_compact_set}" ] && GLM53_DRAFT_KV_COMPACT="$_cli_draft_kv_compact"
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 [ -n "${_cli_load_clone_set}" ] && GLM53_LOAD_CLONE="$_cli_load_clone"
@@ -670,6 +678,11 @@ validate_numeric_config() {
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
         echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
+    fi
+    # The template treats medium as max, so do not advertise it as a level.
+    if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
+        _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
+            "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
     fi
     if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
         # start-tp4.sh is the experimental launcher and does not stage
@@ -1488,6 +1501,9 @@ fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
+fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
     say "language-model-only: no vision tower"
@@ -1610,6 +1626,9 @@ elif [ "${MTP_TOKENS:-0}" != "0" ]; then
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
@@ -1795,6 +1814,7 @@ TP4_SKIP_OLD_SCP
         -e "GLM53_ADAPTIVE_K_MIN_STEPS=$GLM53_ADAPTIVE_K_MIN_STEPS"
         -e "GLM53_ADAPTIVE_K_SATURATE=$GLM53_ADAPTIVE_K_SATURATE"
         -e "GLM53_ADAPTIVE_K_HIST=$GLM53_ADAPTIVE_K_HIST"
+        -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
         -e "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
