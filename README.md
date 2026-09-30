@@ -88,6 +88,11 @@ Network setup, NFS weight sharing, air-gapped installs and other kits:
 Latest TP2 measurements on 2× GB10, 2026-09-28: DFlash2, temperature 0,
 thinking off, mean of fresh boots. Decode excludes time to first token.
 
+> [!IMPORTANT]
+> **Default** is what every install gets. **Speed boost** is opt-in: one
+> `.env` line and a one-time ~25 min build on the head. See
+> [TP2 profiles](#tp2-profiles).
+
 | Decode, tokens/s | Default | Speed boost | Change |
 |---|---:|---:|---:|
 | Prose | 36.1 | 37.5 | +4% |
@@ -122,6 +127,9 @@ xychart-beta
 - **4× Spark, 2026-09-27:** faster prefill is now on by default: 1,772 /
   2,422 / 2,733 tokens/s cold prefill at 8k / 32k / 100k, up from 1,316 /
   1,761 / 1,940 (contributor measurement).
+- **Abliteration + speed boost, 2026-09-30:** decode 34.97 / 82.84 / 51.28
+  tokens/s (prose / structured / code) against 34.87 / 80.68 / 46.54 for
+  plain abliteration: up to +10%, one boot per arm.
 
 > [!NOTE]
 > Speed-boost figures come from 2–3 boots per arm with unlocked clocks;
@@ -146,8 +154,20 @@ Pick one per start. All run on the same public base weights.
 
 Details: [Speed boost](docs/REFERENCE.md#build-the-h3-pair-on-the-head-glm53_model_presetdense-h3) ·
 [Abliteration](docs/REFERENCE.md#abliteration-ablit1) ·
-[Both together](docs/REFERENCE.md#with-abliteration-ablit1) ·
-[Long coding sessions profile](examples/tp2-long-coding.env)
+[Both together](docs/REFERENCE.md#with-abliteration-ablit1)
+
+### Optional tuning
+
+Off by default. Each has a measured benefit and a tradeoff; try one at a time.
+
+| Option | Turn on | What it gets you | Tradeoff |
+|---|---|---|---|
+| Adaptive draft length | `GLM53_ADAPTIVE_K=ema` | Prose decode +13–21% | Mostly helps prose ([details](docs/REFERENCE.md#faster-prose-decode-2026-09-08-measurements)) |
+| Cooperative decode MoE | a generated `EXL3_OVERLAY_HOST` overlay | Structured decode +7–9% | Needs a separately built extension ([quickstart](docs/cooperative-moe-quickstart.md)) |
+| Thin-decode MoE kernels | `GLM53_EXL3_MOE_FAST=1` | Decode +8–15% in one A/B/A | Numerics study inconclusive ([details](docs/sm121-perf-paths.md)) |
+| Long-coding profile | append [`examples/tp2-long-coding.env`](examples/tp2-long-coding.env) to `.env` | Tuned for 262k-context coding sessions | Two concurrent requests |
+
+All options and their tradeoffs: [full reference](docs/REFERENCE.md#env).
 
 ## Topologies
 
