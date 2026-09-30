@@ -247,6 +247,15 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start-tp4.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, matching
+  `start.sh` and `start-tp3.sh`. TP=4 ignored it, so clients that sent no
+  `reasoning_effort` got the template's `max` fallback. The launcher now
+  declares it (empty default, so nothing changes until an operator sets
+  it), accepts only `low|high|max`, passes
+  `--default-chat-template-kwargs` on every rank, and forwards the value to
+  all four containers. `tests/test_default_reasoning_effort_tp4.sh` runs
+  the guard and each rank's argument construction; no TP=4 GPU boot was
+  run.
 - `start-tp3.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, a knob only
   `start.sh` (TP=2) declared, guarded and forwarded. A TP3 seat ignored it
   entirely, so a value set in the shared `.env` reached neither rank and

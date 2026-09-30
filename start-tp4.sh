@@ -145,6 +145,11 @@ fi
 # Adaptive-k requires a TP4 opt-in, even for existing .env.tp4 files.
 GLM53_ADAPTIVE_K=off
 _adaptive_k_source=".env.tp4"
+# Server-side default reasoning effort for clients that send none, as on
+# start.sh (TP=2) and start-tp3.sh. Empty leaves the chat template's own
+# fallback (an absent effort resolves to `max`) unchanged: opt-in only.
+# Declared before .env.tp4 is sourced so the TP=4 env file still wins.
+GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # TP=4 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp4"
@@ -670,6 +675,11 @@ validate_numeric_config() {
     if [ -n "${GLM53_APC_RETENTION_INTERVAL_SWA:-}" ] && [ "$SPEC_METHOD" != "dflash" ]; then
         echo "GLM53_APC_RETENTION_INTERVAL_SWA requires SPEC_METHOD=dflash (got: $SPEC_METHOD)" >&2
         return 2
+    fi
+    # The template treats medium as max, so do not advertise it as a level.
+    if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
+        _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
+            "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
     fi
     if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
         # start-tp4.sh is the experimental launcher and does not stage
@@ -1488,6 +1498,9 @@ fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
+fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
     say "language-model-only: no vision tower"
@@ -1610,6 +1623,9 @@ elif [ "${MTP_TOKENS:-0}" != "0" ]; then
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
@@ -1795,6 +1811,7 @@ TP4_SKIP_OLD_SCP
         -e "GLM53_ADAPTIVE_K_MIN_STEPS=$GLM53_ADAPTIVE_K_MIN_STEPS"
         -e "GLM53_ADAPTIVE_K_SATURATE=$GLM53_ADAPTIVE_K_SATURATE"
         -e "GLM53_ADAPTIVE_K_HIST=$GLM53_ADAPTIVE_K_HIST"
+        -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
         -e "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
