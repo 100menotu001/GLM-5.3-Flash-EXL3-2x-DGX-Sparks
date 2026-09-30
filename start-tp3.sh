@@ -166,6 +166,13 @@ unset EXL3_OVERLAY_HOST
 GLM53_KDA_BF16_LARGE_M=0
 unset GLM53_EXL3_MOE_FAST
 unset GLM53_KDA_FP8_FAT
+# Server-side default reasoning effort for clients that send none.
+# start.sh (TP=2) wires this into --default-chat-template-kwargs;
+# TP3 did not, so a value set in the shared .env never reached the
+# engine and the template's own fallback (which resolves an absent
+# effort to `max`) answered instead. Empty leaves that fallback
+# unchanged: this is an opt-in, and unset must stay unset.
+GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # TP=3 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp3"
@@ -747,6 +754,11 @@ validate_numeric_config() {
         fi
     done
     _glm53_validate_enum GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" 0 1 || return
+    # The template treats medium as max, so do not advertise it as a level.
+    if [ -n "${GLM53_DEFAULT_REASONING_EFFORT-}" ]; then
+        _glm53_validate_enum GLM53_DEFAULT_REASONING_EFFORT \
+            "$GLM53_DEFAULT_REASONING_EFFORT" low high max || return
+    fi
     if [ "${GLM53_DENSE_EXL3-0}" = "1" ]; then
         # Geometry, not policy: the dense pack shards shared_experts
         # (2048 columns) which is not divisible by 3, and the TP=3 64->66
@@ -1657,6 +1669,9 @@ fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
 fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
+fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
     say "language-model-only: no vision tower"
@@ -1806,6 +1821,9 @@ elif [ "${MTP_TOKENS:-0}" != "0" ]; then
 fi
 if [ -n "${CHAT_TEMPLATE:-}" ] && [ -f "${CHAT_TEMPLATE}" ]; then
     ARGS+=(--chat-template "${CHAT_TEMPLATE}")
+fi
+if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
+    ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
 if [ "${LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     ARGS+=(--language-model-only)
@@ -2143,6 +2161,7 @@ TP3_SKIP_OLD_SCP
              TP3_HEAD_OVERRIDE ENABLE_EXPERT_PARALLEL \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
              LOAD_FORMAT PREFIX_MATCH_UNIT \
+             GLM53_DEFAULT_REASONING_EFFORT \
              GLM53_LOAD_CLONE GLM53_LOAD_PREFETCH \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
@@ -2302,6 +2321,7 @@ TP3_SKIP_OLD_SCP
         -e GLM53_ADAPTIVE_K_HIST="$GLM53_ADAPTIVE_K_HIST" \
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
         -e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M" \
+        -e "GLM53_DEFAULT_REASONING_EFFORT=${GLM53_DEFAULT_REASONING_EFFORT-}" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
         -e MM_IMAGE_TOKENS="${MM_IMAGE_TOKENS:-}" \
         -e VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES:-}" \

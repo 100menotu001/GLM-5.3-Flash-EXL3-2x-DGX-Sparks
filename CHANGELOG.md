@@ -237,6 +237,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Fixed
 
+- `start-tp3.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, a knob only
+  `start.sh` (TP=2) declared, guarded and forwarded. A TP3 seat ignored it
+  entirely, so a value set in the shared `.env` reached neither rank and
+  every client that sent no `reasoning_effort` fell through to
+  `files/chat_template.jinja`, which resolves an absent effort to `max`
+  rather than the intended `high`. The TP3 launcher now carries the
+  declaration (empty default, so no seat changes behaviour until an
+  operator opts in), the `low|high|max` guard, and
+  `--default-chat-template-kwargs` in both inner scripts, and the knob is
+  forwarded through the shared `serve_env` loop to worker ranks 1 and 2
+  and to the head's own `-e` list.
 - `start.sh` verifies every shard named by the selected snapshot's index and
   both sidecars against the worker's dereferenced file sizes before trusting
   the sync marker. Pinned, non-NFS `SKIP_SYNC=1` verifies the target snapshot
