@@ -100,6 +100,20 @@ _cli_apc_swa="${GLM53_APC_RETENTION_INTERVAL_SWA-}"
 # value only. #204 / PR #242 review.
 _cli_extra_args_set="${EXTRA_ARGS+1}"
 _cli_extra_args="${EXTRA_ARGS-}"
+_cli_adaptive_mode_set="${GLM53_ADAPTIVE_K+1}"
+_cli_adaptive_mode="${GLM53_ADAPTIVE_K-}"
+_cli_glm53_adaptive_k_set_set="${GLM53_ADAPTIVE_K_SET+1}"
+_cli_glm53_adaptive_k_set="${GLM53_ADAPTIVE_K_SET-}"
+_cli_glm53_adaptive_k_alpha_set="${GLM53_ADAPTIVE_K_ALPHA+1}"
+_cli_glm53_adaptive_k_alpha="${GLM53_ADAPTIVE_K_ALPHA-}"
+_cli_glm53_adaptive_k_margin_set="${GLM53_ADAPTIVE_K_MARGIN+1}"
+_cli_glm53_adaptive_k_margin="${GLM53_ADAPTIVE_K_MARGIN-}"
+_cli_glm53_adaptive_k_min_steps_set="${GLM53_ADAPTIVE_K_MIN_STEPS+1}"
+_cli_glm53_adaptive_k_min_steps="${GLM53_ADAPTIVE_K_MIN_STEPS-}"
+_cli_glm53_adaptive_k_saturate_set="${GLM53_ADAPTIVE_K_SATURATE+1}"
+_cli_glm53_adaptive_k_saturate="${GLM53_ADAPTIVE_K_SATURATE-}"
+_cli_glm53_adaptive_k_hist_set="${GLM53_ADAPTIVE_K_HIST+1}"
+_cli_glm53_adaptive_k_hist="${GLM53_ADAPTIVE_K_HIST-}"
 set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -128,10 +142,21 @@ if [ -n "${EXTRA_ARGS:-}" ]; then
     fi
     unset _kept _skip _tok _dropped
 fi
+# Adaptive-k requires a TP4 opt-in, even for existing .env.tp4 files.
+GLM53_ADAPTIVE_K=off
+_adaptive_k_source=".env.tp4"
 # TP=4 overlay wins over the 2× knobs in .env.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env.tp4"
 set +a
+[ -n "${_cli_adaptive_mode_set}" ] && GLM53_ADAPTIVE_K="$_cli_adaptive_mode"
+[ -n "${_cli_glm53_adaptive_k_set_set}" ] && GLM53_ADAPTIVE_K_SET="$_cli_glm53_adaptive_k_set"
+[ -n "${_cli_glm53_adaptive_k_alpha_set}" ] && GLM53_ADAPTIVE_K_ALPHA="$_cli_glm53_adaptive_k_alpha"
+[ -n "${_cli_glm53_adaptive_k_margin_set}" ] && GLM53_ADAPTIVE_K_MARGIN="$_cli_glm53_adaptive_k_margin"
+[ -n "${_cli_glm53_adaptive_k_min_steps_set}" ] && GLM53_ADAPTIVE_K_MIN_STEPS="$_cli_glm53_adaptive_k_min_steps"
+[ -n "${_cli_glm53_adaptive_k_saturate_set}" ] && GLM53_ADAPTIVE_K_SATURATE="$_cli_glm53_adaptive_k_saturate"
+[ -n "${_cli_glm53_adaptive_k_hist_set}" ] && GLM53_ADAPTIVE_K_HIST="$_cli_glm53_adaptive_k_hist"
+[ -n "${_cli_adaptive_mode_set}" ] && _adaptive_k_source="caller environment"
 [ -n "${_cli_mtp}" ] && MTP_TOKENS="$_cli_mtp"
 [ -n "${_cli_spec}" ] && SPEC_METHOD="$_cli_spec"
 [ -n "${_cli_eager}" ] && ENFORCE_EAGER="$_cli_eager"
@@ -279,6 +304,7 @@ KPOOL_SEED_PATCH_HOST="${KPOOL_SEED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 LOADCLONE_PATCH_HOST="${LOADCLONE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_loadclone.py}"
 SPARSE_SLICE_PATCH_HOST="${SPARSE_SLICE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_sparse_mla_slice.py}"
+ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
 # IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
@@ -306,18 +332,35 @@ FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
 # 1..4 seqs × 3 tokens (must include 3). DFlash2 k=7 is 1..4 seqs × 8 tokens
 # (must include 8, 16, 24, 32).
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
-if [ "${ENFORCE_EAGER}" != "1" ]; then
-    case " ${EXTRA_ARGS:-} " in
-        *" --cudagraph-capture-sizes "*|*" cudagraph-capture-sizes "*) ;;
-        *)
-            if [ "$SPEC_METHOD" = "dflash" ]; then
-                EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 4 8 16 24 32"
-            else
-                EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes 1 2 3 4 6 8 12"
+# Called only for start/restart, after validation and before any host action.
+configure_capture_sizes() {
+    local capture_sizes
+    if [[ "$GLM53_ADAPTIVE_K" =~ ^[[:space:]]*([eE][mM][aA]|[oO][nN]|1)[[:space:]]*$ ]]; then
+        printf '[glm53-exl3-tp4] GLM53_ADAPTIVE_K=%s from %s\n' "$GLM53_ADAPTIVE_K" "$_adaptive_k_source" >&2
+    fi
+    if [ "$ENFORCE_EAGER" != "1" ] && [[ ! " ${EXTRA_ARGS:-} " =~ [[:space:]](--)?cudagraph-capture-sizes([[:space:]]|=) ]]; then
+        if [ "$SPEC_METHOD" = "dflash" ]; then
+            capture_sizes="1 2 4 8 16 24 32"
+            if [[ "$GLM53_ADAPTIVE_K" =~ ^[[:space:]]*([eE][mM][aA]|[oO][nN]|1)[[:space:]]*$ ]]; then
+                capture_sizes="$(python3 -S -c '
+import sys
+mode, raw, tokens, seqs = sys.argv[1:]
+sizes = {1, 2, 4, 8, 16, 24, 32}
+if mode.strip().lower() in ("ema", "on", "1"):
+    decode_query_len = int(tokens) + 1
+    ks = {int(x) for x in raw.split(",") if x.strip()}
+    lens = {k + 1 for k in ks if 0 < k + 1 <= decode_query_len}
+    lens.add(decode_query_len)
+    sizes.update(n * q for n in range(1, int(seqs) + 1) for q in lens)
+print(" ".join(map(str, sorted(sizes))))
+' "${GLM53_ADAPTIVE_K:-off}" "${GLM53_ADAPTIVE_K_SET:-2,4,7}" "${DFLASH_TOKENS:-7}" "${MAX_NUM_SEQS:-4}")" || return 2
             fi
-            ;;
-    esac
-fi
+        else
+            capture_sizes="1 2 3 4 6 8 12"
+        fi
+        EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--cudagraph-capture-sizes $capture_sizes"
+    fi
+}
 # 1 = fused exl3_moe (decode). 0 restores the unique-expert LinearEXL3 loop.
 EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 # 1 = GPU row tiles for fat experts (prefill). 0 = LinearEXL3 fallback.
@@ -382,6 +425,15 @@ GLM53_SPINWAIT_MS="${GLM53_SPINWAIT_MS-stock}"
 # #223 mitigation for #128/#159). 0 = stock backend, byte-identical; 64 = slice
 # the final call into <=64 query rows on every rank. Restart to apply.
 VLLM_SM120_SPARSE_MLA_SLICE_TOKENS="${VLLM_SM120_SPARSE_MLA_SLICE_TOKENS-0}"
+# Adaptive verification length (overlay/patch_adaptive_k.py). off = stock k every step.
+# Same knobs and defaults as start.sh; the capture-size list above follows it.
+GLM53_ADAPTIVE_K="${GLM53_ADAPTIVE_K-off}"
+GLM53_ADAPTIVE_K_SET="${GLM53_ADAPTIVE_K_SET-2,4,7}"
+GLM53_ADAPTIVE_K_ALPHA="${GLM53_ADAPTIVE_K_ALPHA-0.25}"
+GLM53_ADAPTIVE_K_MARGIN="${GLM53_ADAPTIVE_K_MARGIN-1.0}"
+GLM53_ADAPTIVE_K_MIN_STEPS="${GLM53_ADAPTIVE_K_MIN_STEPS-4}"
+GLM53_ADAPTIVE_K_SATURATE="${GLM53_ADAPTIVE_K_SATURATE-max}"
+GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST-200}"
 # EngineCore stock timeout is 300s; mid-serve Triton/TileLang JIT on TP=2 can
 # exceed that without being a true hang. NCCL watchdog is still 600s.
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
@@ -554,7 +606,37 @@ _glm53_validate_retention_interval() {
     export "$name"
 }
 
+_glm53_validate_adaptive_k() {
+    local name value
+    if ! [[ "${GLM53_ADAPTIVE_K-off}" =~ ^[[:space:]]*([oO][fF][fF]|[eE][mM][aA]|[oO][nN]|0|1)[[:space:]]*$ ]]; then
+        echo "GLM53_ADAPTIVE_K must be off/0 or ema/on/1" >&2; return 2
+    fi
+    # Disabled policy knobs have no effect and require no interpreter.
+    [[ "${GLM53_ADAPTIVE_K-off}" =~ ^[[:space:]]*([eE][mM][aA]|[oO][nN]|1)[[:space:]]*$ ]] || return 0
+    for name in GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN; do
+        value="${!name}"
+        if ! [[ "$value" =~ ^[[:space:]]*([0-9]+([.][0-9]*)?|[.][0-9]+)[[:space:]]*$ ]] \
+           || ! awk -v v="$value" -v n="$name" 'BEGIN { exit !(v+0 >= 0 && (n != "GLM53_ADAPTIVE_K_ALPHA" || (v+0 > 0 && v+0 <= 1))) }'; then
+            echo "$name must be a nonnegative decimal (ALPHA in (0,1])" >&2; return 2
+        fi
+    done
+    for name in GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_HIST; do
+        value="${!name}"
+        if ! [[ "$value" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]]; then
+            echo "$name must be a nonnegative integer" >&2; return 2
+        fi
+    done
+    if ! [[ "$GLM53_ADAPTIVE_K_SATURATE" =~ ^[[:space:]]*([mM][aA][xX]|[nN])[[:space:]]*$ ]]; then
+        echo "GLM53_ADAPTIVE_K_SATURATE must be max or n" >&2; return 2
+    fi
+    if ! [[ "$GLM53_ADAPTIVE_K_SET" =~ ^[[:space:]]*[0-9]+[[:space:]]*(,[[:space:]]*[0-9]+[[:space:]]*)*$ ]]; then
+        echo "GLM53_ADAPTIVE_K_SET must be comma-separated nonnegative integers" >&2; return 2
+    fi
+    _glm53_canonical_positive_int DFLASH_TOKENS "$DFLASH_TOKENS" 8388608 || return
+}
+
 validate_numeric_config() {
+    _glm53_validate_adaptive_k || return
     if ! [[ "$GPU_MEM_UTIL" =~ ^(0([.][0-9]+)?|[.][0-9]+|1([.]0+)?)$ ]] \
        || ! awk -v u="$GPU_MEM_UTIL" 'BEGIN { exit !(u > 0 && u <= 1) }'; then
         echo "GPU_MEM_UTIL must be greater than 0 and at most 1 (got: $GPU_MEM_UTIL)" >&2
@@ -859,6 +941,7 @@ preflight() {
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$LOADCLONE_PATCH_HOST" ] || die "$LOADCLONE_PATCH_HOST missing"
     [ -f "$SPARSE_SLICE_PATCH_HOST" ] || die "$SPARSE_SLICE_PATCH_HOST missing"
+    [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
     [ -f "$SCRIPT_DIR/ablit/LAYER_MAP.json" ] || die "$SCRIPT_DIR/ablit/LAYER_MAP.json missing"
@@ -1462,6 +1545,10 @@ fi
 if [ -f /opt/glm53/patch_sparse_mla_slice.py ]; then
     python3 /opt/glm53/patch_sparse_mla_slice.py
 fi
+# Adaptive verification is patched only for an explicit enabled mode.
+if [[ "${GLM53_ADAPTIVE_K:-off}" =~ ^[[:space:]]*([eE][mM][aA]|[oO][nN]|1)[[:space:]]*$ ]] && [ -f /opt/glm53/patch_adaptive_k.py ]; then
+    python3 /opt/glm53/patch_adaptive_k.py
+fi
 if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
     python3 /opt/glm53/patch_indexer_workspace.py
 fi
@@ -1579,6 +1666,10 @@ fi
 if [ -f /opt/glm53/patch_sparse_mla_slice.py ]; then
     python3 /opt/glm53/patch_sparse_mla_slice.py
 fi
+# Adaptive verification is patched only for an explicit enabled mode.
+if [[ "${GLM53_ADAPTIVE_K:-off}" =~ ^[[:space:]]*([eE][mM][aA]|[oO][nN]|1)[[:space:]]*$ ]] && [ -f /opt/glm53/patch_adaptive_k.py ]; then
+    python3 /opt/glm53/patch_adaptive_k.py
+fi
 if [ -f /opt/glm53/patch_indexer_workspace.py ]; then
     python3 /opt/glm53/patch_indexer_workspace.py
 fi
@@ -1617,6 +1708,7 @@ _tp4_scp_runtime() {
     scp -q -o BatchMode=yes "$SPINWAIT_PATCH_HOST" "${ssh_t}:/tmp/patch_spinwait.py"
     scp -q -o BatchMode=yes "$LOADCLONE_PATCH_HOST" "${ssh_t}:/tmp/patch_loadclone.py"
     scp -q -o BatchMode=yes "$SPARSE_SLICE_PATCH_HOST" "${ssh_t}:/tmp/patch_sparse_mla_slice.py"
+    scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${ssh_t}:/tmp/patch_adaptive_k.py"
     worker_ssh_n "$r" "rm -rf /tmp/glm53-ablit"
     scp -q -r -o BatchMode=yes "$SCRIPT_DIR/ablit" "${ssh_t}:/tmp/glm53-ablit"
     scp -q -o BatchMode=yes "$SCRIPT_DIR/overlay/ablit_runtime.py" "${ssh_t}:/tmp/glm53-ablit_runtime.py"
@@ -1696,6 +1788,13 @@ TP4_SKIP_OLD_SCP
         -e "GLM53_DRAFT_KV_COMPACT=$GLM53_DRAFT_KV_COMPACT"
         -e "GLM53_SPINWAIT_MS=$GLM53_SPINWAIT_MS"
         -e "VLLM_SM120_SPARSE_MLA_SLICE_TOKENS=$VLLM_SM120_SPARSE_MLA_SLICE_TOKENS"
+        -e "GLM53_ADAPTIVE_K=$GLM53_ADAPTIVE_K"
+        -e "GLM53_ADAPTIVE_K_SET=$GLM53_ADAPTIVE_K_SET"
+        -e "GLM53_ADAPTIVE_K_ALPHA=$GLM53_ADAPTIVE_K_ALPHA"
+        -e "GLM53_ADAPTIVE_K_MARGIN=$GLM53_ADAPTIVE_K_MARGIN"
+        -e "GLM53_ADAPTIVE_K_MIN_STEPS=$GLM53_ADAPTIVE_K_MIN_STEPS"
+        -e "GLM53_ADAPTIVE_K_SATURATE=$GLM53_ADAPTIVE_K_SATURATE"
+        -e "GLM53_ADAPTIVE_K_HIST=$GLM53_ADAPTIVE_K_HIST"
         -e "TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
         -e "TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
         -e "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
@@ -1752,7 +1851,9 @@ TP4_SKIP_OLD_SCP
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
-             VLLM_SM120_SPARSE_MLA_SLICE_TOKENS; do
+             VLLM_SM120_SPARSE_MLA_SLICE_TOKENS \
+             GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
+             GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST; do
         serve_env+=" -e $v='${!v:-}'"
     done
     # VLLM_API_KEY is read by the head (rank 0) API server for bearer auth; the
@@ -1800,6 +1901,7 @@ TP4_SKIP_OLD_SCP
             -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
             -v '/tmp/patch_loadclone.py:/opt/glm53/patch_loadclone.py:ro' \
             -v '/tmp/patch_sparse_mla_slice.py:/opt/glm53/patch_sparse_mla_slice.py:ro' \
+            -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
             -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
             -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
             -v '/tmp/patch_ablit.py:/opt/glm53/patch_ablit.py:ro' \
@@ -1840,6 +1942,7 @@ TP4_SKIP_OLD_SCP
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$LOADCLONE_PATCH_HOST:/opt/glm53/patch_loadclone.py:ro" \
         -v "$SPARSE_SLICE_PATCH_HOST:/opt/glm53/patch_sparse_mla_slice.py:ro" \
+        -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
         -v "$SCRIPT_DIR/overlay/patch_ablit.py:/opt/glm53/patch_ablit.py:ro" \
@@ -2124,7 +2227,7 @@ logs() {
 main() {
     local cmd="${1:-start}"
     case "$cmd" in
-        start|restart) validate_numeric_config; validate_loadclone_artifacts ;;
+        start|restart) validate_numeric_config; configure_capture_sizes; validate_loadclone_artifacts ;;
     esac
     case "$cmd" in
         stop)     banner stop.sh ;;
