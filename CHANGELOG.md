@@ -255,7 +255,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   `--default-chat-template-kwargs` on every rank, and forwards the value to
   all four containers. `tests/test_default_reasoning_effort_tp4.sh` runs
   the guard and each rank's argument construction; no TP=4 GPU boot was
-  run.
+  run. On both `start-tp3.sh` and `start-tp4.sh`, a caller export
+  (`GLM53_DEFAULT_REASONING_EFFORT=low ./start-tp4.sh`) now wins over
+  `.env` and `.env.tpX`, setness-aware as on `start.sh`; before, the
+  `.env.example` line silently replaced it.
 - `start-tp3.sh` honours `GLM53_DEFAULT_REASONING_EFFORT`, a knob only
   `start.sh` (TP=2) declared, guarded and forwarded. A TP3 seat ignored it
   entirely, so a value set in the shared `.env` reached neither rank and
