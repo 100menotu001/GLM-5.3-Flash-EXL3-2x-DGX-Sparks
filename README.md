@@ -102,11 +102,11 @@ xychart-beta
     title "TP2 decode (tokens/s): default vs speed boost"
     x-axis ["Prose", "Structured", "Code", "Code 32k", "Short code x1", "Short code x2"]
     y-axis "tokens/s" 0 --> 100
-    bar [36.1, 83.0, 54.6, 54.6, 36.0, 53.6]
     bar [37.5, 92.3, 55.5, 60.3, 41.3, 56.9]
+    line [36.1, 83.0, 54.6, 54.6, 36.0, 53.6]
 ```
 
-<sub>First bar in each pair: default. Second: speed boost.</sub>
+<sub>Bars: speed boost. Line: default.</sub>
 
 | Cold prefill, tokens/s | 8k | 32k | 96k |
 |---|---:|---:|---:|
