@@ -64,15 +64,22 @@ def require_packed(tensors: dict, base: str, bits: int) -> None:
 
 
 def parse_layers(spec: str) -> set[int]:
-    """ABLIT_LAYERS syntax ("15-45", "15,17-19"), as overlay/ablit_runtime.py parses it."""
+    """ABLIT_LAYERS syntax ("15-45", "15,17-19"), accepting exactly what
+    overlay/ablit_runtime.py parse_layers accepts, so the pre-stop check never
+    passes a spec the container then refuses."""
     layers: set[int] = set()
-    for part in spec.replace(" ", "").split(","):
+    for part in spec.split(","):
+        part = part.strip()
         if not part:
             continue
-        lo, _, hi = part.partition("-")
-        if not lo.isdigit() or (hi and not hi.isdigit()) or int(hi or lo) < int(lo):
-            raise ValueError(f"ABLIT_LAYERS: bad range {part!r}")
-        layers.update(range(int(lo), int(hi or lo) + 1))
+        lo_s, sep, hi_s = part.partition("-")
+        try:
+            lo, hi = int(lo_s), int(hi_s if sep else lo_s)
+        except ValueError as exc:
+            raise ValueError(f"ABLIT_LAYERS: bad range {part!r}") from exc
+        if hi < lo:
+            raise ValueError(f"ABLIT_LAYERS: inverted range {part!r}")
+        layers.update(range(lo, hi + 1))
     if not layers:
         raise ValueError(f"ABLIT_LAYERS {spec!r} names no layers")
     return layers

@@ -125,9 +125,31 @@ def test_ablit_selects_only_layers_whose_o_proj_stays_bf16(tmp_path):
     profile.check_ablit(tc, "16-45")  # layer 45 is the MTP block, never a target o_proj
     with pytest.raises(ValueError):
         profile.check_ablit(tc, "15")
-    for bad in ("", "20-15", "x"):
+
+
+def _runtime_parse_layers():
+    """overlay/ablit_runtime.parse_layers without importing torch."""
+    import ast
+    tree = ast.parse((ROOT / "overlay/ablit_runtime.py").read_text())
+    keep = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+            and n.name in ("AblitError", "parse_layers")]
+    ns: dict = {}
+    exec(compile(ast.Module(keep, type_ignores=[]), "ablit_runtime", "exec"), ns)
+    return ns["parse_layers"]
+
+
+@pytest.mark.parametrize("spec", ["15-45", "15,17-19", " 15 - 20 ", "+15", "15-", "-5",
+                                  "20-15", "x", "", ",", "1 5"])
+def test_ablit_layer_spec_matches_the_runtime_parser(spec):
+    """The pre-stop check must accept exactly what the in-container hook accepts:
+    a spec it passes but the runtime refuses would stop a healthy serve first."""
+    try:
+        want = set(_runtime_parse_layers()(spec))
+    except Exception:  # AblitError
         with pytest.raises(ValueError):
-            profile.parse_layers(bad)
+            profile.parse_layers(spec)
+    else:
+        assert profile.parse_layers(spec) == want
 
 
 @pytest.mark.parametrize("damage", ["missing", "truncated", "hash", "bitrate", "missing_part"])
