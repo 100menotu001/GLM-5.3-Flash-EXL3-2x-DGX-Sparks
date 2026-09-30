@@ -291,6 +291,10 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   `docker load` on the worker failed with `max depth exceeded` while the
   head built and saved the same image fine; grouping removes five layers
   without changing the patch order. (#301)
+- `tests/test_image_layer_budget.py` fails when the base image's 32 layers
+  plus the Dockerfile's COPY/RUN/ADD steps exceed 123, the largest depth
+  observed to load on a worker, so a PR that would repeat #301 fails on CPU
+  before merge instead of at the worker's `docker load`.
 
 - `overlay/patch_kpool_tail_seed_stride.py`: backport vLLM #57477 so the NVIDIA
   prefill kpool tail seed addresses the padded indexer stride. Pinned vLLM
